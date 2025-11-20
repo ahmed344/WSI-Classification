@@ -1,0 +1,11 @@
+timm
+openslide-python
+openslide-bin
+pandas
+pyarrow
+seaborn
+scikit-learn
+scikit-image
+imagecodecs
+jupyter
+ipywidgets

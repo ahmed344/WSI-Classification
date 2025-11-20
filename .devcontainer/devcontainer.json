@@ -1,0 +1,32 @@
+{
+	"name": "WSI-Classification",
+	"build": {
+        "dockerfile": "Dockerfile"
+    },
+
+    "runArgs": ["--gpus", "all"],
+
+	// Configure tool-specific properties.
+	"customizations": {
+        // Configure the vscode.
+        "vscode": {
+            // Install the vscode extension.
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-python.debugpy",
+                "ms-toolsai.jupyter",
+                "github.copilot",
+                "github.copilot-chat",
+                "njpwerner.autodocstring"
+            ]
+        }
+        
+    },
+
+    // Mount the data directory in the container.
+    "mounts": [
+        "source=/home/ahmed/Data,target=/workspaces/WSI-Classification/data,type=bind,consistency=cached",
+        "source=/home/ahmed/QP-projects,target=/workspaces/WSI-Classification/qp-projects,type=bind,consistency=cached"
+    ]
+}
