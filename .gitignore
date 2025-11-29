@@ -7,13 +7,19 @@ qp-projects/
 *.jpg
 *.jpeg
 *.tiff
+*.tif
 
 # Files
+*.pickle
+*.pkl
 *.pth
 *.key
 *.bin
 .gitattributes
 config.json
+
+# notebooks
+*.ipynb
 
 # Directories
 .locks/
