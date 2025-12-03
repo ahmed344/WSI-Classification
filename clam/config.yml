@@ -1,0 +1,40 @@
+# CLAM-MB Configuration File
+
+# Data paths
+data_root: "/workspaces/WSI-Classification/data/HE-MYO/Processed"
+checkpoint_dir: "checkpoints"
+output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results"
+
+# Model architecture
+input_dim: 1536
+hidden_dim: 512
+num_classes: 5
+k_clusters: 2
+
+# Training parameters
+batch_size: 1
+epochs: 100
+learning_rate: 0.0001
+weight_decay: 0.00001
+clustering_weight: 0.1
+train_ratio: 0.9
+patience: 10
+random_seed: 42
+
+# Evaluation parameters
+evaluation:
+  split: "val"  # 'train' or 'val'
+  plot_cm: true  # Plot confusion matrix
+
+# Visualization parameters
+visualization:
+  split: "val"  # 'train' or 'val'
+  max_slides: null  # null for all slides, or specify a number
+  tile_size: 448
+
+# Paths (can be overridden)
+paths:
+  checkpoint: null  # Will be set to checkpoints/best_model.pth if null
+  evaluation_output: null  # Will use output_dir/evaluation_results if null
+  attention_output: null  # Will use output_dir/attention_heatmaps if null
+
