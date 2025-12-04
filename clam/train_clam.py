@@ -1,3 +1,6 @@
+from typing import Any
+
+
 import os
 import torch
 import torch.nn as nn
@@ -13,6 +16,10 @@ from clam_dataset import WSIFeatureDataset, collate_fn
 from clam_model import CLAM_MB, compute_clustering_loss
 from config_loader import load_config
 
+import matplotlib.pyplot as plt
+import seaborn as sns
+sns.set_theme(style="darkgrid")
+
 
 def train_epoch(model, dataloader, criterion, optimizer, device, clustering_weight=0.1):
     """Train for one epoch"""
@@ -23,8 +30,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, clustering_weig
     all_preds = []
     all_labels = []
     
-    pbar = tqdm(dataloader, desc='Training')
-    for batch in pbar:
+    for batch in dataloader:
         features = batch['features'].to(device)
         labels = batch['labels'].to(device)
         masks = batch['masks'].to(device)
@@ -57,25 +63,13 @@ def train_epoch(model, dataloader, criterion, optimizer, device, clustering_weig
         preds = torch.argmax(logits, dim=1).cpu().numpy()
         all_preds.extend(preds)
         all_labels.extend(labels.cpu().numpy())
-        
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': f'{running_loss / len(dataloader):.4f}',
-            'cls': f'{running_cls_loss / len(dataloader):.4f}',
-            'cluster': f'{running_cluster_loss / len(dataloader):.4f}'
-        })
     
     epoch_loss = running_loss / len(dataloader)
     epoch_cls_loss = running_cls_loss / len(dataloader)
     epoch_cluster_loss = running_cluster_loss / len(dataloader)
     accuracy = accuracy_score(all_labels, all_preds)
     
-    return {
-        'loss': epoch_loss,
-        'cls_loss': epoch_cls_loss,
-        'cluster_loss': epoch_cluster_loss,
-        'accuracy': accuracy
-    }
+    return {'loss': epoch_loss, 'cls_loss': epoch_cls_loss, 'cluster_loss': epoch_cluster_loss, 'accuracy': accuracy}
 
 
 def validate(model, dataloader, criterion, device, clustering_weight=0.1):
@@ -88,8 +82,7 @@ def validate(model, dataloader, criterion, device, clustering_weight=0.1):
     all_labels = []
     
     with torch.no_grad():
-        pbar = tqdm(dataloader, desc='Validation')
-        for batch in pbar:
+        for batch in dataloader:
             features = batch['features'].to(device)
             labels = batch['labels'].to(device)
             masks = batch['masks'].to(device)
@@ -117,12 +110,6 @@ def validate(model, dataloader, criterion, device, clustering_weight=0.1):
             preds = torch.argmax(logits, dim=1).cpu().numpy()
             all_preds.extend(preds)
             all_labels.extend(labels.cpu().numpy())
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': f'{running_loss / len(dataloader):.4f}',
-                'acc': f'{accuracy_score(all_labels, all_preds):.4f}'
-            })
     
     epoch_loss = running_loss / len(dataloader)
     epoch_cls_loss = running_cls_loss / len(dataloader)
@@ -217,12 +204,12 @@ def main():
         'val': {'loss': [], 'cls_loss': [], 'cluster_loss': [], 'accuracy': []}
     }
     
+    best_val_loss = float('inf')
     best_val_acc = 0.0
     patience_counter = 0
     
     print('Starting training...')
-    for epoch in range(config['epochs']):
-        print(f'\nEpoch {epoch+1}/{config["epochs"]}')
+    for epoch in tqdm(range(config['epochs'])):
         
         # Train
         train_metrics = train_epoch(
@@ -243,17 +230,11 @@ def main():
             history['val'][key].append(val_metrics[key])
         
         # Print metrics
-        print(f'Train - Loss: {train_metrics["loss"]:.4f}, '
-              f'Cls Loss: {train_metrics["cls_loss"]:.4f}, '
-              f'Cluster Loss: {train_metrics["cluster_loss"]:.4f}, '
-              f'Accuracy: {train_metrics["accuracy"]:.4f}')
-        print(f'Val   - Loss: {val_metrics["loss"]:.4f}, '
-              f'Cls Loss: {val_metrics["cls_loss"]:.4f}, '
-              f'Cluster Loss: {val_metrics["cluster_loss"]:.4f}, '
-              f'Accuracy: {val_metrics["accuracy"]:.4f}')
+        tqdm.write(f'Loss: {train_metrics["loss"]:.3e}, {val_metrics["loss"]:.3e} | Cls Loss: {train_metrics["cls_loss"]:.3e}, {val_metrics["cls_loss"]:.3e} | Cluster Loss: {train_metrics["cluster_loss"]:.3e}, {val_metrics["cluster_loss"]:.3e} | Accuracy: {train_metrics["accuracy"]:.4f}, {val_metrics["accuracy"]:.4f}')
         
         # Save best model
-        if val_metrics['accuracy'] > best_val_acc:
+        if val_metrics['loss'] < best_val_loss or val_metrics['accuracy'] > best_val_acc:
+            best_val_loss = val_metrics['loss']
             best_val_acc = val_metrics['accuracy']
             patience_counter = 0
             
@@ -261,6 +242,7 @@ def main():
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
                 'best_val_acc': best_val_acc,
                 'history': history,
                 'config': config,
@@ -269,7 +251,7 @@ def main():
             
             checkpoint_path = os.path.join(config['checkpoint_dir'], 'best_model.pth')
             torch.save(checkpoint, checkpoint_path)
-            print(f'Saved best model (val_acc: {best_val_acc:.4f})')
+            # tqdm.write(f'Saved best model (val_loss: {best_val_loss:.3e}, val_acc: {best_val_acc:.4f})')
             
             # Save classification report
             report = classification_report(
@@ -288,7 +270,7 @@ def main():
         
         # Early stopping
         if patience_counter >= config['patience']:
-            print(f'Early stopping at epoch {epoch+1}')
+            tqdm.write(f'Early stopping at epoch {epoch+1}')
             break
     
     # Save final model and history
@@ -308,8 +290,23 @@ def main():
     history_path = os.path.join(config['checkpoint_dir'], 'training_history.json')
     with open(history_path, 'w') as f:
         json.dump(history, f, indent=2)
+
+    # Plot training history
+    fig, ax = plt.subplots(nrows=4, figsize=(10, 15))
+    for i, key in enumerate(['loss', 'cls_loss', 'cluster_loss', 'accuracy']):
+        ax[i].plot(history['train'][key], label='Train')
+        ax[i].plot(history['val'][key], label='Val')
+        ax[i].set_ylabel(key)
+        ax[i].legend()
+        if key != 'accuracy':
+            ax[i].set_yscale('log')
+    ax[i].set_xlabel('Epoch')
+    plt.tight_layout()
+    plt.savefig(os.path.join(config['checkpoint_dir'], 'training_history.png'))
+    plt.close()
     
     print(f'\nTraining completed!')
+    print(f'Best validation loss: {best_val_loss:.3e}')
     print(f'Best validation accuracy: {best_val_acc:.4f}')
     print(f'Checkpoints saved to: {config["checkpoint_dir"]}')
 
