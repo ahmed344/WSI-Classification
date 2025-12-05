@@ -22,7 +22,21 @@ sns.set_theme(style="darkgrid")
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device, clustering_weight=0.1):
-    """Train for one epoch"""
+    """
+    Train for one epoch using mixed loss function:
+        loss = classification loss + clustering_weight * clustering loss
+    
+    Args:
+        model: The model to train
+        dataloader: The dataloader to train on
+        criterion: The criterion to use for the classification loss
+        optimizer: The optimizer to use for the training
+        device: The device to use for the training
+        clustering_weight: The weight of the clustering loss
+    
+    Returns:
+        A dictionary containing the training metrics
+    """
     model.train()
     running_loss = 0.0
     running_cls_loss = 0.0
@@ -73,7 +87,20 @@ def train_epoch(model, dataloader, criterion, optimizer, device, clustering_weig
 
 
 def validate(model, dataloader, criterion, device, clustering_weight=0.1):
-    """Validate the model"""
+    """
+    Validate the model using mixed loss function:
+        loss = classification loss + clustering_weight * clustering loss
+    
+    Args:
+        model: The model to validate
+        dataloader: The dataloader to validate on
+        criterion: The criterion to use for the validation
+        device: The device to use for the validation
+        clustering_weight: The weight of the clustering loss
+    
+    Returns:
+        A dictionary containing the validation metrics
+    """
     model.eval()
     running_loss = 0.0
     running_cls_loss = 0.0
@@ -194,9 +221,7 @@ def main():
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=config['weight_decay'])
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
-    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
     # Training history
     history = {
@@ -212,14 +237,10 @@ def main():
     for epoch in tqdm(range(config['epochs'])):
         
         # Train
-        train_metrics = train_epoch(
-            model, train_loader, criterion, optimizer, device, config['clustering_weight']
-        )
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device, config['clustering_weight'])
         
         # Validate
-        val_metrics = validate(
-            model, val_loader, criterion, device, config['clustering_weight']
-        )
+        val_metrics = validate(model, val_loader, criterion, device, config['clustering_weight'])
         
         # Update learning rate
         scheduler.step(val_metrics['loss'])

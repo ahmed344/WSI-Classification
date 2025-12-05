@@ -71,7 +71,7 @@ class WSIFeatureDataset(Dataset):
             
             if split == 'train':
                 self.indices = train_indices
-            else:
+            elif split == 'val':
                 self.indices = val_indices
         else:
             self.indices = []
