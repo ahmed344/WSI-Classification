@@ -8,6 +8,7 @@ from torchvision import transforms
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import os
+from pathlib import Path
 
 from dataset import WSI_tiles
 
@@ -15,12 +16,27 @@ from dataset import WSI_tiles
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Hyperparameters
-path = "/workspaces/WSI-Classification/data/HE-MYO/Processed/Inflammatory"
+path = "/workspaces/WSI-Classification/data/HE-MYO/Processed/"
 TILE_SIZE= (448, 448)
 BATCH_SIZE = 64
 
-# liset the slides
-slides = os.listdir(path)
+# List the slides  all category directories (Dystrophic, Healthy, Inflammatory, Myopathic, Neurogenic)
+slides = []
+for category_dir in os.listdir(path):
+    category_path = Path(path) / category_dir
+    if category_path.is_dir():
+        # For each category, scan slide directories
+        for slide_dir in os.listdir(category_path):
+            slide_dir_path = category_path / slide_dir
+            if slide_dir_path.is_dir():
+                # Find .ome.tiff files in the slide directory
+                for slide_file in slide_dir_path.glob("*.ome.tiff"):
+                    slides.append({
+                        'name': slide_file.name,
+                        'path': str(slide_file),
+                        'category': category_dir,
+                        'slide_dir': slide_dir
+                    })
 
 # # Create the model
 # model = timm.create_model("hf-hub:bioptimus/H-optimus-0", pretrained=True, init_values=1e-5, dynamic_img_size=False)
@@ -44,17 +60,28 @@ transform = transforms.Compose([
     ),
 ])
 
-for slide_name in slides:
+for slide_info in slides:
+    slide_name = slide_info['name']
+    slide_path = slide_info['path']
+    category = slide_info['category']
+    slide_dir = slide_info['slide_dir']
+    
+    # Determine output directory (slide's own directory)
+    output_dir = Path(path) / category / slide_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     # Check if the embedding features already exist
-    if os.path.exists(f"{path}/{slide_name.split('.')[0]}_features.pkl"):
-        print(f"{slide_name.split('.')[0]} already processed")
+    slide_base_name = Path(slide_name).stem
+    features_path = output_dir / f"{slide_base_name}_features.pt"
+    if features_path.exists():
+        print(f"{slide_base_name} already processed")
         continue
     
-    # Print the slide name
-    print(f"Processing {slide_name}")
+    # Print the slide name with category
+    print(f"Processing [{category}] {slide_name}")
 
     # Load the slide with openslide
-    slide = openslide.OpenSlide(f"{path}/{slide_name}")
+    slide = openslide.OpenSlide(slide_path)
 
     # Read the slide as RGB
     img = slide.read_region((0, 0), 0, slide.dimensions).convert("RGB")
@@ -81,7 +108,8 @@ for slide_name in slides:
     tiles = pd.DataFrame({'id': range(len(x_coords)), 'x': x_coords, 'y': y_coords})
 
     # Save the pixels
-    tiles.to_csv(f"{path}/{slide_name.split('.')[0]}_tiles.csv")
+    tiles_path = output_dir / f"{slide_base_name}_tiles.csv"
+    tiles.to_csv(tiles_path)
 
     # Create the dataset
     dataset = WSI_tiles(slide=slide, tiles=tiles, transform=transform, size=TILE_SIZE)
@@ -106,7 +134,7 @@ for slide_name in slides:
     feature_emb = torch.cat(feature_emb, dim=0)
 
     # Save the embedding features as a tensor using torch.save
-    torch.save(feature_emb, f"{path}/{slide_name.split('.')[0]}_features.pt")
+    torch.save(feature_emb, str(features_path))
 
     # Clean up the GPU memory
     torch.cuda.empty_cache()
