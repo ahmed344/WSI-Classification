@@ -72,7 +72,7 @@ for slide_info in slides:
     
     # Check if the embedding features already exist
     slide_base_name = Path(slide_name).stem
-    features_path = output_dir / f"{slide_base_name}_features.pt"
+    features_path = output_dir / f"{slide_base_name.split('.')[0]}_features.pt"
     if features_path.exists():
         print(f"{slide_base_name} already processed")
         continue
@@ -108,7 +108,7 @@ for slide_info in slides:
     tiles = pd.DataFrame({'id': range(len(x_coords)), 'x': x_coords, 'y': y_coords})
 
     # Save the pixels
-    tiles_path = output_dir / f"{slide_base_name}_tiles.csv"
+    tiles_path = output_dir / f"{slide_base_name.split('.')[0]}_tiles.csv"
     tiles.to_csv(tiles_path)
 
     # Create the dataset
