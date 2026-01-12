@@ -1,0 +1,20 @@
+name: wsi-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10
+  - numpy<2.0
+  - pandas
+  - pyarrow
+  - seaborn
+  - scikit-learn
+  - scikit-image
+  - imagecodecs
+  - jupyter
+  - ipywidgets
+  - jupytext
+  - openslide-python
+  - pip
+  - pip:
+    - opencv-python-headless<4.10

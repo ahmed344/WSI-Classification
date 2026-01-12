@@ -148,6 +148,7 @@ def crop_tissues(
         
         # Save as OME-TIFF in the slide-specific directory
         output_path = slide_output_dir / f"{x_full}_{y_full}.ome.tiff"
+        print(output_path)
         with tifffile.TiffWriter(str(output_path), bigtiff=True, ome=True) as tif:
             tif.write(data=full_crop, subifds=len(pyramid) - 1, tile=tile_size, compression='JPEG', metadata=metadata)
             for level in pyramid[1:]:
@@ -182,11 +183,18 @@ def crop_tissues(
         plt.show()
 
     if show_results:
-        fig, ax = plt.subplots(1, len(cropped_tissues), figsize=(4*len(cropped_tissues), 4))
-        for i, crop in enumerate(cropped_tissues):
-            ax[i].imshow(crop)
-            ax[i].set_title(f'Tissue {i+1}')
-            ax[i].axis('off')
-        plt.show()
+        n_tissues = len(cropped_tissues)
+        if n_tissues > 0:
+            fig, ax = plt.subplots(1, n_tissues, figsize=(4*n_tissues, 4))
+            
+            # If only one tissue, wrap ax in a list so we can iterate
+            if n_tissues == 1:
+                ax = [ax]
+                
+            for i, crop in enumerate(cropped_tissues):
+                ax[i].imshow(crop)
+                ax[i].set_title(f'Tissue {i+1}')
+                ax[i].axis('off')
+            plt.show()
 
     return cropped_tissues
