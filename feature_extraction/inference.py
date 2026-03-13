@@ -18,7 +18,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Hyperparameters
 path = "/workspaces/WSI-Classification/data/HE-MYO/Processed/"
 TILE_SIZE= (448, 448)
-BATCH_SIZE = 64
+BATCH_SIZE = 256
 
 # List the slides  all category directories (Dystrophic, Healthy, Inflammatory, Myopathic, Neurogenic)
 slides = []
@@ -74,11 +74,11 @@ for slide_info in slides:
     slide_base_name = Path(slide_name).stem
     features_path = output_dir / f"{slide_base_name.split('.')[0]}_features.pt"
     if features_path.exists():
-        print(f"{slide_base_name} already processed")
+        print(f"{slide_base_name.split('.')[0]} already processed")
         continue
     
     # Print the slide name with category
-    print(f"Processing [{category}] {slide_name}")
+    print(f"Processing [{category}] {slide_name.split('.')[0]}")
 
     # Load the slide with openslide
     slide = openslide.OpenSlide(slide_path)

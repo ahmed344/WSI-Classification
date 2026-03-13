@@ -32,7 +32,7 @@ device
 
 # %%
 # Read the huggingface token from a fileReviewing the codebase to understand the current structure and data format.
-with open("huggingface_token.key", "r") as f:
+with open("/workspaces/WSI-Classification/huggingface_token.key", "r") as f:
     token = f.read()
 
 # Login to huggingface hub with the token
@@ -76,11 +76,8 @@ transform = transforms.Compose([
 transform
 
 # %%
-# Determine the slide id
-slide = "tissue_crop_4352_30208"
-
 # Load the slide with openslide
-slide = openslide.OpenSlide(f"/workspaces/WSI-Classification/data/HE-MYO/Processed/Dystrophic/{slide}.ome.tiff")
+slide = openslide.OpenSlide(f"/workspaces/WSI-Classification/data/HE-MYO/Processed/Dystrophic/P862653_M1/1024_57856.ome.tiff")
 
 # Make a thumbnail of the slide
 slide.get_thumbnail(size=(256, 256))
@@ -113,3 +110,5 @@ ax[2].plot(feature_emb.cpu().squeeze().detach().numpy())
 ax[2].set_title("Extracted features")
 
 plt.show()
+
+# %%
