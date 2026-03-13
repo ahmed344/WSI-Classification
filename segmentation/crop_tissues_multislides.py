@@ -23,15 +23,16 @@ import gc
 
 # %%
 # Assign the path
-path = '/data/aabdelrahman/HE-MYO/Raw/Giessen/HE Muscle biopsy/'
-path_results = '/data/aabdelrahman/HE-MYO/Processed/'
+path = '/workspaces/WSI-Classification/data/HE-MYO/Raw/Giessen/HE Muscle biopsy/'
+path_metadata = '/workspaces/WSI-Classification/data/HE-MYO/Raw/Giessen/Cooperation_Malfatti_Sept.25_II.xlsx'
+path_results = '/workspaces/WSI-Classification/data/HE-MYO/Processed/'
 
 # List the slides
 slides = [slide for slide in os.listdir(path)]
 slides_ids = [slide[:-5] for slide in slides]
 
 # Load the metadata
-metadata_df = pd.read_excel('/data/aabdelrahman/HE-MYO/Raw/Giessen/Cooperation_Malfatti_Sept.25_II.xlsx')
+metadata_df = pd.read_excel(path_metadata)
 
 # Remove nan values
 metadata_df = metadata_df.dropna()
@@ -128,3 +129,5 @@ print("Terminated")
 #     print(f"Processing {slide_name}")
 #     slide_path = path + slide_name
 #     crop_tissues(slide_path, level=-1, min_area_ratio=0.005, show_steps=True, show_results=True, results_dir=results_dir)
+
+# %%
