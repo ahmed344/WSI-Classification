@@ -20,6 +20,23 @@ from clam_model import CLAM_MB
 from config_loader import load_config
 
 
+def get_class_sample_counts(dataset: WSIFeatureDataset) -> Dict[str, int]:
+    """
+    Calculate sample counts per class for a dataset split.
+
+    Args:
+        dataset (WSIFeatureDataset): Dataset instance containing split indices and tissue metadata.
+
+    Returns:
+        Dict[str, int]: Mapping from class name to number of samples in the dataset split.
+    """
+    class_counts: Dict[str, int] = {class_name: 0 for class_name in dataset.class_folders}
+    for tissue_idx in dataset.indices:
+        class_name = dataset.tissues[tissue_idx]['class']
+        class_counts[class_name] += 1
+    return class_counts
+
+
 def evaluate(
     model: CLAM_MB,
     dataloader: DataLoader,
@@ -291,7 +308,11 @@ def main() -> None:
         random_seed=config['random_seed']
     )
     
+    class_counts = get_class_sample_counts(dataset)
     print(f'Number of samples: {len(dataset)}')
+    print(f'{split.capitalize()} samples per class:')
+    for class_name in class_folders:
+        print(f'  {class_name}: {class_counts[class_name]}')
     
     # Create dataloader
     dataloader = DataLoader(

@@ -370,8 +370,23 @@ def evaluate_with_attention(
                 
                 # Generate visualization if coordinates are available
                 if tile_coords is not None:
-                    # Filter coordinates to valid tiles only
-                    tile_coords = tile_coords[valid_mask]
+                    # tile_coords are already tissue-level (unpadded), while valid_mask is
+                    # batch-padded length. Align by count to avoid shape mismatch.
+                    n_attn_tiles = avg_attention.shape[0]
+                    n_coord_tiles = tile_coords.shape[0]
+                    if n_attn_tiles != n_coord_tiles:
+                        n_common_tiles = min(n_attn_tiles, n_coord_tiles)
+                        tqdm.write(
+                            f"Warning: Tile count mismatch for "
+                            f"{slide_name}/{tissue_name}: "
+                            f"attention={n_attn_tiles}, coords={n_coord_tiles}. "
+                            f"Using first {n_common_tiles} tiles."
+                        )
+                        avg_attention = avg_attention[:n_common_tiles]
+                        branch_attentions = [
+                            attn[:n_common_tiles] for attn in branch_attentions
+                        ]
+                        tile_coords = tile_coords[:n_common_tiles]
                     
                     # Create safe filenames (replace problematic characters)
                     slide_safe_name = slide_name.replace('/', '_').replace(' ', '_')

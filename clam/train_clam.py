@@ -25,6 +25,23 @@ import seaborn as sns
 sns.set_theme(style="darkgrid")
 
 
+def get_class_sample_counts(dataset: WSIFeatureDataset) -> Dict[str, int]:
+    """
+    Calculate sample counts per class for a dataset split.
+
+    Args:
+        dataset (WSIFeatureDataset): Dataset instance containing split indices and tissue metadata.
+
+    Returns:
+        Dict[str, int]: Mapping from class name to number of samples in the dataset split.
+    """
+    class_counts: Dict[str, int] = {class_name: 0 for class_name in dataset.class_folders}
+    for tissue_idx in dataset.indices:
+        class_name = dataset.tissues[tissue_idx]['class']
+        class_counts[class_name] += 1
+    return class_counts
+
+
 def train_epoch(
     model: CLAM_MB,
     dataloader: DataLoader,
@@ -239,6 +256,14 @@ def main() -> None:
     print(f'Training samples: {len(train_dataset)}')
     print(f'Validation samples: {len(val_dataset)}')
     print(f'Classes: {train_dataset.class_folders}')
+    train_class_counts = get_class_sample_counts(train_dataset)
+    val_class_counts = get_class_sample_counts(val_dataset)
+    print('Training samples per class:')
+    for class_name in train_dataset.class_folders:
+        print(f'  {class_name}: {train_class_counts[class_name]}')
+    print('Validation samples per class:')
+    for class_name in train_dataset.class_folders:
+        print(f'  {class_name}: {val_class_counts[class_name]}')
     
     # Create data loaders
     train_loader = DataLoader(
@@ -285,8 +310,8 @@ def main() -> None:
         'val': {'loss': [], 'cls_loss': [], 'cluster_loss': [], 'accuracy': []}
     }
     
-    # Initialize best metrics and early stopping counter
-    best_val_loss = float('inf')
+    # Initialize best classification metrics and early stopping counter
+    best_val_cls_loss = float('inf')
     best_val_acc = 0.0
     patience_counter = 0
     
@@ -320,10 +345,13 @@ def main() -> None:
             f'Accuracy: {train_metrics["accuracy"]:.4f}, {val_metrics["accuracy"]:.4f}'
         )
         
-        # Save best model if validation improved
-        if val_metrics['loss'] < best_val_loss or val_metrics['accuracy'] > best_val_acc:
-            # Update best metrics
-            best_val_loss = val_metrics['loss']
+        # Save best model if validation classification metrics improved
+        if (
+            val_metrics['cls_loss'] < best_val_cls_loss
+            or val_metrics['accuracy'] > best_val_acc
+        ):
+            # Update best classification metrics
+            best_val_cls_loss = val_metrics['cls_loss']
             best_val_acc = val_metrics['accuracy']
             patience_counter = 0  # Reset patience counter
             
@@ -332,7 +360,7 @@ def main() -> None:
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'best_val_loss': best_val_loss,
+                'best_val_cls_loss': best_val_cls_loss,
                 'best_val_acc': best_val_acc,
                 'history': history,
                 'config': config,
@@ -373,6 +401,7 @@ def main() -> None:
         'epoch': epoch + 1,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'best_val_cls_loss': best_val_cls_loss,
         'best_val_acc': best_val_acc,
         'history': history,
         'config': config,
@@ -407,7 +436,7 @@ def main() -> None:
     
     # Print final summary
     print(f'\nTraining completed!')
-    print(f'Best validation loss: {best_val_loss:.3e}')
+    print(f'Best validation classification loss: {best_val_cls_loss:.3e}')
     print(f'Best validation accuracy: {best_val_acc:.4f}')
     print(f'Checkpoints saved to: {config["checkpoint_dir"]}')
 

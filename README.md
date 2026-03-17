@@ -17,7 +17,6 @@ Target classes currently used in this project:
 ## End-to-End Workflow
 
 ```mermaid
-%%{init: {'themeVariables': {'fontSize': '24px'}}}%%
 flowchart TB
     rawSlides["RawWSI(.ndpi/.tiff)"] --> segmentation["TissueSegmentationAndCrop"]
     segmentation --> croppedOme["CroppedOME-TIFFTissues"]
@@ -28,6 +27,8 @@ flowchart TB
     checkpoint --> evaluation["Evaluation(accuracy,CM,report)"]
     checkpoint --> attention["AttentionHeatmaps"]
 ```
+
+
 
 ## Key Capabilities
 
@@ -44,7 +45,6 @@ flowchart TB
 - `feature_extraction/` - Tile dataset and embedding inference pipeline.
 - `clam/` - Dataset, CLAM model, training, evaluation, and attention visualization.
 - `notebooks/` - Model usage and exploratory notebook scripts (jupytext format).
-- `presentation/` - Slide deck material.
 - `environment.yml` - Conda environment definition.
 - `.devcontainer/` - Containerized development setup.
 
