@@ -10,10 +10,15 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 import numpy as np
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    classification_report
+)
 import json
 
 from clam_dataset import WSIFeatureDataset, collate_fn
@@ -40,6 +45,55 @@ def get_class_sample_counts(dataset: WSIFeatureDataset) -> Dict[str, int]:
         class_name = dataset.tissues[tissue_idx]['class']
         class_counts[class_name] += 1
     return class_counts
+
+
+def compute_class_weights(dataset: WSIFeatureDataset) -> torch.Tensor:
+    """
+    Compute inverse-frequency class weights from the training split.
+
+    Args:
+        dataset (WSIFeatureDataset): Training dataset containing class names and split indices.
+
+    Returns:
+        torch.Tensor: Float tensor of shape [num_classes] ordered by
+            dataset.class_folders, where larger values correspond to rarer classes.
+    """
+    class_counts = get_class_sample_counts(dataset)
+    total_samples = sum(class_counts.values())
+    num_classes = len(dataset.class_folders)
+    class_weights: List[float] = []
+    for class_name in dataset.class_folders:
+        count = class_counts[class_name]
+        weight = total_samples / (num_classes * count) if count > 0 else 0.0
+        class_weights.append(weight)
+    return torch.tensor(class_weights, dtype=torch.float32)
+
+
+def compute_sample_weights(
+    dataset: WSIFeatureDataset,
+    class_weights: torch.Tensor
+) -> List[float]:
+    """
+    Compute per-sample weights for weighted random sampling.
+
+    Args:
+        dataset (WSIFeatureDataset): Dataset containing tissue metadata and split indices.
+        class_weights (torch.Tensor): Class-weight tensor of shape [num_classes]
+            aligned with dataset.class_folders.
+
+    Returns:
+        List[float]: Per-sample weights aligned with dataset.indices for use in
+            WeightedRandomSampler.
+    """
+    class_weight_map: Dict[str, float] = {
+        class_name: float(class_weights[class_idx].item())
+        for class_idx, class_name in enumerate(dataset.class_folders)
+    }
+    sample_weights: List[float] = []
+    for tissue_idx in dataset.indices:
+        class_name = dataset.tissues[tissue_idx]['class']
+        sample_weights.append(class_weight_map[class_name])
+    return sample_weights
 
 
 def train_epoch(
@@ -70,6 +124,7 @@ def train_epoch(
             - 'cls_loss' (float): Average classification loss for the epoch.
             - 'cluster_loss' (float): Average clustering loss for the epoch.
             - 'accuracy' (float): Classification accuracy for the epoch.
+            - 'balanced_accuracy' (float): Balanced accuracy for the epoch.
     """
     model.train()
     running_loss = 0.0
@@ -119,12 +174,14 @@ def train_epoch(
     epoch_cls_loss = running_cls_loss / len(dataloader)
     epoch_cluster_loss = running_cluster_loss / len(dataloader)
     accuracy = accuracy_score(all_labels, all_preds)
+    balanced_accuracy = balanced_accuracy_score(all_labels, all_preds)
     
     return {
         'loss': epoch_loss,
         'cls_loss': epoch_cls_loss,
         'cluster_loss': epoch_cluster_loss,
-        'accuracy': accuracy
+        'accuracy': accuracy,
+        'balanced_accuracy': balanced_accuracy
     }
 
 
@@ -154,6 +211,7 @@ def validate(
             - 'cls_loss' (float): Average classification loss for the epoch.
             - 'cluster_loss' (float): Average clustering loss for the epoch.
             - 'accuracy' (float): Classification accuracy for the epoch.
+            - 'balanced_accuracy' (float): Balanced accuracy for the epoch.
             - 'confusion_matrix' (List[List[int]]): Confusion matrix as nested list.
             - 'predictions' (List[int]): List of predicted class indices.
             - 'labels' (List[int]): List of true class indices.
@@ -202,6 +260,7 @@ def validate(
     epoch_cls_loss = running_cls_loss / len(dataloader)
     epoch_cluster_loss = running_cluster_loss / len(dataloader)
     accuracy = accuracy_score(all_labels, all_preds)
+    balanced_accuracy = balanced_accuracy_score(all_labels, all_preds)
     
     # Compute confusion matrix for detailed analysis
     cm = confusion_matrix(all_labels, all_preds)
@@ -211,6 +270,7 @@ def validate(
         'cls_loss': epoch_cls_loss,
         'cluster_loss': epoch_cluster_loss,
         'accuracy': accuracy,
+        'balanced_accuracy': balanced_accuracy,
         'confusion_matrix': cm.tolist(),
         'predictions': all_preds,
         'labels': all_labels
@@ -266,10 +326,17 @@ def main() -> None:
         print(f'  {class_name}: {val_class_counts[class_name]}')
     
     # Create data loaders
+    class_weights = compute_class_weights(train_dataset)
+    sample_weights = compute_sample_weights(train_dataset, class_weights)
+    train_sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
-        shuffle=True,  # Shuffle training data
+        sampler=train_sampler,
         collate_fn=collate_fn,
         num_workers=0  # Set to 0 to avoid pickle issues with custom dataset
     )
@@ -293,7 +360,7 @@ def main() -> None:
     print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
     
     # Setup loss function, optimizer, and learning rate scheduler
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
     optimizer = optim.Adam(
         model.parameters(),
         lr=config['learning_rate'],
@@ -306,13 +373,19 @@ def main() -> None:
     
     # Initialize training history tracking
     history: Dict[str, Dict[str, List[float]]] = {
-        'train': {'loss': [], 'cls_loss': [], 'cluster_loss': [], 'accuracy': []},
-        'val': {'loss': [], 'cls_loss': [], 'cluster_loss': [], 'accuracy': []}
+        'train': {
+            'loss': [], 'cls_loss': [], 'cluster_loss': [],
+            'accuracy': [], 'balanced_accuracy': []
+        },
+        'val': {
+            'loss': [], 'cls_loss': [], 'cluster_loss': [],
+            'accuracy': [], 'balanced_accuracy': []
+        }
     }
     
-    # Initialize best classification metrics and early stopping counter
+    # Initialize best validation metrics and early stopping counter
     best_val_cls_loss = float('inf')
-    best_val_acc = 0.0
+    best_val_balanced_acc = 0.0
     patience_counter = 0
     
     # Training loop
@@ -333,7 +406,7 @@ def main() -> None:
         scheduler.step(val_metrics['loss'])
         
         # Save metrics to history
-        for key in ['loss', 'cls_loss', 'cluster_loss', 'accuracy']:
+        for key in ['loss', 'cls_loss', 'cluster_loss', 'accuracy', 'balanced_accuracy']:
             history['train'][key].append(train_metrics[key])
             history['val'][key].append(val_metrics[key])
         
@@ -342,17 +415,23 @@ def main() -> None:
             f'Loss: {train_metrics["loss"]:.3e}, {val_metrics["loss"]:.3e} | '
             f'Cls Loss: {train_metrics["cls_loss"]:.3e}, {val_metrics["cls_loss"]:.3e} | '
             f'Cluster Loss: {train_metrics["cluster_loss"]:.3e}, {val_metrics["cluster_loss"]:.3e} | '
-            f'Accuracy: {train_metrics["accuracy"]:.4f}, {val_metrics["accuracy"]:.4f}'
+            f'Accuracy: {train_metrics["accuracy"]:.4f}, {val_metrics["accuracy"]:.4f} | '
+            f'Bal Acc: {train_metrics["balanced_accuracy"]:.4f}, '
+            f'{val_metrics["balanced_accuracy"]:.4f}'
         )
         
-        # Save best model if validation classification metrics improved
+        # Save best model using balanced accuracy as primary criterion
+        # and classification loss as tie-breaker.
         if (
-            val_metrics['cls_loss'] < best_val_cls_loss
-            or val_metrics['accuracy'] > best_val_acc
+            val_metrics['balanced_accuracy'] > best_val_balanced_acc
+            or (
+                np.isclose(val_metrics['balanced_accuracy'], best_val_balanced_acc)
+                and val_metrics['cls_loss'] < best_val_cls_loss
+            )
         ):
-            # Update best classification metrics
+            # Update best validation metrics
             best_val_cls_loss = val_metrics['cls_loss']
-            best_val_acc = val_metrics['accuracy']
+            best_val_balanced_acc = val_metrics['balanced_accuracy']
             patience_counter = 0  # Reset patience counter
             
             # Create checkpoint dictionary
@@ -361,7 +440,7 @@ def main() -> None:
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_val_cls_loss': best_val_cls_loss,
-                'best_val_acc': best_val_acc,
+                'best_val_balanced_acc': best_val_balanced_acc,
                 'history': history,
                 'config': config,
                 'class_folders': train_dataset.class_folders
@@ -402,7 +481,7 @@ def main() -> None:
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'best_val_cls_loss': best_val_cls_loss,
-        'best_val_acc': best_val_acc,
+        'best_val_balanced_acc': best_val_balanced_acc,
         'history': history,
         'config': config,
         'class_folders': train_dataset.class_folders
@@ -418,14 +497,15 @@ def main() -> None:
         json.dump(history, f, indent=2)
     
     # Plot training history curves
-    fig, ax = plt.subplots(nrows=4, figsize=(10, 15))
-    for i, key in enumerate(['loss', 'cls_loss', 'cluster_loss', 'accuracy']):
+    plot_keys = ['loss', 'cls_loss', 'cluster_loss', 'accuracy', 'balanced_accuracy']
+    fig, ax = plt.subplots(nrows=len(plot_keys), figsize=(10, 18))
+    for i, key in enumerate(plot_keys):
         ax[i].plot(history['train'][key], label='Train')
         ax[i].plot(history['val'][key], label='Val')
         ax[i].set_ylabel(key)
         ax[i].legend()
         # Use log scale for loss metrics (not accuracy)
-        if key != 'accuracy':
+        if key in ['loss', 'cls_loss', 'cluster_loss']:
             ax[i].set_yscale('log')
     ax[-1].set_xlabel('Epoch')
     plt.tight_layout()
@@ -437,7 +517,7 @@ def main() -> None:
     # Print final summary
     print(f'\nTraining completed!')
     print(f'Best validation classification loss: {best_val_cls_loss:.3e}')
-    print(f'Best validation accuracy: {best_val_acc:.4f}')
+    print(f'Best validation balanced accuracy: {best_val_balanced_acc:.4f}')
     print(f'Checkpoints saved to: {config["checkpoint_dir"]}')
 
 
