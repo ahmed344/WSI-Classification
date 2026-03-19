@@ -96,6 +96,31 @@ def compute_sample_weights(
     return sample_weights
 
 
+def get_clustering_weight_for_epoch(
+    epoch_idx: int,
+    weight_start: float,
+    weight_end: float,
+    warmup_epochs: int
+) -> float:
+    """
+    Compute clustering loss weight for a given epoch using linear warmup.
+
+    Args:
+        epoch_idx (int): Zero-based epoch index.
+        weight_start (float): Initial clustering weight used at first epoch.
+        weight_end (float): Final clustering weight after warmup.
+        warmup_epochs (int): Number of epochs for linear ramp-up. If <= 1,
+            the function returns weight_end directly.
+
+    Returns:
+        float: Clustering weight value to use for the specified epoch.
+    """
+    if warmup_epochs <= 1:
+        return float(weight_end)
+    progress = min(max(epoch_idx, 0), warmup_epochs - 1) / (warmup_epochs - 1)
+    return float(weight_start + progress * (weight_end - weight_start))
+
+
 def train_epoch(
     model: CLAM_MB,
     dataloader: DataLoader,
@@ -361,9 +386,20 @@ def main() -> None:
     
     # Setup loss function, optimizer, and learning rate scheduler
     criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+
+    lr_cls = config.get('lr_cls', config.get('learning_rate', 1e-4))
+    lr_cluster = config.get('lr_cluster', lr_cls)
+    cls_params = (
+        list(model.feature_projection.parameters())
+        + list(model.attention_branches.parameters())
+        + list(model.classifier.parameters())
+    )
+    cluster_params = list(model.clustering_branch.parameters())
     optimizer = optim.Adam(
-        model.parameters(),
-        lr=config['learning_rate'],
+        [
+            {'params': cls_params, 'lr': lr_cls},
+            {'params': cluster_params, 'lr': lr_cluster}
+        ],
         weight_decay=config['weight_decay']
     )
     # Reduce learning rate when validation loss plateaus
@@ -390,20 +426,36 @@ def main() -> None:
     
     # Training loop
     print('Starting training...')
+    cluster_weight_start = config.get(
+        'clustering_weight_start',
+        config.get('clustering_weight', 0.1)
+    )
+    cluster_weight_end = config.get(
+        'clustering_weight_end',
+        config.get('clustering_weight', 0.1)
+    )
+    cluster_warmup_epochs = config.get('clustering_warmup_epochs', 1)
+
     for epoch in tqdm(range(config['epochs'])):
+        clustering_weight = get_clustering_weight_for_epoch(
+            epoch_idx=epoch,
+            weight_start=cluster_weight_start,
+            weight_end=cluster_weight_end,
+            warmup_epochs=cluster_warmup_epochs
+        )
         # Train for one epoch
         train_metrics = train_epoch(
             model, train_loader, criterion, optimizer, device,
-            config['clustering_weight']
+            clustering_weight
         )
         
         # Validate for one epoch
         val_metrics = validate(
-            model, val_loader, criterion, device, config['clustering_weight']
+            model, val_loader, criterion, device, clustering_weight
         )
         
-        # Update learning rate based on validation loss
-        scheduler.step(val_metrics['loss'])
+        # Update learning rate based on validation classification loss
+        scheduler.step(val_metrics['cls_loss'])
         
         # Save metrics to history
         for key in ['loss', 'cls_loss', 'cluster_loss', 'accuracy', 'balanced_accuracy']:
@@ -417,7 +469,10 @@ def main() -> None:
             f'Cluster Loss: {train_metrics["cluster_loss"]:.3e}, {val_metrics["cluster_loss"]:.3e} | '
             f'Accuracy: {train_metrics["accuracy"]:.4f}, {val_metrics["accuracy"]:.4f} | '
             f'Bal Acc: {train_metrics["balanced_accuracy"]:.4f}, '
-            f'{val_metrics["balanced_accuracy"]:.4f}'
+            f'{val_metrics["balanced_accuracy"]:.4f} | '
+            f'LR(cls/cluster): {optimizer.param_groups[0]["lr"]:.2e}/'
+            f'{optimizer.param_groups[1]["lr"]:.2e} | '
+            f'Cluster W: {clustering_weight:.3f}'
         )
         
         # Save best model using balanced accuracy as primary criterion
