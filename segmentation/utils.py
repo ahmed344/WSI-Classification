@@ -11,7 +11,7 @@ def crop_tissues(
     level: int = -1,
     min_area_ratio: float = 0.01,
     min_hole_ratio: float = 0.005,
-    hsv_lower: tuple = (0, 10, 0),
+    hsv_lower: tuple = (50, 50, 50),
     hsv_upper: tuple = (180, 255, 220),
     tile_size: tuple = (256, 256),
     pyramidal_levels: int = 6,
@@ -27,7 +27,7 @@ def crop_tissues(
         level (int): Pyramid level to process default -1 (lowest resolution).
         min_area_ratio (float): Minimum area ratio (relative to image size) to keep a tissue region default 0.01.
         min_hole_ratio (float): Minimum size ratio (relative to image size) to keep a whole tissue region default 0.005.
-        hsv_lower (tuple): Lower bound for HSV thresholding default (0, 10, 0) for H&E on white background.
+        hsv_lower (tuple): Lower bound for HSV thresholding default (50, 50, 50) for H&E on white background.
         hsv_upper (tuple): Upper bound for HSV thresholding default (180, 255, 220) for H&E on white background.
         tile_size (tuple): Tile size for saving OME-TIFF files default (256, 256).
         pyramidal_levels (int): Number of pyramid levels for OME-TIFF saving default 6.
