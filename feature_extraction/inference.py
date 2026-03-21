@@ -76,6 +76,12 @@ for slide_info in slides:
     if features_path.exists():
         print(f"{slide_base_name.split('.')[0]} already processed")
         continue
+
+    # Check if the tiles is missing
+    tiles_path = output_dir / f"{slide_base_name.split('.')[0]}_tiles.csv"
+    if not tiles_path.exists():
+        print(f"{slide_base_name.split('.')[0]} tiles is missing")
+        continue
     
     # Print the slide name with category
     print(f"Processing [{category}] {slide_name.split('.')[0]}")
@@ -86,30 +92,8 @@ for slide_info in slides:
     # Read the slide as RGB
     img = slide.read_region((0, 0), 0, slide.dimensions).convert("RGB")
 
-    # Convert RGB to HSV for color segmentation
-    hsv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2HSV)
-
-    # Threshold to segment tissue (non-white)
-    lower = (0, 10, 0)
-    upper = (180, 255, 220)
-    mask = cv2.inRange(hsv_img, lower, upper)
-
-    # Calculate tile centers for 448x448 tiles without intersection
-    delta = (TILE_SIZE[0] // 2, TILE_SIZE[1] // 2)
-    slide_width, slide_height = slide.dimensions
-    x_coords, y_coords = [], []
-    for y in range(delta[1], slide_height, TILE_SIZE[1]):
-        for x in range(delta[0], slide_width, TILE_SIZE[0]):
-            if np.median(mask[y-delta[1]:y+delta[1], x-delta[0]:x+delta[0]]) > 0:
-                x_coords.append(x)
-                y_coords.append(y)
-
-    # Create DataFrame with id, x, and y columns
-    tiles = pd.DataFrame({'id': range(len(x_coords)), 'x': x_coords, 'y': y_coords})
-
-    # Save the pixels
-    tiles_path = output_dir / f"{slide_base_name.split('.')[0]}_tiles.csv"
-    tiles.to_csv(tiles_path)
+    # Load the tiles
+    tiles = pd.read_csv(tiles_path)
 
     # Create the dataset
     dataset = WSI_tiles(slide=slide, tiles=tiles, transform=transform, size=TILE_SIZE)
