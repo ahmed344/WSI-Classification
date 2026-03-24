@@ -4,7 +4,7 @@
         "dockerfile": "Dockerfile"
     },
 
-    "runArgs": ["--gpus", "all"],
+    "runArgs": ["--gpus", "all", "--shm-size=8g"],
 
 	// Configure tool-specific properties.
 	"customizations": {
