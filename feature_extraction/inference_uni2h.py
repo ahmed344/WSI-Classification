@@ -1,10 +1,11 @@
 import torch
-from torchvision import transforms
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+import timm
 import pandas as pd
 import os
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 from pathlib import Path
+from torchvision import transforms
 
 from dataset import WSI_tiles
 
@@ -14,7 +15,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Hyperparameters
 path = "/workspaces/WSI-Classification/data/HE-MYO/Processed/"
 TILE_SIZE= (448, 448)
-BATCH_SIZE = 256
+BATCH_SIZE = 512
 
 # List the slides  all category directories (Dystrophic, Healthy, Inflammatory, Myopathic, Neurogenic)
 slides = []
@@ -34,12 +35,26 @@ for category_dir in os.listdir(path):
                         'slide_dir': slide_dir
                     })
 
-# # Create the model
-# model = timm.create_model("hf-hub:bioptimus/H-optimus-0", pretrained=True, init_values=1e-5, dynamic_img_size=False)
+# pretrained=True needed to load UNI2-h weights (and download weights for the first time)
+timm_kwargs = {
+            'model_name': 'hf-hub:MahmoodLab/UNI2-h',
+            'img_size': 224, 
+            'patch_size': 14, 
+            'depth': 24,
+            'num_heads': 24,
+            'init_values': 1e-5, 
+            'embed_dim': 1536,
+            'mlp_ratio': 2.66667*2,
+            'num_classes': 0, 
+            'no_embed_class': True,
+            'mlp_layer': timm.layers.SwiGLUPacked, 
+            'act_layer': torch.nn.SiLU, 
+            'reg_tokens': 8, 
+            'dynamic_img_size': True
+        }
 
-# Load the whole model
-model = torch.load("/workspaces/WSI-Classification/models/H-Optimus-0.pth", map_location=device, weights_only=False)
-
+# Create the model
+model = timm.create_model(pretrained=True, **timm_kwargs)
 # Put the model on the device
 model = model.to(device)
 
@@ -47,14 +62,13 @@ model = model.to(device)
 model.eval()
 
 # Create the transform function from the model configuration
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=(0.707223, 0.578729, 0.703617), 
-        std=(0.211883, 0.230117, 0.177517)
-    ),
-])
+transform = transforms.Compose(
+    [
+        transforms.Resize(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ]
+)
 
 for slide_info in slides:
     slide_name = slide_info['name']
@@ -68,7 +82,7 @@ for slide_info in slides:
     
     # Check if the embedding features already exist
     slide_base_name = Path(slide_name).stem
-    features_path = output_dir / f"{slide_base_name.split('.')[0]}_features.pt"
+    features_path = output_dir / f"{slide_base_name.split('.')[0]}_features_uni2h.pt"
     if features_path.exists():
         print(f"{slide_base_name.split('.')[0]} already processed")
         continue
