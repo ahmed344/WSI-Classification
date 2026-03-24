@@ -20,24 +20,41 @@ class AttentionBranch(nn.Module):
     for classification. Each branch learns to attend to class-specific regions.
     """
     
-    def __init__(self, input_dim: int, hidden_dim: int = 512) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 512,
+        attention_hidden_dim: int = 512,
+        attention_dim: int = 256,
+        feature_dropout: float = 0.25
+    ) -> None:
         """
         Initialize attention branch.
         
         Args:
             input_dim (int): Dimension of input features (typically 1536 for H-Optimus).
             hidden_dim (int): Dimension of hidden layers. Defaults to 512.
+            attention_hidden_dim (int): Intermediate attention MLP dimension.
+                Defaults to 512.
+            attention_dim (int): Attention projection dimension before scalar score.
+                Defaults to 256.
+            feature_dropout (float): Dropout probability used in branch feature
+                extractor.
+                Defaults to 0.25.
+
+        Returns:
+            None: This constructor initializes attention branch modules in-place.
         """
         super(AttentionBranch, self).__init__()
         # Intermediate dimensions for attention computation
-        self.L = 500  # Intermediate dimension for attention network
-        self.D = 256  # Attention dimension
+        self.L = attention_hidden_dim
+        self.D = attention_dim
         
         # Feature extraction network
         self.feature_extractor = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.25)
+            nn.Dropout(feature_dropout)
         )
         
         # Attention network: computes attention weights for each tile
@@ -107,7 +124,9 @@ class ClusteringBranch(nn.Module):
         self,
         input_dim: int,
         hidden_dim: int = 512,
-        k_clusters: int = 2
+        k_clusters: int = 2,
+        feature_dropout: float = 0.25,
+        cluster_head_hidden_dim: Optional[int] = None
     ) -> None:
         """
         Initialize clustering branch.
@@ -116,22 +135,34 @@ class ClusteringBranch(nn.Module):
             input_dim (int): Dimension of input features.
             hidden_dim (int): Dimension of hidden layers. Defaults to 512.
             k_clusters (int): Number of clusters to assign tiles to. Defaults to 2.
+            feature_dropout (float): Dropout probability used in branch feature
+                extractor.
+                Defaults to 0.25.
+            cluster_head_hidden_dim (Optional[int]): Hidden dimension of clustering
+                head MLP. If None, uses hidden_dim // 2. Defaults to None.
+
+        Returns:
+            None: This constructor initializes clustering branch modules in-place.
         """
         super(ClusteringBranch, self).__init__()
         self.k_clusters = k_clusters
+        cluster_mlp_hidden_dim = (
+            hidden_dim // 2 if cluster_head_hidden_dim is None
+            else cluster_head_hidden_dim
+        )
         
         # Feature extraction network
         self.feature_extractor = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.25)
+            nn.Dropout(feature_dropout)
         )
         
         # Cluster assignment network: maps features to cluster logits
         self.cluster_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim, cluster_mlp_hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, k_clusters)
+            nn.Linear(cluster_mlp_hidden_dim, k_clusters)
         )
     
     def forward(
@@ -184,7 +215,13 @@ class CLAM_MB(nn.Module):
         hidden_dim: int = 512,
         num_classes: int = 5,
         k_clusters: int = 2,
-        dropout: float = 0.25
+        attention_hidden_dim: int = 512,
+        attention_dim: int = 256,
+        cluster_head_hidden_dim: Optional[int] = None,
+        feature_projection_dropout: float = 0.25,
+        attention_branch_feature_dropout: float = 0.25,
+        clustering_branch_feature_dropout: float = 0.25,
+        final_classifier_dropout: float = 0.25
     ) -> None:
         """
         Initialize CLAM-MB model.
@@ -194,7 +231,24 @@ class CLAM_MB(nn.Module):
             hidden_dim (int): Dimension of hidden layers. Defaults to 512.
             num_classes (int): Number of classification classes. Defaults to 5.
             k_clusters (int): Number of clusters for clustering branch. Defaults to 2.
-            dropout (float): Dropout probability. Defaults to 0.25.
+            attention_hidden_dim (int): Intermediate attention MLP dimension used
+                in each attention branch. Defaults to 512.
+            attention_dim (int): Attention projection dimension used in each
+                attention branch. Defaults to 256.
+            cluster_head_hidden_dim (Optional[int]): Hidden dimension used in
+                clustering head MLP. If None, uses hidden_dim // 2.
+                Defaults to None.
+            feature_projection_dropout (float): Dropout probability used in the
+                shared input feature projection block. Defaults to 0.25.
+            attention_branch_feature_dropout (float): Dropout probability used
+                in each attention branch feature extractor. Defaults to 0.25.
+            clustering_branch_feature_dropout (float): Dropout probability used
+                in the clustering branch feature extractor. Defaults to 0.25.
+            final_classifier_dropout (float): Dropout probability used in the
+                final classifier MLP. Defaults to 0.25.
+
+        Returns:
+            None: This constructor initializes CLAM-MB modules in-place.
         """
         super(CLAM_MB, self).__init__()
         self.num_classes = num_classes
@@ -204,25 +258,35 @@ class CLAM_MB(nn.Module):
         self.feature_projection = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout)
+            nn.Dropout(feature_projection_dropout)
         )
         
         # Multiple attention branches: one per class
         # Each branch learns to attend to class-specific regions
         self.attention_branches = nn.ModuleList([
-            AttentionBranch(hidden_dim, hidden_dim) for _ in range(num_classes)
+            AttentionBranch(
+                input_dim=hidden_dim,
+                hidden_dim=hidden_dim,
+                attention_hidden_dim=attention_hidden_dim,
+                attention_dim=attention_dim,
+                feature_dropout=attention_branch_feature_dropout
+            ) for _ in range(num_classes)
         ])
         
         # Clustering branch: provides unsupervised learning constraint
         self.clustering_branch = ClusteringBranch(
-            hidden_dim, hidden_dim, k_clusters
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            k_clusters=k_clusters,
+            feature_dropout=clustering_branch_feature_dropout,
+            cluster_head_hidden_dim=cluster_head_hidden_dim
         )
         
         # Final classification head: combines branch outputs
         self.classifier = nn.Sequential(
             nn.Linear(num_classes, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(final_classifier_dropout),
             nn.Linear(hidden_dim, num_classes)
         )
     

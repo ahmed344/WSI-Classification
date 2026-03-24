@@ -8,6 +8,14 @@ output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results"
 # Model architecture
 input_dim: 1536
 hidden_dim: 512
+attention_hidden_dim: 256  # Intermediate dimension for attention network
+attention_dim: 256  # Projection dimension for attention scoring
+feature_projection_dropout: 0.3  # Dropout in shared input feature projection
+attention_branch_feature_dropout: 0.3  # Dropout in attention branch feature extractors
+clustering_branch_feature_dropout: 0.3  # Dropout in clustering branch feature extractor
+final_classifier_dropout: 0.3  # Dropout in final classifier MLP
+dropout: 0.3  # Legacy fallback used when specific dropout keys are not provided
+cluster_head_hidden_dim: 256  # Hidden dimension in clustering head MLP
 num_classes: 5
 k_clusters: 10
 
@@ -15,11 +23,11 @@ k_clusters: 10
 batch_size: 64
 epochs: 1000
 lr_cls: 0.0001
-lr_cluster: 0.0003
-weight_decay: 0.001
+lr_cluster: 0.001
+weight_decay: 0.05
 clustering_weight_start: 0.1
-clustering_weight_end: 0.5
-clustering_warmup_epochs: 20
+clustering_weight_end: 0.3
+clustering_warmup_epochs: 10
 train_ratio: 0.8
 patience: 10
 random_seed: 42

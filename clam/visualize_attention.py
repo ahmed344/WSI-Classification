@@ -471,6 +471,7 @@ def main() -> None:
         hidden_dim = model_config.get('hidden_dim', config['hidden_dim'])
         num_classes = model_config.get('num_classes', config['num_classes'])
         k_clusters = model_config.get('k_clusters', config['k_clusters'])
+        architecture_source = model_config
         class_folders = checkpoint.get('class_folders', None)
     elif 'args' in checkpoint:
         model_args = checkpoint['args']
@@ -478,6 +479,7 @@ def main() -> None:
         hidden_dim = model_args.get('hidden_dim', config['hidden_dim'])
         num_classes = model_args.get('num_classes', config['num_classes'])
         k_clusters = model_args.get('k_clusters', config['k_clusters'])
+        architecture_source = model_args
         class_folders = checkpoint.get('class_folders', None)
     else:
         # Fallback to config file values
@@ -485,6 +487,7 @@ def main() -> None:
         hidden_dim = config['hidden_dim']
         num_classes = config['num_classes']
         k_clusters = config['k_clusters']
+        architecture_source = config
         class_folders = None
     
     # Auto-detect class folders if not in checkpoint
@@ -498,12 +501,24 @@ def main() -> None:
     
     # Create model with extracted configuration
     print('Creating model...')
-    model = CLAM_MB(
-        input_dim=input_dim,
-        hidden_dim=hidden_dim,
-        num_classes=num_classes,
-        k_clusters=k_clusters
-    ).to(device)
+    model_kwargs: Dict[str, Any] = {
+        'input_dim': input_dim,
+        'hidden_dim': hidden_dim,
+        'num_classes': num_classes,
+        'k_clusters': k_clusters
+    }
+    for key in [
+        'attention_hidden_dim',
+        'attention_dim',
+        'cluster_head_hidden_dim',
+        'dropout'
+    ]:
+        value = architecture_source.get(key)
+        if value is None:
+            value = config.get(key)
+        if value is not None:
+            model_kwargs[key] = value
+    model = CLAM_MB(**model_kwargs).to(device)
     
     # Load model weights from checkpoint
     model.load_state_dict(checkpoint['model_state_dict'])

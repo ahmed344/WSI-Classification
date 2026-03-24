@@ -375,11 +375,27 @@ def main() -> None:
     
     # Create model with configuration parameters
     print('Creating model...')
+    legacy_dropout = config.get('dropout', 0.25)
     model = CLAM_MB(
         input_dim=config['input_dim'],
         hidden_dim=config['hidden_dim'],
         num_classes=config['num_classes'],
-        k_clusters=config['k_clusters']
+        k_clusters=config['k_clusters'],
+        attention_hidden_dim=config.get('attention_hidden_dim'),
+        attention_dim=config.get('attention_dim'),
+        cluster_head_hidden_dim=config.get('cluster_head_hidden_dim'),
+        feature_projection_dropout=config.get(
+            'feature_projection_dropout', legacy_dropout
+        ),
+        attention_branch_feature_dropout=config.get(
+            'attention_branch_feature_dropout', legacy_dropout
+        ),
+        clustering_branch_feature_dropout=config.get(
+            'clustering_branch_feature_dropout', legacy_dropout
+        ),
+        final_classifier_dropout=config.get(
+            'final_classifier_dropout', legacy_dropout
+        )
     ).to(device)
     
     print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
@@ -422,6 +438,7 @@ def main() -> None:
     # Initialize best validation metrics and early stopping counter
     best_val_cls_loss = float('inf')
     best_val_balanced_acc = 0.0
+    best_epoch = 1
     patience_counter = 0
     
     # Training loop
@@ -487,6 +504,7 @@ def main() -> None:
             # Update best validation metrics
             best_val_cls_loss = val_metrics['cls_loss']
             best_val_balanced_acc = val_metrics['balanced_accuracy']
+            best_epoch = epoch + 1
             patience_counter = 0  # Reset patience counter
             
             # Create checkpoint dictionary
@@ -554,16 +572,37 @@ def main() -> None:
     # Plot training history curves
     plot_keys = ['loss', 'cls_loss', 'cluster_loss', 'accuracy', 'balanced_accuracy']
     fig, ax = plt.subplots(nrows=len(plot_keys), figsize=(10, 18))
+    train_handle = None
+    val_handle = None
+    best_epoch_handle = None
     for i, key in enumerate(plot_keys):
-        ax[i].plot(history['train'][key], label='Train')
-        ax[i].plot(history['val'][key], label='Val')
+        train_line, = ax[i].plot(history['train'][key], label='Train')
+        val_line, = ax[i].plot(history['val'][key], label='Val')
+        best_line = ax[i].axvline(
+            x=best_epoch - 1,
+            color='red',
+            linestyle='--',
+            linewidth=1.5,
+            label='Best model epoch'
+        )
+        if i == 0:
+            train_handle = train_line
+            val_handle = val_line
+            best_epoch_handle = best_line
         ax[i].set_ylabel(key)
-        ax[i].legend()
         # Use log scale for loss metrics (not accuracy)
         if key in ['loss', 'cls_loss', 'cluster_loss']:
             ax[i].set_yscale('log')
     ax[-1].set_xlabel('Epoch')
-    plt.tight_layout()
+    fig.legend(
+        [train_handle, val_handle, best_epoch_handle],
+        ['Train', 'Val', 'Best model epoch'],
+        loc='upper center',
+        ncol=3,
+        fontsize=12,
+        frameon=True
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(
         os.path.join(config['checkpoint_dir'], 'training_history.png')
     )
