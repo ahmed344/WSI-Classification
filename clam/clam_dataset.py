@@ -233,6 +233,186 @@ class WSIFeatureDataset(Dataset):
         }
 
 
+class WSISlideBagDataset(Dataset):
+    """
+    Dataset that builds one bag per slide by concatenating all tissue features.
+
+    Each sample corresponds to one slide directory. All tissue feature files that
+    match the selected feature suffix are loaded and concatenated along the tile
+    dimension to build a single slide-level bag.
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        class_folders: Optional[List[str]] = None,
+        split: str = 'train',
+        train_ratio: float = 0.9,
+        random_seed: int = 42,
+        feature_file_suffix: str = '_features.pt'
+    ) -> None:
+        """
+        Initialize the slide-level bag dataset.
+
+        Args:
+            data_root (str): Root directory containing class folders.
+            class_folders (Optional[List[str]]): Class folder names. If None,
+                class folders are auto-detected from `data_root`.
+            split (str): Dataset split name. Must be `'train'` or `'val'`.
+            train_ratio (float): Ratio of slides assigned to train split.
+            random_seed (int): Random seed used in reproducible split.
+            feature_file_suffix (str): Suffix used to select feature files.
+
+        Returns:
+            None: This constructor initializes dataset metadata and split indices.
+        """
+        self.data_root: str = data_root
+        self.split: str = split
+        self.feature_file_suffix: str = feature_file_suffix
+        if len(self.feature_file_suffix) == 0:
+            raise ValueError("feature_file_suffix must be a non-empty string.")
+
+        if class_folders is None:
+            class_folders = sorted([
+                d for d in os.listdir(data_root)
+                if os.path.isdir(os.path.join(data_root, d))
+            ])
+
+        self.class_folders: List[str] = class_folders
+        self.class_to_idx: Dict[str, int] = {
+            cls: idx for idx, cls in enumerate(class_folders)
+        }
+        self.idx_to_class: Dict[int, str] = {
+            idx: cls for cls, idx in self.class_to_idx.items()
+        }
+        self.num_classes: int = len(class_folders)
+
+        # slide_key -> slide sample metadata
+        slide_samples: Dict[str, Dict[str, Any]] = {}
+        unique_slides: List[str] = []
+        unique_slide_labels: List[int] = []
+
+        for class_folder in class_folders:
+            class_path = os.path.join(data_root, class_folder)
+            if not os.path.isdir(class_path):
+                continue
+
+            for slide_dir in os.listdir(class_path):
+                slide_path = os.path.join(class_path, slide_dir)
+                if not os.path.isdir(slide_path):
+                    continue
+
+                feature_paths: List[str] = []
+                tissue_names: List[str] = []
+                for item in os.listdir(slide_path):
+                    if not item.endswith(self.feature_file_suffix):
+                        continue
+
+                    tissue_name = item[:-len(self.feature_file_suffix)]
+                    feature_path = os.path.join(slide_path, item)
+                    tiles_path = os.path.join(slide_path, f"{tissue_name}_tiles.csv")
+                    if os.path.exists(feature_path) and os.path.exists(tiles_path):
+                        feature_paths.append(feature_path)
+                        tissue_names.append(tissue_name)
+
+                if len(feature_paths) == 0:
+                    continue
+
+                slide_key = f"{class_folder}/{slide_dir}"
+                sorted_pairs = sorted(
+                    zip(tissue_names, feature_paths),
+                    key=lambda pair: pair[0]
+                )
+                sorted_tissue_names = [pair[0] for pair in sorted_pairs]
+                sorted_feature_paths = [pair[1] for pair in sorted_pairs]
+
+                slide_samples[slide_key] = {
+                    'slide_name': slide_dir,
+                    'class': class_folder,
+                    'feature_paths': sorted_feature_paths,
+                    'tissue_names': sorted_tissue_names
+                }
+                unique_slides.append(slide_key)
+                unique_slide_labels.append(self.class_to_idx[class_folder])
+
+        self.slides: List[Dict[str, Any]] = [
+            slide_samples[slide_key] for slide_key in unique_slides
+        ]
+
+        if len(unique_slides) > 0:
+            train_slide_indices, val_slide_indices = train_test_split(
+                range(len(unique_slides)),
+                test_size=1 - train_ratio,
+                random_state=random_seed,
+                stratify=unique_slide_labels
+            )
+            if split == 'train':
+                self.indices: List[int] = list(train_slide_indices)
+            elif split == 'val':
+                self.indices = list(val_slide_indices)
+            else:
+                raise ValueError(f"Invalid split: {split}. Must be 'train' or 'val'.")
+        else:
+            self.indices = []
+
+    def __len__(self) -> int:
+        """
+        Get the number of slide bags in the selected split.
+
+        Args:
+            None
+
+        Returns:
+            int: Number of slide-level samples in current split.
+        """
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """
+        Get one slide-level bag made from all tissue features in the slide.
+
+        Args:
+            idx (int): Index of the slide sample in split-local indexing.
+
+        Returns:
+            Dict[str, Any]: Dictionary containing:
+                - `features` (torch.Tensor): Slide bag feature tensor with shape
+                  `[total_tiles_in_slide, feature_dim]`.
+                - `label` (int): Integer class label for the slide.
+                - `slide_name` (str): Name of the slide directory.
+                - `tissue_name` (str): Synthetic identifier for compatibility
+                  with collate logic.
+                - `num_tissues` (int): Number of tissues concatenated for this slide.
+        """
+        actual_idx = self.indices[idx]
+        slide_info = self.slides[actual_idx]
+
+        features_list: List[torch.Tensor] = []
+        for feature_path in slide_info['feature_paths']:
+            features_tensor = torch.load(
+                feature_path,
+                map_location='cpu',
+                weights_only=False
+            )
+            if not isinstance(features_tensor, torch.Tensor):
+                features_tensor = torch.FloatTensor(features_tensor)
+            else:
+                features_tensor = features_tensor.float()
+            features_list.append(features_tensor)
+
+        concatenated_features = torch.cat(features_list, dim=0)
+        label = self.class_to_idx[slide_info['class']]
+        tissue_names = slide_info['tissue_names']
+
+        return {
+            'features': concatenated_features,
+            'label': label,
+            'slide_name': slide_info['slide_name'],
+            'tissue_name': f"slide_bag::{slide_info['slide_name']}",
+            'num_tissues': len(tissue_names)
+        }
+
+
 def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Custom collate function to handle variable-length sequences.

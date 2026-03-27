@@ -15,26 +15,38 @@ import json
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from clam_dataset import WSIFeatureDataset, collate_fn
+from clam_dataset import WSIFeatureDataset, WSISlideBagDataset, collate_fn
 from clam_model import CLAM_MB
 from config_loader import load_config, resolve_feature_file_suffix
 
 
-def get_class_sample_counts(dataset: WSIFeatureDataset) -> Dict[str, int]:
+def get_class_sample_counts(dataset: Any) -> Dict[str, int]:
     """
     Calculate sample counts per class for a dataset split.
 
     Args:
-        dataset (WSIFeatureDataset): Dataset instance containing split indices and tissue metadata.
+        dataset (Any): Dataset instance containing split indices and either tissue
+            metadata (`tissues`) or slide metadata (`slides`).
 
     Returns:
         Dict[str, int]: Mapping from class name to number of samples in the dataset split.
     """
     class_counts: Dict[str, int] = {class_name: 0 for class_name in dataset.class_folders}
-    for tissue_idx in dataset.indices:
-        class_name = dataset.tissues[tissue_idx]['class']
-        class_counts[class_name] += 1
-    return class_counts
+    if hasattr(dataset, 'tissues'):
+        for sample_idx in dataset.indices:
+            class_name = dataset.tissues[sample_idx]['class']
+            class_counts[class_name] += 1
+        return class_counts
+
+    if hasattr(dataset, 'slides'):
+        for sample_idx in dataset.indices:
+            class_name = dataset.slides[sample_idx]['class']
+            class_counts[class_name] += 1
+        return class_counts
+
+    raise AttributeError(
+        "Dataset must provide either 'tissues' or 'slides' metadata for class counting."
+    )
 
 
 def evaluate(
@@ -62,6 +74,7 @@ def evaluate(
             - 'labels' (List[int]): List of true class indices.
             - 'probabilities' (List[List[float]]): List of prediction probabilities for each sample.
             - 'slide_names' (List[str]): List of slide names for each sample.
+            - 'tissue_names' (List[str]): List of tissue names for each sample.
             - 'attention_weights' (List[np.ndarray]): List of attention weight arrays (if available).
     """
     model.eval()
@@ -69,6 +82,7 @@ def evaluate(
     all_labels: List[int] = []
     all_probs: List[List[float]] = []
     all_slide_names: List[str] = []
+    all_tissue_names: List[str] = []
     all_attention_weights: List[np.ndarray] = []
     
     # Disable gradient computation for evaluation
@@ -79,6 +93,7 @@ def evaluate(
             labels = batch['labels'].to(device)
             masks = batch['masks'].to(device)
             slide_names = batch['slide_names']
+            tissue_names = batch['tissue_names']
             
             # Forward pass through model
             outputs = model(features, masks)
@@ -94,6 +109,7 @@ def evaluate(
             all_labels.extend(labels.cpu().numpy())
             all_probs.extend(probs.cpu().numpy())
             all_slide_names.extend(slide_names)
+            all_tissue_names.extend(tissue_names)
             
             # Store attention weights (average across branches for visualization)
             if attention_weights:
@@ -126,6 +142,7 @@ def evaluate(
         'labels': all_labels,
         'probabilities': all_probs,
         'slide_names': all_slide_names,
+        'tissue_names': all_tissue_names,
         'attention_weights': all_attention_weights
     }
 
@@ -216,6 +233,168 @@ def print_metrics(metrics: Dict[str, Any], class_names: List[str]) -> None:
     print('='*60)
 
 
+def create_dataset_for_level(
+    level: str,
+    data_root: str,
+    class_folders: List[str],
+    split: str,
+    train_ratio: float,
+    random_seed: int,
+    feature_file_suffix: str
+) -> Any:
+    """
+    Create a dataset for the selected evaluation level and split.
+
+    Args:
+        level (str): Evaluation level name (`'tissue'` or `'slide'`).
+        data_root (str): Root directory containing class folders.
+        class_folders (List[str]): Ordered class folder names.
+        split (str): Dataset split (`'train'` or `'val'`).
+        train_ratio (float): Ratio of slides assigned to training split.
+        random_seed (int): Seed for reproducible split generation.
+        feature_file_suffix (str): Feature suffix used to select input files.
+
+    Returns:
+        Any: Instantiated dataset object for the requested level.
+    """
+    if level == 'tissue':
+        return WSIFeatureDataset(
+            data_root=data_root,
+            class_folders=class_folders,
+            split=split,
+            train_ratio=train_ratio,
+            random_seed=random_seed,
+            feature_file_suffix=feature_file_suffix
+        )
+    if level == 'slide':
+        return WSISlideBagDataset(
+            data_root=data_root,
+            class_folders=class_folders,
+            split=split,
+            train_ratio=train_ratio,
+            random_seed=random_seed,
+            feature_file_suffix=feature_file_suffix
+        )
+    raise ValueError(f"Invalid level '{level}'. Expected 'tissue' or 'slide'.")
+
+
+def save_level_results(
+    metrics: Dict[str, Any],
+    class_folders: List[str],
+    output_dir: str,
+    level: str,
+    split: str,
+    plot_cm: bool
+) -> None:
+    """
+    Save evaluation summaries, confusion matrix, and per-sample predictions.
+
+    Args:
+        metrics (Dict[str, Any]): Output dictionary returned by `evaluate`.
+        class_folders (List[str]): Ordered class names.
+        output_dir (str): Directory where artifacts are written.
+        level (str): Evaluation level label (`'tissue'` or `'slide'`).
+        split (str): Dataset split label (`'train'` or `'val'`).
+        plot_cm (bool): Whether to export confusion matrix image.
+
+    Returns:
+        None: This function writes files to disk.
+    """
+    results = {
+        'accuracy': float(metrics['accuracy']),
+        'confusion_matrix': metrics['confusion_matrix'].tolist(),
+        'classification_report': metrics['classification_report'],
+        'predictions': [int(p) for p in metrics['predictions']],
+        'labels': [int(l) for l in metrics['labels']],
+        'slide_names': metrics['slide_names'],
+        'tissue_names': metrics['tissue_names']
+    }
+    results_path = os.path.join(output_dir, f'{level}_evaluation_{split}.json')
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f'Results saved to {results_path}')
+
+    predictions: List[Dict[str, Any]] = []
+    for i, slide_name in enumerate(metrics['slide_names']):
+        predictions.append({
+            'slide_name': slide_name,
+            'tissue_name': metrics['tissue_names'][i],
+            'true_label': int(metrics['labels'][i]),
+            'predicted_label': int(metrics['predictions'][i]),
+            'true_class': class_folders[metrics['labels'][i]],
+            'predicted_class': class_folders[metrics['predictions'][i]],
+            'probabilities': {
+                class_folders[j]: float(metrics['probabilities'][i][j])
+                for j in range(len(class_folders))
+            }
+        })
+    predictions_path = os.path.join(output_dir, f'{level}_predictions_{split}.json')
+    with open(predictions_path, 'w') as f:
+        json.dump(predictions, f, indent=2)
+    print(f'Predictions saved to {predictions_path}')
+
+    if plot_cm:
+        cm_path = os.path.join(output_dir, f'{level}_confusion_matrix_{split}.png')
+        plot_confusion_matrix(metrics['confusion_matrix'], class_folders, cm_path)
+
+
+def run_level_split_evaluation(
+    model: CLAM_MB,
+    config: Dict[str, Any],
+    class_folders: List[str],
+    feature_file_suffix: str,
+    device: torch.device,
+    output_dir: str,
+    level: str,
+    split: str,
+    plot_cm: bool
+) -> None:
+    """
+    Run one evaluation job for a level/split pair and persist artifacts.
+
+    Args:
+        model (CLAM_MB): Loaded CLAM model in evaluation mode.
+        config (Dict[str, Any]): Global configuration dictionary.
+        class_folders (List[str]): Ordered class names for label decoding.
+        feature_file_suffix (str): Feature suffix selected in config.
+        device (torch.device): Evaluation device.
+        output_dir (str): Evaluation output directory.
+        level (str): Evaluation level (`'tissue'` or `'slide'`).
+        split (str): Dataset split (`'train'` or `'val'`).
+        plot_cm (bool): Whether to export confusion matrix image.
+
+    Returns:
+        None: This function runs evaluation and writes artifacts to disk.
+    """
+    print('\n' + '-' * 60)
+    print(f'Running {level} evaluation on {split} split...')
+    dataset = create_dataset_for_level(
+        level=level,
+        data_root=config['data_root'],
+        class_folders=class_folders,
+        split=split,
+        train_ratio=config['train_ratio'],
+        random_seed=config['random_seed'],
+        feature_file_suffix=feature_file_suffix
+    )
+    class_counts = get_class_sample_counts(dataset)
+    print(f'Number of {level} samples ({split}): {len(dataset)}')
+    print(f'{split.capitalize()} samples per class:')
+    for class_name in class_folders:
+        print(f'  {class_name}: {class_counts[class_name]}')
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config['batch_size'],
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0
+    )
+    metrics = evaluate(model, dataloader, device, class_folders)
+    print_metrics(metrics, class_folders)
+    save_level_results(metrics, class_folders, output_dir, level, split, plot_cm)
+
+
 def main() -> None:
     """
     Main evaluation function.
@@ -241,7 +420,6 @@ def main() -> None:
     
     # Get evaluation parameters from config
     eval_config = config.get('evaluation', {})
-    split = eval_config.get('split', 'val')
     plot_cm = eval_config.get('plot_cm', True)
     
     # Create output directory if it doesn't exist
@@ -321,80 +499,20 @@ def main() -> None:
     model.load_state_dict(checkpoint['model_state_dict'])
     print('Model loaded successfully')
     
-    # Create dataset for specified split
-    print(f'Loading {split} dataset...')
-    dataset = WSIFeatureDataset(
-        config['data_root'],
-        class_folders=class_folders,
-        split=split,
-        train_ratio=config['train_ratio'],
-        random_seed=config['random_seed'],
-        feature_file_suffix=feature_file_suffix
-    )
-    
-    class_counts = get_class_sample_counts(dataset)
-    print(f'Number of samples: {len(dataset)}')
-    print(f'{split.capitalize()} samples per class:')
-    for class_name in class_folders:
-        print(f'  {class_name}: {class_counts[class_name]}')
-    
-    # Create dataloader
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=0
-    )
-    
-    # Evaluate model
-    print('Evaluating model...')
-    metrics = evaluate(model, dataloader, device, class_folders)
-    
-    # Print metrics to console
-    print_metrics(metrics, class_folders)
-    
-    # Save results as JSON (convert numpy types to native Python types)
-    results = {
-        'accuracy': float(metrics['accuracy']),
-        'confusion_matrix': metrics['confusion_matrix'].tolist(),
-        'classification_report': metrics['classification_report'],
-        'predictions': [int(p) for p in metrics['predictions']],
-        'labels': [int(l) for l in metrics['labels']],
-        'slide_names': metrics['slide_names']
-    }
-    
-    results_path = os.path.join(output_dir, f'evaluation_{split}.json')
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f'\nResults saved to {results_path}')
-    
-    # Plot and save confusion matrix if requested
-    if plot_cm:
-        cm_path = os.path.join(output_dir, f'confusion_matrix_{split}.png')
-        plot_confusion_matrix(metrics['confusion_matrix'], class_folders, cm_path)
-    
-    # Save per-slide predictions with probabilities
-    slide_results: List[Dict[str, Any]] = []
-    for i, slide_name in enumerate(metrics['slide_names']):
-        slide_results.append({
-            'slide_name': slide_name,
-            'true_label': int(metrics['labels'][i]),
-            'predicted_label': int(metrics['predictions'][i]),
-            'true_class': class_folders[metrics['labels'][i]],
-            'predicted_class': class_folders[metrics['predictions'][i]],
-            'probabilities': {
-                class_folders[j]: float(metrics['probabilities'][i][j])
-                for j in range(len(class_folders))
-            }
-        })
-    
-    slide_results_path = os.path.join(
-        output_dir, f'slide_predictions_{split}.json'
-    )
-    with open(slide_results_path, 'w') as f:
-        json.dump(slide_results, f, indent=2)
-    print(f'Per-slide predictions saved to {slide_results_path}')
+    # Run both levels on both splits.
+    for split in ['train', 'val']:
+        for level in ['tissue', 'slide']:
+            run_level_split_evaluation(
+                model=model,
+                config=config,
+                class_folders=class_folders,
+                feature_file_suffix=feature_file_suffix,
+                device=device,
+                output_dir=output_dir,
+                level=level,
+                split=split,
+                plot_cm=plot_cm
+            )
 
 
 if __name__ == '__main__':
