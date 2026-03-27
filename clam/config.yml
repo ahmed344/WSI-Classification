@@ -31,6 +31,9 @@ batch_size: 64
 epochs: 1000
 lr_cls: 0.00001
 lr_cluster: 0.01
+use_weighted_sampler: true  # If true, train DataLoader uses WeightedRandomSampler
+use_class_weighted_loss: false  # If true, CrossEntropyLoss uses inverse-frequency class weights
+best_checkpoint_metric: "balanced_accuracy"  # Options: balanced_accuracy, accuracy, loss, classification_loss, clustering_loss
 weight_decay_cls: 0.001  # Weight decay for feature projection, attention branches, and classifier
 weight_decay_cluster: 0.01  # Weight decay for clustering branch
 clustering_weight_start: 0.01
@@ -40,11 +43,6 @@ train_ratio: 0.8
 min_epochs_before_early_stopping: 100
 patience: 50
 random_seed: 42
-
-# Evaluation parameters
-evaluation:
-  split: "val"  # 'train' or 'val'
-  plot_cm: true  # Plot confusion matrix
 
 # Visualization parameters
 visualization:

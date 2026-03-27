@@ -5,7 +5,7 @@ This module provides training functionality for the CLAM-MB model using a mixed
 loss function combining classification loss and clustering loss. It includes
 early stopping, learning rate scheduling, and checkpoint saving.
 """
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import os
 import torch
 import torch.nn as nn
@@ -119,6 +119,38 @@ def get_clustering_weight_for_epoch(
         return float(weight_end)
     progress = min(max(epoch_idx, 0), warmup_epochs - 1) / (warmup_epochs - 1)
     return float(weight_start + progress * (weight_end - weight_start))
+
+
+def resolve_best_checkpoint_metric(
+    metric_name: str
+) -> Tuple[str, bool, str]:
+    """
+    Resolve checkpoint metric config into validation key and optimization direction.
+
+    Args:
+        metric_name (str): User-selected checkpoint metric name from config.
+
+    Returns:
+        Tuple[str, bool, str]: Tuple containing:
+            - validation metric key used in `val_metrics`
+            - boolean flag indicating whether metric should be maximized
+            - normalized config metric name
+    """
+    normalized_name = str(metric_name).strip().lower()
+    metric_mapping: Dict[str, Tuple[str, bool, str]] = {
+        'balanced_accuracy': ('balanced_accuracy', True, 'balanced_accuracy'),
+        'accuracy': ('accuracy', True, 'accuracy'),
+        'loss': ('loss', False, 'loss'),
+        'classification_loss': ('cls_loss', False, 'classification_loss'),
+        'clustering_loss': ('cluster_loss', False, 'clustering_loss')
+    }
+    if normalized_name not in metric_mapping:
+        valid_metrics = ', '.join(metric_mapping.keys())
+        raise ValueError(
+            f"Invalid best_checkpoint_metric '{metric_name}'. "
+            f"Valid options are: {valid_metrics}."
+        )
+    return metric_mapping[normalized_name]
 
 
 def train_epoch(
@@ -358,26 +390,53 @@ def main() -> None:
         print(f'  {class_name}: {val_class_counts[class_name]}')
     
     # Create data loaders
+    use_weighted_sampler = bool(config.get('use_weighted_sampler', True))
+    use_class_weighted_loss = bool(config.get('use_class_weighted_loss', False))
+    (
+        best_checkpoint_metric_key,
+        maximize_best_checkpoint_metric,
+        best_checkpoint_metric_name
+    ) = resolve_best_checkpoint_metric(
+        config.get('best_checkpoint_metric', 'balanced_accuracy')
+    )
     class_weights = compute_class_weights(train_dataset)
-    sample_weights = compute_sample_weights(train_dataset, class_weights)
-    train_sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config['batch_size'],
-        sampler=train_sampler,
-        collate_fn=collate_fn,
-        num_workers=0  # Set to 0 to avoid pickle issues with custom dataset
-    )
+    if use_weighted_sampler:
+        sample_weights = compute_sample_weights(train_dataset, class_weights)
+        train_sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config['batch_size'],
+            sampler=train_sampler,
+            collate_fn=collate_fn,
+            num_workers=0  # Set to 0 to avoid pickle issues with custom dataset
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config['batch_size'],
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=0  # Set to 0 to avoid pickle issues with custom dataset
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config['batch_size'],
         shuffle=False,  # Don't shuffle validation data
         collate_fn=collate_fn,
         num_workers=0
+    )
+    checkpoint_metric_direction = (
+        'max' if maximize_best_checkpoint_metric else 'min'
+    )
+    print(f'Weighted sampler enabled: {use_weighted_sampler}')
+    print(f'Class-weighted CE loss enabled: {use_class_weighted_loss}')
+    print(
+        'Best checkpoint metric: '
+        f'{best_checkpoint_metric_name} ({checkpoint_metric_direction})'
     )
     
     # Create model with configuration parameters
@@ -399,7 +458,10 @@ def main() -> None:
     print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
     
     # Setup loss function, optimizer, and learning rate scheduler
-    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+    if use_class_weighted_loss:
+        criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+    else:
+        criterion = nn.CrossEntropyLoss()
 
     lr_cls = config.get('lr_cls', config.get('learning_rate', 1e-4))
     lr_cluster = config.get('lr_cluster', lr_cls)
@@ -445,6 +507,10 @@ def main() -> None:
     # Initialize best validation metrics and early stopping counter
     best_val_cls_loss = float('inf')
     best_val_balanced_acc = 0.0
+    if maximize_best_checkpoint_metric:
+        best_val_checkpoint_metric = -float('inf')
+    else:
+        best_val_checkpoint_metric = float('inf')
     best_epoch = 1
     patience_counter = 0
     
@@ -504,23 +570,33 @@ def main() -> None:
             not np.isclose(current_lr, previous_lr)
             for current_lr, previous_lr in zip(current_lrs, previous_lrs)
         ):
-            tqdm.write('Learning rates updated:')
-            tqdm.write(f'  lr_cls: {current_lrs[0]:.2e}')
-            tqdm.write(f'  lr_cluster: {current_lrs[1]:.2e}')
+            tqdm.write(
+                f'Learning rates updated: lr_cls: {current_lrs[0]:.2e}, '
+                f'lr_cluster: {current_lrs[1]:.2e}'
+            )
         previous_lrs = current_lrs
         
-        # Save best model using balanced accuracy as primary criterion
-        # and classification loss as tie-breaker.
-        if (
-            val_metrics['balanced_accuracy'] > best_val_balanced_acc
-            or (
-                np.isclose(val_metrics['balanced_accuracy'], best_val_balanced_acc)
-                and val_metrics['cls_loss'] < best_val_cls_loss
+        # Save best model using selected checkpoint metric and direction.
+        current_checkpoint_metric = float(val_metrics[best_checkpoint_metric_key])
+        if maximize_best_checkpoint_metric:
+            is_better_metric = (
+                current_checkpoint_metric > best_val_checkpoint_metric
             )
-        ):
+        else:
+            is_better_metric = (
+                current_checkpoint_metric < best_val_checkpoint_metric
+            )
+        is_tie_on_metric = np.isclose(
+            current_checkpoint_metric, best_val_checkpoint_metric
+        )
+        if is_tie_on_metric:
+            is_better_metric = val_metrics['cls_loss'] < best_val_cls_loss
+
+        if is_better_metric:
             # Update best validation metrics
             best_val_cls_loss = val_metrics['cls_loss']
             best_val_balanced_acc = val_metrics['balanced_accuracy']
+            best_val_checkpoint_metric = current_checkpoint_metric
             best_epoch = epoch + 1
             patience_counter = 0  # Reset patience counter
             
@@ -531,6 +607,10 @@ def main() -> None:
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_val_cls_loss': best_val_cls_loss,
                 'best_val_balanced_acc': best_val_balanced_acc,
+                'best_checkpoint_metric': best_checkpoint_metric_name,
+                'best_checkpoint_metric_key': best_checkpoint_metric_key,
+                'best_checkpoint_metric_mode': checkpoint_metric_direction,
+                'best_checkpoint_metric_value': best_val_checkpoint_metric,
                 'history': history,
                 'config': config,
                 'class_folders': train_dataset.class_folders
@@ -575,6 +655,10 @@ def main() -> None:
         'optimizer_state_dict': optimizer.state_dict(),
         'best_val_cls_loss': best_val_cls_loss,
         'best_val_balanced_acc': best_val_balanced_acc,
+        'best_checkpoint_metric': best_checkpoint_metric_name,
+        'best_checkpoint_metric_key': best_checkpoint_metric_key,
+        'best_checkpoint_metric_mode': checkpoint_metric_direction,
+        'best_checkpoint_metric_value': best_val_checkpoint_metric,
         'history': history,
         'config': config,
         'class_folders': train_dataset.class_folders
@@ -632,6 +716,10 @@ def main() -> None:
     print(f'\nTraining completed!')
     print(f'Best validation classification loss: {best_val_cls_loss:.3e}')
     print(f'Best validation balanced accuracy: {best_val_balanced_acc:.4f}')
+    print(
+        'Best validation checkpoint metric '
+        f'({best_checkpoint_metric_name}): {best_val_checkpoint_metric:.6f}'
+    )
     print(f'Checkpoints saved to: {config["checkpoint_dir"]}')
 
 

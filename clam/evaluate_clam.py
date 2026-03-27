@@ -283,8 +283,7 @@ def save_level_results(
     class_folders: List[str],
     output_dir: str,
     level: str,
-    split: str,
-    plot_cm: bool
+    split: str
 ) -> None:
     """
     Save evaluation summaries, confusion matrix, and per-sample predictions.
@@ -295,7 +294,6 @@ def save_level_results(
         output_dir (str): Directory where artifacts are written.
         level (str): Evaluation level label (`'tissue'` or `'slide'`).
         split (str): Dataset split label (`'train'` or `'val'`).
-        plot_cm (bool): Whether to export confusion matrix image.
 
     Returns:
         None: This function writes files to disk.
@@ -333,9 +331,8 @@ def save_level_results(
         json.dump(predictions, f, indent=2)
     print(f'Predictions saved to {predictions_path}')
 
-    if plot_cm:
-        cm_path = os.path.join(output_dir, f'{level}_confusion_matrix_{split}.png')
-        plot_confusion_matrix(metrics['confusion_matrix'], class_folders, cm_path)
+    cm_path = os.path.join(output_dir, f'{level}_confusion_matrix_{split}.png')
+    plot_confusion_matrix(metrics['confusion_matrix'], class_folders, cm_path)
 
 
 def run_level_split_evaluation(
@@ -346,8 +343,7 @@ def run_level_split_evaluation(
     device: torch.device,
     output_dir: str,
     level: str,
-    split: str,
-    plot_cm: bool
+    split: str
 ) -> None:
     """
     Run one evaluation job for a level/split pair and persist artifacts.
@@ -361,7 +357,6 @@ def run_level_split_evaluation(
         output_dir (str): Evaluation output directory.
         level (str): Evaluation level (`'tissue'` or `'slide'`).
         split (str): Dataset split (`'train'` or `'val'`).
-        plot_cm (bool): Whether to export confusion matrix image.
 
     Returns:
         None: This function runs evaluation and writes artifacts to disk.
@@ -392,7 +387,7 @@ def run_level_split_evaluation(
     )
     metrics = evaluate(model, dataloader, device, class_folders)
     print_metrics(metrics, class_folders)
-    save_level_results(metrics, class_folders, output_dir, level, split, plot_cm)
+    save_level_results(metrics, class_folders, output_dir, level, split)
 
 
 def main() -> None:
@@ -417,10 +412,6 @@ def main() -> None:
     output_dir = config['paths']['evaluation_output']
     if output_dir is None:
         output_dir = os.path.join(config['output_dir'], 'evaluation_results')
-    
-    # Get evaluation parameters from config
-    eval_config = config.get('evaluation', {})
-    plot_cm = eval_config.get('plot_cm', True)
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -510,8 +501,7 @@ def main() -> None:
                 device=device,
                 output_dir=output_dir,
                 level=level,
-                split=split,
-                plot_cm=plot_cm
+                split=split
             )
 
 
