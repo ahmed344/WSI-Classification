@@ -4,7 +4,7 @@ Configuration loader for CLAM-MB training and evaluation.
 This module provides functionality to load and process configuration files
 in YAML format, with automatic path resolution for checkpoints and outputs.
 """
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Mapping
 import yaml
 import os
 from pathlib import Path
@@ -65,3 +65,39 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         )
     
     return config
+
+
+def resolve_feature_file_suffix(config: Mapping[str, Any]) -> str:
+    """
+    Resolve the feature filename suffix based on selected feature model.
+
+    Args:
+        config (Mapping[str, Any]): Parsed configuration dictionary that may include
+            `feature_model` and `feature_model_suffixes` keys.
+
+    Returns:
+        str: Feature filename suffix including extension (e.g., `_features.pt` or
+            `_features_hoptimus.pt`) used by dataset discovery.
+    """
+    selected_model = str(config.get('feature_model', 'default'))
+    suffix_map = config.get('feature_model_suffixes', {})
+
+    if not isinstance(suffix_map, Mapping):
+        raise ValueError(
+            "Invalid config key 'feature_model_suffixes': expected a mapping."
+        )
+
+    if selected_model not in suffix_map:
+        available_models = ', '.join(sorted(str(k) for k in suffix_map.keys()))
+        raise ValueError(
+            f"Unknown feature_model '{selected_model}'. "
+            f"Available models: {available_models}."
+        )
+
+    suffix = str(suffix_map[selected_model])
+    if not suffix.endswith('.pt'):
+        raise ValueError(
+            f"Invalid suffix '{suffix}' for feature_model '{selected_model}'. "
+            "Suffix must end with '.pt'."
+        )
+    return suffix

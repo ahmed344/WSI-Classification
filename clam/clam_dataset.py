@@ -32,7 +32,8 @@ class WSIFeatureDataset(Dataset):
         class_folders: Optional[List[str]] = None,
         split: str = 'train',
         train_ratio: float = 0.9,
-        random_seed: int = 42
+        random_seed: int = 42,
+        feature_file_suffix: str = '_features.pt'
     ) -> None:
         """
         Initialize the WSI Feature Dataset.
@@ -45,9 +46,15 @@ class WSIFeatureDataset(Dataset):
             train_ratio (float): Ratio of slides to use for training. Remaining slides go to validation.
                 Defaults to 0.9.
             random_seed (int): Random seed for reproducible train/val split. Defaults to 42.
+            feature_file_suffix (str): Feature filename suffix to match when scanning
+                slide directories (e.g., '_features.pt' or '_features_hoptimus.pt').
+                Defaults to '_features.pt'.
         """
         self.data_root: str = data_root
         self.split: str = split
+        self.feature_file_suffix: str = feature_file_suffix
+        if len(self.feature_file_suffix) == 0:
+            raise ValueError("feature_file_suffix must be a non-empty string.")
         
         # Auto-detect class folders if not provided
         if class_folders is None:
@@ -87,12 +94,12 @@ class WSIFeatureDataset(Dataset):
                 slide_key = f"{class_folder}/{slide_dir}"
                 
                 # Scan slide directory for feature files
-                # Expected structure: slide_dir/tissue_name_features.pt
+                # Expected structure: slide_dir/tissue_name<feature_file_suffix>
                 for item in os.listdir(slide_path):
-                    # Check if item is a feature file (ends with _features.pt)
-                    if item.endswith('_features.pt'):
+                    # Check if item is a feature file for selected extractor
+                    if item.endswith(self.feature_file_suffix):
                         # Extract tissue name from filename
-                        tissue_name = item.replace('_features.pt', '')
+                        tissue_name = item[:-len(self.feature_file_suffix)]
                         feature_path = os.path.join(slide_path, item)
                         tiles_path = os.path.join(slide_path, f"{tissue_name}_tiles.csv")
                         

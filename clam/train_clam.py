@@ -23,7 +23,7 @@ import json
 
 from clam_dataset import WSIFeatureDataset, collate_fn
 from clam_model import CLAM_MB, compute_clustering_loss
-from config_loader import load_config
+from config_loader import load_config, resolve_feature_file_suffix
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -315,6 +315,7 @@ def main() -> None:
     # Set random seeds for reproducibility
     torch.manual_seed(config['random_seed'])
     np.random.seed(config['random_seed'])
+    feature_file_suffix = resolve_feature_file_suffix(config)
     
     # Determine device (GPU if available, else CPU)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -325,17 +326,23 @@ def main() -> None:
     
     # Create training and validation datasets
     print('Loading datasets...')
+    print(
+        f"Using feature model '{config['feature_model']}' "
+        f"with suffix '{feature_file_suffix}'"
+    )
     train_dataset = WSIFeatureDataset(
         config['data_root'],
         split='train',
         train_ratio=config['train_ratio'],
-        random_seed=config['random_seed']
+        random_seed=config['random_seed'],
+        feature_file_suffix=feature_file_suffix
     )
     val_dataset = WSIFeatureDataset(
         config['data_root'],
         split='val',
         train_ratio=config['train_ratio'],
-        random_seed=config['random_seed']
+        random_seed=config['random_seed'],
+        feature_file_suffix=feature_file_suffix
     )
     
     print(f'Training samples: {len(train_dataset)}')
@@ -375,7 +382,6 @@ def main() -> None:
     
     # Create model with configuration parameters
     print('Creating model...')
-    legacy_dropout = config.get('dropout', 0.25)
     model = CLAM_MB(
         input_dim=config['input_dim'],
         hidden_dim=config['hidden_dim'],
@@ -384,18 +390,10 @@ def main() -> None:
         attention_hidden_dim=config.get('attention_hidden_dim'),
         attention_dim=config.get('attention_dim'),
         cluster_head_hidden_dim=config.get('cluster_head_hidden_dim'),
-        feature_projection_dropout=config.get(
-            'feature_projection_dropout', legacy_dropout
-        ),
-        attention_branch_feature_dropout=config.get(
-            'attention_branch_feature_dropout', legacy_dropout
-        ),
-        clustering_branch_feature_dropout=config.get(
-            'clustering_branch_feature_dropout', legacy_dropout
-        ),
-        final_classifier_dropout=config.get(
-            'final_classifier_dropout', legacy_dropout
-        )
+        feature_projection_dropout=config['feature_projection_dropout'],
+        attention_branch_feature_dropout=config['attention_branch_feature_dropout'],
+        clustering_branch_feature_dropout=config['clustering_branch_feature_dropout'],
+        final_classifier_dropout=config['final_classifier_dropout']
     ).to(device)
     
     print(f'Model parameters: {sum(p.numel() for p in model.parameters()):,}')
@@ -411,12 +409,21 @@ def main() -> None:
         + list(model.classifier.parameters())
     )
     cluster_params = list(model.clustering_branch.parameters())
+    weight_decay_cls = config['weight_decay_cls']
+    weight_decay_cluster = config['weight_decay_cluster']
     optimizer = optim.Adam(
         [
-            {'params': cls_params, 'lr': lr_cls},
-            {'params': cluster_params, 'lr': lr_cluster}
-        ],
-        weight_decay=config['weight_decay']
+            {
+                'params': cls_params,
+                'lr': lr_cls,
+                'weight_decay': weight_decay_cls
+            },
+            {
+                'params': cluster_params,
+                'lr': lr_cluster,
+                'weight_decay': weight_decay_cluster
+            }
+        ]
     )
     # Reduce learning rate when validation loss plateaus
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -452,6 +459,10 @@ def main() -> None:
         config.get('clustering_weight', 0.1)
     )
     cluster_warmup_epochs = config.get('clustering_warmup_epochs', 1)
+    min_epochs_before_early_stopping = max(
+        0, int(config.get('min_epochs_before_early_stopping', 0))
+    )
+    previous_lrs = [group['lr'] for group in optimizer.param_groups]
 
     for epoch in tqdm(range(config['epochs'])):
         clustering_weight = get_clustering_weight_for_epoch(
@@ -486,11 +497,17 @@ def main() -> None:
             f'Cluster Loss: {train_metrics["cluster_loss"]:.3e}, {val_metrics["cluster_loss"]:.3e} | '
             f'Accuracy: {train_metrics["accuracy"]:.4f}, {val_metrics["accuracy"]:.4f} | '
             f'Bal Acc: {train_metrics["balanced_accuracy"]:.4f}, '
-            f'{val_metrics["balanced_accuracy"]:.4f} | '
-            f'LR(cls/cluster): {optimizer.param_groups[0]["lr"]:.2e}/'
-            f'{optimizer.param_groups[1]["lr"]:.2e} | '
-            f'Cluster W: {clustering_weight:.3f}'
+            f'{val_metrics["balanced_accuracy"]:.4f}'
         )
+        current_lrs = [group['lr'] for group in optimizer.param_groups]
+        if any(
+            not np.isclose(current_lr, previous_lr)
+            for current_lr, previous_lr in zip(current_lrs, previous_lrs)
+        ):
+            tqdm.write('Learning rates updated:')
+            tqdm.write(f'  lr_cls: {current_lrs[0]:.2e}')
+            tqdm.write(f'  lr_cluster: {current_lrs[1]:.2e}')
+        previous_lrs = current_lrs
         
         # Save best model using balanced accuracy as primary criterion
         # and classification loss as tie-breaker.
@@ -543,8 +560,11 @@ def main() -> None:
             # No improvement, increment patience counter
             patience_counter += 1
         
-        # Early stopping: stop if no improvement for 'patience' epochs
-        if patience_counter >= config['patience']:
+        # Early stopping: only active after minimum epoch threshold is reached.
+        if (
+            (epoch + 1) >= min_epochs_before_early_stopping
+            and patience_counter >= config['patience']
+        ):
             tqdm.write(f'Early stopping at epoch {epoch+1}')
             break
     

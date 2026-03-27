@@ -19,7 +19,7 @@ import openslide
 
 from clam_dataset import WSIFeatureDataset, collate_fn
 from clam_model import CLAM_MB
-from config_loader import load_config
+from config_loader import load_config, resolve_feature_file_suffix
 
 
 def load_tile_coordinates(
@@ -432,6 +432,7 @@ def main() -> None:
     """
     # Load configuration from config.yml
     config = load_config()
+    feature_file_suffix = resolve_feature_file_suffix(config)
     
     # Resolve checkpoint path
     checkpoint_path = config['paths']['checkpoint']
@@ -464,31 +465,19 @@ def main() -> None:
         checkpoint_path, map_location=device, weights_only=False
     )
     
-    # Extract model configuration from checkpoint
-    if 'config' in checkpoint:
-        model_config = checkpoint['config']
-        input_dim = model_config.get('input_dim', config['input_dim'])
-        hidden_dim = model_config.get('hidden_dim', config['hidden_dim'])
-        num_classes = model_config.get('num_classes', config['num_classes'])
-        k_clusters = model_config.get('k_clusters', config['k_clusters'])
-        architecture_source = model_config
-        class_folders = checkpoint.get('class_folders', None)
-    elif 'args' in checkpoint:
-        model_args = checkpoint['args']
-        input_dim = model_args.get('input_dim', config['input_dim'])
-        hidden_dim = model_args.get('hidden_dim', config['hidden_dim'])
-        num_classes = model_args.get('num_classes', config['num_classes'])
-        k_clusters = model_args.get('k_clusters', config['k_clusters'])
-        architecture_source = model_args
-        class_folders = checkpoint.get('class_folders', None)
-    else:
-        # Fallback to config file values
-        input_dim = config['input_dim']
-        hidden_dim = config['hidden_dim']
-        num_classes = config['num_classes']
-        k_clusters = config['k_clusters']
-        architecture_source = config
-        class_folders = None
+    # Require new-format checkpoints that contain full model config.
+    if 'config' not in checkpoint:
+        raise KeyError(
+            "Checkpoint is missing 'config'. "
+            "Only new-format checkpoints are supported."
+        )
+    model_config = checkpoint['config']
+    input_dim = model_config.get('input_dim', config['input_dim'])
+    hidden_dim = model_config.get('hidden_dim', config['hidden_dim'])
+    num_classes = model_config.get('num_classes', config['num_classes'])
+    k_clusters = model_config.get('k_clusters', config['k_clusters'])
+    architecture_source = model_config
+    class_folders = checkpoint.get('class_folders', None)
     
     # Auto-detect class folders if not in checkpoint
     if class_folders is None:
@@ -498,6 +487,10 @@ def main() -> None:
         ])
     
     print(f'Classes: {class_folders}')
+    print(
+        f"Using feature model '{config['feature_model']}' "
+        f"with suffix '{feature_file_suffix}'"
+    )
     
     # Create model with extracted configuration
     print('Creating model...')
@@ -511,7 +504,10 @@ def main() -> None:
         'attention_hidden_dim',
         'attention_dim',
         'cluster_head_hidden_dim',
-        'dropout'
+        'feature_projection_dropout',
+        'attention_branch_feature_dropout',
+        'clustering_branch_feature_dropout',
+        'final_classifier_dropout'
     ]:
         value = architecture_source.get(key)
         if value is None:
@@ -531,7 +527,8 @@ def main() -> None:
         class_folders=class_folders,
         split=split,
         train_ratio=config['train_ratio'],
-        random_seed=config['random_seed']
+        random_seed=config['random_seed'],
+        feature_file_suffix=feature_file_suffix
     )
     
     # Optionally limit number of samples for faster processing

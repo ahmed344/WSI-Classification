@@ -5,16 +5,23 @@ data_root: "/workspaces/WSI-Classification/data/HE-MYO/Processed"
 checkpoint_dir: "checkpoints"
 output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results"
 
+# Feature source selection
+# Choose which extracted feature set CLAM should load.
+feature_model: "uni2h"
+feature_model_suffixes:
+  default: "_features.pt"
+  hoptimus: "_features_hoptimus.pt"
+  uni2h: "_features_uni2h.pt"
+
 # Model architecture
 input_dim: 1536
-hidden_dim: 512
+hidden_dim: 256
 attention_hidden_dim: 256  # Intermediate dimension for attention network
 attention_dim: 256  # Projection dimension for attention scoring
 feature_projection_dropout: 0.3  # Dropout in shared input feature projection
 attention_branch_feature_dropout: 0.3  # Dropout in attention branch feature extractors
 clustering_branch_feature_dropout: 0.3  # Dropout in clustering branch feature extractor
 final_classifier_dropout: 0.3  # Dropout in final classifier MLP
-dropout: 0.3  # Legacy fallback used when specific dropout keys are not provided
 cluster_head_hidden_dim: 256  # Hidden dimension in clustering head MLP
 num_classes: 5
 k_clusters: 10
@@ -22,14 +29,16 @@ k_clusters: 10
 # Training parameters
 batch_size: 64
 epochs: 1000
-lr_cls: 0.0001
-lr_cluster: 0.001
-weight_decay: 0.05
-clustering_weight_start: 0.1
-clustering_weight_end: 0.3
-clustering_warmup_epochs: 10
+lr_cls: 0.00001
+lr_cluster: 0.01
+weight_decay_cls: 0.001  # Weight decay for feature projection, attention branches, and classifier
+weight_decay_cluster: 0.01  # Weight decay for clustering branch
+clustering_weight_start: 0.01
+clustering_weight_end: 0.5
+clustering_warmup_epochs: 100
 train_ratio: 0.8
-patience: 10
+min_epochs_before_early_stopping: 100
+patience: 50
 random_seed: 42
 
 # Evaluation parameters

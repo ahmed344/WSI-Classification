@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 
 from clam_dataset import WSIFeatureDataset, collate_fn
 from clam_model import CLAM_MB, compute_clustering_loss
+from config_loader import load_config, resolve_feature_file_suffix
 
 
 def test_integration() -> bool:
@@ -35,11 +36,14 @@ def test_integration() -> bool:
     print("\n1. Testing data loading...")
     try:
         data_root = '/workspaces/WSI-Classification/data/HE-MYO/Processed'
+        config = load_config()
+        feature_file_suffix = resolve_feature_file_suffix(config)
         train_dataset = WSIFeatureDataset(
             data_root,
             split='train',
             train_ratio=0.9,
-            random_seed=42
+            random_seed=42,
+            feature_file_suffix=feature_file_suffix
         )
         
         # Check if dataset is empty
