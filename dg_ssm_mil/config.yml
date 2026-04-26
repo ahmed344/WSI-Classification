@@ -1,0 +1,79 @@
+# DG-SSM-MIL tissue-level configuration.
+
+# Data paths
+data_root: "/workspaces/WSI-Classification/data/HE-MYO/Processed"
+checkpoint_dir: "dg_ssm_mil/checkpoints"
+output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results/dg_ssm_mil"
+
+# Feature source selection
+feature_model: "uni2h"
+feature_model_suffixes:
+  default: "_features.pt"
+  hoptimus: "_features_hoptimus.pt"
+  uni2h: "_features_uni2h.pt"
+
+# Dataset and coordinate handling
+num_classes: 5
+train_ratio: 0.8
+random_seed: 42
+sort_tiles_spatially: true
+coordinate_columns: ["x", "y"]
+coordinate_mismatch: "trim"  # Options: error, trim
+normalize_coordinates: true
+
+# Model architecture
+input_dim: 1536
+hidden_dim: 256
+projection_dropout: 0.15
+spatial_knn_k: 8
+gat_heads: 4
+gat_dropout: 0.15
+dynamic_graph_top_k: 6
+dynamic_graph_chunk_size: 512
+dynamic_graph_dropout: 0.15
+mamba_d_state: 16
+mamba_d_conv: 4
+mamba_expand: 2
+use_conv_branch: true
+conv_kernel_size: 3
+block_dropout: 0.15
+attention_hidden_dim: 256
+classifier_dropout: 0.3
+
+# Training parameters
+batch_size: 16
+epochs: 200
+learning_rate: 0.000001
+weight_decay: 0.1
+gradient_clip_norm: 1.0
+use_weighted_sampler: true
+use_class_weighted_loss: false
+best_checkpoint_metric: "balanced_accuracy"  # Options: balanced_accuracy, accuracy, loss
+lr_scheduler_factor: 0.5
+lr_scheduler_patience: 15
+min_epochs_before_early_stopping: 50
+patience: 25
+num_workers: 0
+device: "auto"  # Options: auto, cpu, cuda
+evaluation_batch_size: 1  # Keep evaluation memory stable for large tissue bags
+integration_max_tiles: 128  # Caps tiles used by the integration smoke test
+
+# Attention visualization parameters
+visualization:
+  split: "val"  # Options: train, val
+  max_tissues: null  # null for all tissues, or an integer for a quick subset
+  tile_size: 448
+  thumbnail_size: 512
+  top_k_tiles: 25  # Number of highest-attention tiles to highlight and export
+  top_percentile: null  # Optional percentile threshold, e.g. 95
+  save_top_tiles_csv: true
+
+# Paths (can be overridden)
+paths:
+  checkpoint: null
+  final_checkpoint: null
+  training_history: null
+  training_report: null
+  training_plot: null
+  evaluation_output: null
+  attention_output: null

@@ -1,0 +1,171 @@
+"""
+Configuration loading utilities for the independent DG-SSM-MIL workflow.
+"""
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Tuple
+import os
+
+import yaml
+
+
+def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load and validate a DG-SSM-MIL YAML configuration file.
+
+    Args:
+        config_path (Optional[str]): Path to the YAML file. If None, the
+            `config.yml` file next to this module is used.
+
+    Returns:
+        Dict[str, Any]: Parsed configuration with default output paths filled in.
+    """
+    if config_path is None:
+        config_path = str(Path(__file__).parent / "config.yml")
+
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file)
+
+    if not isinstance(config, dict):
+        raise ValueError("DG-SSM-MIL config must contain a YAML mapping.")
+
+    config["paths"] = config.get("paths", {}) or {}
+    checkpoint_dir = str(config.get("checkpoint_dir", "dg_ssm_mil/checkpoints"))
+    output_dir = str(config.get("output_dir", "dg_ssm_mil/results"))
+
+    if config["paths"].get("checkpoint") is None:
+        config["paths"]["checkpoint"] = os.path.join(checkpoint_dir, "best_model.pth")
+    if config["paths"].get("final_checkpoint") is None:
+        config["paths"]["final_checkpoint"] = os.path.join(
+            checkpoint_dir, "final_model.pth"
+        )
+    if config["paths"].get("training_history") is None:
+        config["paths"]["training_history"] = os.path.join(
+            output_dir, "training_history.json"
+        )
+    if config["paths"].get("training_report") is None:
+        config["paths"]["training_report"] = os.path.join(
+            output_dir, "best_model_report.json"
+        )
+    if config["paths"].get("training_plot") is None:
+        config["paths"]["training_plot"] = os.path.join(
+            output_dir, "training_history.png"
+        )
+    if config["paths"].get("evaluation_output") is None:
+        config["paths"]["evaluation_output"] = os.path.join(
+            output_dir, "evaluation_results"
+        )
+    if config["paths"].get("attention_output") is None:
+        config["paths"]["attention_output"] = os.path.join(
+            output_dir, "attention_heatmaps"
+        )
+
+    validate_config(config)
+    return config
+
+
+def resolve_feature_file_suffix(config: Mapping[str, Any]) -> str:
+    """
+    Resolve the feature tensor filename suffix for the selected feature model.
+
+    Args:
+        config (Mapping[str, Any]): Parsed configuration containing
+            `feature_model` and `feature_model_suffixes`.
+
+    Returns:
+        str: Feature filename suffix, including the `.pt` extension.
+    """
+    selected_model = str(config.get("feature_model", "default"))
+    suffix_map = config.get("feature_model_suffixes", {})
+    if not isinstance(suffix_map, Mapping):
+        raise ValueError("feature_model_suffixes must be a mapping.")
+    if selected_model not in suffix_map:
+        available = ", ".join(sorted(str(key) for key in suffix_map.keys()))
+        raise ValueError(
+            f"Unknown feature_model '{selected_model}'. Available models: {available}."
+        )
+    suffix = str(suffix_map[selected_model])
+    if not suffix.endswith(".pt"):
+        raise ValueError(
+            f"Invalid feature suffix '{suffix}' for model '{selected_model}'."
+        )
+    return suffix
+
+
+def resolve_device(config: Mapping[str, Any]) -> str:
+    """
+    Resolve the configured training device.
+
+    Args:
+        config (Mapping[str, Any]): Parsed configuration with an optional
+            `device` key.
+
+    Returns:
+        str: Device name suitable for `torch.device`.
+    """
+    import torch
+
+    requested_device = str(config.get("device", "auto")).lower()
+    if requested_device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if requested_device not in {"cpu", "cuda"}:
+        raise ValueError("device must be one of: auto, cpu, cuda.")
+    if requested_device == "cuda" and not torch.cuda.is_available():
+        raise ValueError("device is set to cuda, but CUDA is not available.")
+    return requested_device
+
+
+def get_coordinate_columns(config: Mapping[str, Any]) -> Tuple[str, str]:
+    """
+    Return the configured CSV coordinate column names.
+
+    Args:
+        config (Mapping[str, Any]): Parsed configuration with `coordinate_columns`.
+
+    Returns:
+        Tuple[str, str]: Column names for x and y coordinates.
+    """
+    columns = config.get("coordinate_columns", ["x", "y"])
+    if not isinstance(columns, list) or len(columns) != 2:
+        raise ValueError("coordinate_columns must be a two-item list, e.g. ['x', 'y'].")
+    return str(columns[0]), str(columns[1])
+
+
+def validate_config(config: Mapping[str, Any]) -> None:
+    """
+    Validate required DG-SSM-MIL configuration values.
+
+    Args:
+        config (Mapping[str, Any]): Parsed configuration dictionary.
+
+    Returns:
+        None: Raises ValueError when a required setting is invalid.
+    """
+    required_keys = [
+        "data_root",
+        "input_dim",
+        "hidden_dim",
+        "num_classes",
+        "spatial_knn_k",
+        "dynamic_graph_top_k",
+        "learning_rate",
+        "epochs",
+        "batch_size",
+    ]
+    missing = [key for key in required_keys if key not in config]
+    if missing:
+        raise ValueError(f"Missing required config keys: {', '.join(missing)}")
+
+    if int(config["num_classes"]) <= 1:
+        raise ValueError("num_classes must be greater than 1.")
+    if int(config["input_dim"]) <= 0 or int(config["hidden_dim"]) <= 0:
+        raise ValueError("input_dim and hidden_dim must be positive.")
+    if int(config["spatial_knn_k"]) <= 0:
+        raise ValueError("spatial_knn_k must be positive.")
+    if int(config["dynamic_graph_top_k"]) <= 0:
+        raise ValueError("dynamic_graph_top_k must be positive.")
+    if int(config.get("dynamic_graph_chunk_size", 512)) <= 0:
+        raise ValueError("dynamic_graph_chunk_size must be positive.")
+    if str(config.get("coordinate_mismatch", "trim")) not in {"error", "trim"}:
+        raise ValueError("coordinate_mismatch must be either 'error' or 'trim'.")
+    get_coordinate_columns(config)
+    resolve_feature_file_suffix(config)
