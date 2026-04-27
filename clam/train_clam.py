@@ -157,7 +157,8 @@ def train_epoch(
     model: CLAM_MB,
     dataloader: DataLoader,
     criterion: nn.Module,
-    optimizer: optim.Optimizer,
+    optimizer_cls: optim.Optimizer,
+    optimizer_cluster: optim.Optimizer,
     device: torch.device,
     clustering_weight: float = 0.1
 ) -> Dict[str, float]:
@@ -171,7 +172,8 @@ def train_epoch(
         model (CLAM_MB): The CLAM-MB model to train.
         dataloader (DataLoader): DataLoader providing batches of training samples.
         criterion (nn.Module): Loss function for classification (typically CrossEntropyLoss).
-        optimizer (optim.Optimizer): Optimizer for updating model parameters.
+        optimizer_cls (optim.Optimizer): Optimizer for updating classification branch parameters.
+        optimizer_cluster (optim.Optimizer): Optimizer for updating clustering branch parameters.
         device (torch.device): Device to run training on (CPU or CUDA).
         clustering_weight (float): Weight for clustering loss component. Defaults to 0.1.
     
@@ -212,9 +214,11 @@ def train_epoch(
         total_loss = cls_loss + clustering_weight * cluster_loss
         
         # Backward pass: compute gradients
-        optimizer.zero_grad()
+        optimizer_cls.zero_grad()
+        optimizer_cluster.zero_grad()
         total_loss.backward()
-        optimizer.step()
+        optimizer_cls.step()
+        optimizer_cluster.step()
         
         # Accumulate statistics for epoch summary
         running_loss += total_loss.item()
@@ -473,13 +477,17 @@ def main() -> None:
     cluster_params = list(model.clustering_branch.parameters())
     weight_decay_cls = config['weight_decay_cls']
     weight_decay_cluster = config['weight_decay_cluster']
-    optimizer = optim.Adam(
+    optimizer_cls = optim.Adam(
         [
             {
                 'params': cls_params,
                 'lr': lr_cls,
                 'weight_decay': weight_decay_cls
-            },
+            }
+        ]
+    )
+    optimizer_cluster = optim.Adam(
+        [
             {
                 'params': cluster_params,
                 'lr': lr_cluster,
@@ -487,9 +495,18 @@ def main() -> None:
             }
         ]
     )
-    # Reduce learning rate when validation loss plateaus
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
+    # Reduce branch-specific learning rates when their validation losses plateau.
+    scheduler_cls = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer_cls,
+        mode='min',
+        factor=float(config.get('lr_scheduler_factor_cls', 0.5)),
+        patience=int(config.get('lr_scheduler_patience_cls', 5))
+    )
+    scheduler_cluster = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer_cluster,
+        mode='min',
+        factor=float(config.get('lr_scheduler_factor_cluster', 0.5)),
+        patience=int(config.get('lr_scheduler_patience_cluster', 5))
     )
     
     # Initialize training history tracking
@@ -528,7 +545,10 @@ def main() -> None:
     min_epochs_before_early_stopping = max(
         0, int(config.get('min_epochs_before_early_stopping', 0))
     )
-    previous_lrs = [group['lr'] for group in optimizer.param_groups]
+    previous_lrs = {
+        'cls': optimizer_cls.param_groups[0]['lr'],
+        'cluster': optimizer_cluster.param_groups[0]['lr']
+    }
 
     for epoch in tqdm(range(config['epochs'])):
         clustering_weight = get_clustering_weight_for_epoch(
@@ -539,7 +559,7 @@ def main() -> None:
         )
         # Train for one epoch
         train_metrics = train_epoch(
-            model, train_loader, criterion, optimizer, device,
+            model, train_loader, criterion, optimizer_cls, optimizer_cluster, device,
             clustering_weight
         )
         
@@ -548,8 +568,9 @@ def main() -> None:
             model, val_loader, criterion, device, clustering_weight
         )
         
-        # Update learning rate based on validation classification loss
-        scheduler.step(val_metrics['cls_loss'])
+        # Update branch-specific learning rates based on branch losses.
+        scheduler_cls.step(val_metrics['cls_loss'])
+        scheduler_cluster.step(val_metrics['cluster_loss'])
         
         # Save metrics to history
         for key in ['loss', 'cls_loss', 'cluster_loss', 'accuracy', 'balanced_accuracy']:
@@ -565,14 +586,17 @@ def main() -> None:
             f'Bal Acc: {train_metrics["balanced_accuracy"]:.4f}, '
             f'{val_metrics["balanced_accuracy"]:.4f}'
         )
-        current_lrs = [group['lr'] for group in optimizer.param_groups]
-        if any(
-            not np.isclose(current_lr, previous_lr)
-            for current_lr, previous_lr in zip(current_lrs, previous_lrs)
+        current_lrs = {
+            'cls': optimizer_cls.param_groups[0]['lr'],
+            'cluster': optimizer_cluster.param_groups[0]['lr']
+        }
+        if (
+            not np.isclose(current_lrs['cls'], previous_lrs['cls'])
+            or not np.isclose(current_lrs['cluster'], previous_lrs['cluster'])
         ):
             tqdm.write(
-                f'Learning rates updated: lr_cls: {current_lrs[0]:.2e}, '
-                f'lr_cluster: {current_lrs[1]:.2e}'
+                f'Learning rates updated: lr_cls: {current_lrs["cls"]:.2e}, '
+                f'lr_cluster: {current_lrs["cluster"]:.2e}'
             )
         previous_lrs = current_lrs
         
@@ -604,7 +628,12 @@ def main() -> None:
             checkpoint = {
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
+                'optimizer_state_dict': {
+                    'cls': optimizer_cls.state_dict(),
+                    'cluster': optimizer_cluster.state_dict()
+                },
+                'optimizer_cls_state_dict': optimizer_cls.state_dict(),
+                'optimizer_cluster_state_dict': optimizer_cluster.state_dict(),
                 'best_val_cls_loss': best_val_cls_loss,
                 'best_val_balanced_acc': best_val_balanced_acc,
                 'best_checkpoint_metric': best_checkpoint_metric_name,
@@ -652,7 +681,12 @@ def main() -> None:
     final_checkpoint = {
         'epoch': epoch + 1,
         'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
+        'optimizer_state_dict': {
+            'cls': optimizer_cls.state_dict(),
+            'cluster': optimizer_cluster.state_dict()
+        },
+        'optimizer_cls_state_dict': optimizer_cls.state_dict(),
+        'optimizer_cluster_state_dict': optimizer_cluster.state_dict(),
         'best_val_cls_loss': best_val_cls_loss,
         'best_val_balanced_acc': best_val_balanced_acc,
         'best_checkpoint_metric': best_checkpoint_metric_name,

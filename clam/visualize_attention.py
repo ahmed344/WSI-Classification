@@ -198,7 +198,7 @@ def visualize_attention_branches(
             (x - tile_size // 2, y - tile_size // 2),
             tile_size, tile_size,
             linewidth=0, edgecolor='none',
-            facecolor=plt.cm.viridis(avg_norm[j])  # Use viridis colormap
+            facecolor=plt.cm.jet(avg_norm[j])  # Use jet colormap
         )
         axes[subplot_idx].add_patch(rect)
     
@@ -211,7 +211,7 @@ def visualize_attention_branches(
     
     # Add colorbar for average attention
     sm_avg = plt.cm.ScalarMappable(
-        cmap=plt.cm.viridis,
+        cmap=plt.cm.jet,
         norm=plt.Normalize(vmin=avg_attention.min(), vmax=avg_attention.max())
     )
     sm_avg.set_array([])
@@ -238,7 +238,7 @@ def visualize_attention_branches(
                 (x - tile_size // 2, y - tile_size // 2),
                 tile_size, tile_size,
                 linewidth=0, edgecolor='none',
-                facecolor=plt.cm.viridis(attn_norm[j])
+                facecolor=plt.cm.jet(attn_norm[j])
             )
             ax.add_patch(rect)
         
@@ -251,7 +251,7 @@ def visualize_attention_branches(
         
         # Add colorbar for this branch
         sm = plt.cm.ScalarMappable(
-            cmap=plt.cm.viridis,
+            cmap=plt.cm.jet,
             norm=plt.Normalize(vmin=attn_weights.min(), vmax=attn_weights.max())
         )
         sm.set_array([])

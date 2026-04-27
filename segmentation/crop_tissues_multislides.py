@@ -71,7 +71,7 @@ print("Terminated")
 
 # %%
 # Assign the path
-path = '/workspaces/WSI-Classification/data/HE-MYO/Raw/Scans/scan_20260211/'
+path = '/workspaces/WSI-Classification/data/HE-MYO/Raw/Scans/scan_20260409/'
 path_results = '/workspaces/WSI-Classification/data/HE-MYO/Processed/'
 
 # List the slides
@@ -124,8 +124,8 @@ print("Terminated")
 # # Crop to specific directory
 
 # %%
-path = '/workspaces/WSI-Classification/data/HE-MYO/Raw/INFLAMMATORY_patients_selected/'
-results_dir = '/workspaces/WSI-Classification/data/HE-MYO/Processed/Inflammatory/'
+path = '/workspaces/WSI-Classification/data/HE-MYO/Raw/LGMD_St_Etienne/'
+results_dir = '/workspaces/WSI-Classification/data/HE-MYO/Processed/Dystrophic/'
 
 # List the slides
 slides = [slide for slide in os.listdir(path)]
