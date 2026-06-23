@@ -160,7 +160,8 @@ def train_epoch(
     optimizer_cls: optim.Optimizer,
     optimizer_cluster: optim.Optimizer,
     device: torch.device,
-    clustering_weight: float = 0.1
+    clustering_weight: float = 0.1,
+    gradient_accumulation_steps: int = 1
 ) -> Dict[str, float]:
     """
     Train the model for one epoch using mixed loss function.
@@ -176,6 +177,8 @@ def train_epoch(
         optimizer_cluster (optim.Optimizer): Optimizer for updating clustering branch parameters.
         device (torch.device): Device to run training on (CPU or CUDA).
         clustering_weight (float): Weight for clustering loss component. Defaults to 0.1.
+        gradient_accumulation_steps (int): Number of micro-batches to accumulate
+            before each optimizer step. Defaults to 1.
     
     Returns:
         Dict[str, float]: Dictionary containing training metrics:
@@ -191,9 +194,12 @@ def train_epoch(
     running_cluster_loss = 0.0
     all_preds: List[int] = []
     all_labels: List[int] = []
+    accumulation_steps = max(1, int(gradient_accumulation_steps))
+    optimizer_cls.zero_grad()
+    optimizer_cluster.zero_grad()
     
     # Iterate over batches
-    for batch in dataloader:
+    for batch_idx, batch in enumerate(dataloader):
         # Move batch data to device
         features = batch['features'].to(device)
         labels = batch['labels'].to(device)
@@ -213,12 +219,18 @@ def train_epoch(
         # Combine losses with weighted sum
         total_loss = cls_loss + clustering_weight * cluster_loss
         
-        # Backward pass: compute gradients
-        optimizer_cls.zero_grad()
-        optimizer_cluster.zero_grad()
-        total_loss.backward()
-        optimizer_cls.step()
-        optimizer_cluster.step()
+        # Backward pass: scale loss so accumulated gradients match a larger batch.
+        scaled_loss = total_loss / accumulation_steps
+        scaled_loss.backward()
+        is_accumulation_boundary = (
+            (batch_idx + 1) % accumulation_steps == 0
+            or (batch_idx + 1) == len(dataloader)
+        )
+        if is_accumulation_boundary:
+            optimizer_cls.step()
+            optimizer_cluster.step()
+            optimizer_cls.zero_grad()
+            optimizer_cluster.zero_grad()
         
         # Accumulate statistics for epoch summary
         running_loss += total_loss.item()
@@ -352,6 +364,17 @@ def main() -> None:
     torch.manual_seed(config['random_seed'])
     np.random.seed(config['random_seed'])
     feature_file_suffix = resolve_feature_file_suffix(config)
+    batch_size = int(config['batch_size'])
+    gradient_accumulation_steps = int(
+        config.get('gradient_accumulation_steps', 1)
+    )
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive.")
+    effective_batch_size = batch_size * gradient_accumulation_steps
+    max_tiles_per_tissue_train = config.get('max_tiles_per_tissue_train')
+    max_tiles_per_tissue_val = config.get('max_tiles_per_tissue_val')
     
     # Determine device (GPU if available, else CPU)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -371,19 +394,26 @@ def main() -> None:
         split='train',
         train_ratio=config['train_ratio'],
         random_seed=config['random_seed'],
-        feature_file_suffix=feature_file_suffix
+        feature_file_suffix=feature_file_suffix,
+        max_tiles_per_tissue=max_tiles_per_tissue_train
     )
     val_dataset = WSIFeatureDataset(
         config['data_root'],
         split='val',
         train_ratio=config['train_ratio'],
         random_seed=config['random_seed'],
-        feature_file_suffix=feature_file_suffix
+        feature_file_suffix=feature_file_suffix,
+        max_tiles_per_tissue=max_tiles_per_tissue_val
     )
     
     print(f'Training samples: {len(train_dataset)}')
     print(f'Validation samples: {len(val_dataset)}')
     print(f'Classes: {train_dataset.class_folders}')
+    print(f'Physical batch size: {batch_size}')
+    print(f'Gradient accumulation steps: {gradient_accumulation_steps}')
+    print(f'Effective batch size: {effective_batch_size}')
+    print(f'Max train tiles per tissue: {max_tiles_per_tissue_train}')
+    print(f'Max val tiles per tissue: {max_tiles_per_tissue_val}')
     train_class_counts = get_class_sample_counts(train_dataset)
     val_class_counts = get_class_sample_counts(val_dataset)
     print('Training samples per class:')
@@ -413,7 +443,7 @@ def main() -> None:
         )
         train_loader = DataLoader(
             train_dataset,
-            batch_size=config['batch_size'],
+            batch_size=batch_size,
             sampler=train_sampler,
             collate_fn=collate_fn,
             num_workers=0  # Set to 0 to avoid pickle issues with custom dataset
@@ -421,14 +451,14 @@ def main() -> None:
     else:
         train_loader = DataLoader(
             train_dataset,
-            batch_size=config['batch_size'],
+            batch_size=batch_size,
             shuffle=True,
             collate_fn=collate_fn,
             num_workers=0  # Set to 0 to avoid pickle issues with custom dataset
         )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config['batch_size'],
+        batch_size=batch_size,
         shuffle=False,  # Don't shuffle validation data
         collate_fn=collate_fn,
         num_workers=0
@@ -560,7 +590,7 @@ def main() -> None:
         # Train for one epoch
         train_metrics = train_epoch(
             model, train_loader, criterion, optimizer_cls, optimizer_cluster, device,
-            clustering_weight
+            clustering_weight, gradient_accumulation_steps
         )
         
         # Validate for one epoch

@@ -33,7 +33,8 @@ class WSIFeatureDataset(Dataset):
         split: str = 'train',
         train_ratio: float = 0.9,
         random_seed: int = 42,
-        feature_file_suffix: str = '_features.pt'
+        feature_file_suffix: str = '_features.pt',
+        max_tiles_per_tissue: Optional[int] = None
     ) -> None:
         """
         Initialize the WSI Feature Dataset.
@@ -49,12 +50,17 @@ class WSIFeatureDataset(Dataset):
             feature_file_suffix (str): Feature filename suffix to match when scanning
                 slide directories (e.g., '_features.pt' or '_features_hoptimus.pt').
                 Defaults to '_features.pt'.
+            max_tiles_per_tissue (Optional[int]): Maximum number of tile features to
+                return per tissue. If None, all tiles are returned. Defaults to None.
         """
         self.data_root: str = data_root
         self.split: str = split
         self.feature_file_suffix: str = feature_file_suffix
         if len(self.feature_file_suffix) == 0:
             raise ValueError("feature_file_suffix must be a non-empty string.")
+        if max_tiles_per_tissue is not None and max_tiles_per_tissue <= 0:
+            raise ValueError("max_tiles_per_tissue must be positive or None.")
+        self.max_tiles_per_tissue: Optional[int] = max_tiles_per_tissue
         
         # Auto-detect class folders if not provided
         if class_folders is None:
@@ -221,6 +227,10 @@ class WSIFeatureDataset(Dataset):
             features_tensor = torch.FloatTensor(features_tensor)
         else:
             features_tensor = features_tensor.float()
+        features_tensor = subsample_features(
+            features=features_tensor,
+            max_tiles=self.max_tiles_per_tissue
+        )
         
         # Get integer class label
         label = self.class_to_idx[tissue_info['class']]
@@ -231,6 +241,30 @@ class WSIFeatureDataset(Dataset):
             'slide_name': tissue_info['slide_name'],
             'tissue_name': tissue_info['tissue_name']
         }
+
+
+def subsample_features(
+    features: torch.Tensor,
+    max_tiles: Optional[int]
+) -> torch.Tensor:
+    """
+    Randomly subsample tile features when a bag exceeds a configured limit.
+
+    Args:
+        features (torch.Tensor): Feature tensor with shape `[n_tiles, feature_dim]`.
+        max_tiles (Optional[int]): Maximum number of tiles to keep. If None or
+            greater than/equal to `n_tiles`, the original feature tensor is returned.
+
+    Returns:
+        torch.Tensor: Feature tensor with at most `max_tiles` rows, preserving
+            original row order for the randomly selected tiles.
+    """
+    if max_tiles is None or features.shape[0] <= max_tiles:
+        return features
+
+    selected_indices = torch.randperm(features.shape[0])[:max_tiles]
+    selected_indices, _ = torch.sort(selected_indices)
+    return features[selected_indices]
 
 
 class WSISlideBagDataset(Dataset):
