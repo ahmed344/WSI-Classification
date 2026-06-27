@@ -111,6 +111,66 @@ class SlideStainStatistics:
     visualization_path: Path
 
 
+@dataclass(frozen=True)
+class HDIStainStatistics:
+    """Store empirical HDI statistics for one positive stain signal.
+
+    Args:
+        probability (float): Probability mass contained in the HDI.
+        positive_fraction (float): Fraction of finite tissue pixels with strictly positive stain signal.
+        lower (float): Lower bound of the empirical HDI.
+        upper (float): Upper bound of the empirical HDI.
+        mean (float): Direct mean of sampled positive values inside the HDI.
+        std (float): Direct standard deviation of sampled positive values inside the HDI.
+        n_positive_values (int): Number of strictly positive sampled stain values.
+        n_hdi_values (int): Number of sampled values contained in the HDI.
+
+    Returns:
+        HDIStainStatistics: Immutable container for empirical HDI statistics.
+    """
+
+    probability: float
+    positive_fraction: float
+    lower: float
+    upper: float
+    mean: float
+    std: float
+    n_positive_values: int
+    n_hdi_values: int
+
+
+@dataclass(frozen=True)
+class SlideHDIStatistics:
+    """Store empirical HDI statistics for one tissue slide.
+
+    Args:
+        slide_path (Path): Path to the analyzed tissue slide.
+        slide_width (int): Full-resolution slide width in pixels.
+        slide_height (int): Full-resolution slide height in pixels.
+        analysis_width (int): Width of the image used for analysis.
+        analysis_height (int): Height of the image used for analysis.
+        n_tissue_pixels_available (int): Number of masked tissue pixels available in the analysis image.
+        n_tissue_pixels_used (int): Number of tissue pixels sampled for HDI analysis.
+        hematoxylin (HDIStainStatistics): Empirical HDI statistics for the Hematoxylin signal.
+        eosin (HDIStainStatistics): Empirical HDI statistics for the Eosin signal.
+        visualization_path (Path): Path to the saved visualization image.
+
+    Returns:
+        SlideHDIStatistics: Immutable container for one slide's HDI stain statistics.
+    """
+
+    slide_path: Path
+    slide_width: int
+    slide_height: int
+    analysis_width: int
+    analysis_height: int
+    n_tissue_pixels_available: int
+    n_tissue_pixels_used: int
+    hematoxylin: HDIStainStatistics
+    eosin: HDIStainStatistics
+    visualization_path: Path
+
+
 def parse_hsv_triplet(values: Sequence[int]) -> tuple[int, int, int]:
     """Validate and return an HSV threshold triplet.
 
@@ -249,6 +309,50 @@ def sample_tissue_values(
         raise ValueError("At least two finite stain-signal values are required for distribution fitting.")
 
     return sampled_values, n_available
+
+
+def compute_empirical_hdi(values: np.ndarray, probability: float) -> HDIStainStatistics:
+    """Compute the shortest empirical HDI from strictly positive stain values.
+
+    Args:
+        values (np.ndarray): One-dimensional sampled stain signal values from tissue pixels.
+        probability (float): Desired HDI probability mass in the range `(0, 1)`.
+
+    Returns:
+        HDIStainStatistics: Empirical HDI bounds and direct mean/std inside the HDI.
+    """
+    if probability <= 0 or probability >= 1:
+        raise ValueError("probability must be in the range (0, 1).")
+
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size < 2:
+        raise ValueError("At least two finite stain-signal values are required for HDI analysis.")
+
+    positive_values = finite_values[finite_values > 0]
+    positive_fraction = float(positive_values.size / finite_values.size)
+    if positive_values.size < 2:
+        raise ValueError("At least two strictly positive stain-signal values are required for HDI analysis.")
+
+    sorted_values = np.sort(positive_values)
+    window_size = int(np.ceil(probability * sorted_values.size))
+    window_size = min(max(window_size, 2), sorted_values.size)
+    interval_widths = sorted_values[window_size - 1:] - sorted_values[: sorted_values.size - window_size + 1]
+    start_index = int(np.argmin(interval_widths))
+    end_index = start_index + window_size - 1
+    lower = float(sorted_values[start_index])
+    upper = float(sorted_values[end_index])
+    hdi_values = positive_values[(positive_values >= lower) & (positive_values <= upper)]
+
+    return HDIStainStatistics(
+        probability=probability,
+        positive_fraction=positive_fraction,
+        lower=lower,
+        upper=upper,
+        mean=float(np.mean(hdi_values)),
+        std=float(np.std(hdi_values)),
+        n_positive_values=int(positive_values.size),
+        n_hdi_values=int(hdi_values.size),
+    )
 
 
 def estimate_distribution_mode(distribution: stats.rv_continuous, params: tuple[float, ...]) -> float:
@@ -488,6 +592,88 @@ def plot_signal_with_distribution(
         )
 
 
+def plot_signal_with_hdi(
+    axis: plt.Axes,
+    values: np.ndarray,
+    hdi: HDIStainStatistics,
+    title: str,
+    bins: int,
+    xmax_percentile: float,
+) -> None:
+    """Plot positive stain-signal values with differently colored HDI bins.
+
+    Args:
+        axis (plt.Axes): Matplotlib axis to draw on.
+        values (np.ndarray): Stain signal values used for HDI analysis.
+        hdi (HDIStainStatistics): Empirical HDI statistics.
+        title (str): Plot title.
+        bins (int): Number of histogram bins.
+        xmax_percentile (float): Upper percentile used to limit the displayed histogram x-axis.
+
+    Returns:
+        None: The function draws on `axis`.
+    """
+    positive_values = values[np.isfinite(values) & (values > 0)]
+    if positive_values.size < 2:
+        raise ValueError("At least two positive values are required to plot an HDI histogram.")
+    if xmax_percentile <= 0 or xmax_percentile > 100:
+        raise ValueError("xmax_percentile must be in the range (0, 100].")
+
+    x_min = float(np.min(positive_values))
+    x_max = float(np.percentile(positive_values, xmax_percentile))
+    if x_max <= x_min:
+        x_max = float(np.max(positive_values))
+
+    display_values = positive_values[positive_values <= x_max]
+    counts, bin_edges = np.histogram(display_values, bins=bins, range=(x_min, x_max))
+    bin_widths = np.diff(bin_edges)
+    bin_centers = bin_edges[:-1] + bin_widths / 2
+    hdi_bin_mask = (bin_centers >= hdi.lower) & (bin_centers <= hdi.upper)
+    bar_colors = np.where(hdi_bin_mask, "tab:orange", "lightgray")
+
+    axis.bar(
+        bin_edges[:-1],
+        counts,
+        width=bin_widths,
+        align="edge",
+        color=bar_colors,
+        edgecolor="white",
+        linewidth=0.2,
+    )
+    axis.axvspan(hdi.lower, min(hdi.upper, x_max), color="tab:orange", alpha=0.12)
+    axis.axvline(hdi.mean, color="black", linestyle="--", linewidth=1.5)
+    axis.annotate(
+        f"HDI mean={hdi.mean:.4f}",
+        xy=(hdi.mean, max(float(np.max(counts)), 1.0) * 0.9),
+        xytext=(8, 0),
+        textcoords="offset points",
+        rotation=90,
+        va="top",
+        ha="left",
+        fontsize=9,
+    )
+    axis.set_title(
+        f"{title}\nHDI {hdi.probability:.0%}: [{hdi.lower:.4f}, {hdi.upper:.4f}], "
+        f"std={hdi.std:.4f}, positive={hdi.positive_fraction:.2%}"
+    )
+    axis.set_xlabel("Separated stain signal")
+    axis.set_ylabel("Pixel count")
+    axis.set_xlim(x_min, x_max)
+    axis.set_ylim(bottom=0, top=max(float(np.max(counts)), 1.0) * 1.1)
+    axis.grid(True, alpha=0.3, linestyle="--", linewidth=0.7)
+    if xmax_percentile < 100:
+        axis.text(
+            0.98,
+            0.95,
+            f"x-axis <= p{xmax_percentile:g}",
+            transform=axis.transAxes,
+            ha="right",
+            va="top",
+            fontsize=9,
+            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
+        )
+
+
 def create_thresholded_rgb_stain_image(
     rgb_image: np.ndarray,
     signal: np.ndarray,
@@ -612,6 +798,105 @@ def save_visualization(
     return output_path
 
 
+def save_hdi_visualization(
+    slide_path: Path,
+    rgb_image: np.ndarray,
+    tissue_mask: np.ndarray,
+    hematoxylin: np.ndarray,
+    eosin: np.ndarray,
+    hematoxylin_values: np.ndarray,
+    eosin_values: np.ndarray,
+    hematoxylin_hdi: HDIStainStatistics,
+    eosin_hdi: HDIStainStatistics,
+    output_dir: Path,
+    histogram_bins: int,
+    histogram_xmax_percentile: float,
+    hematoxylin_rgb_threshold_stds: float,
+    eosin_rgb_threshold_stds: float,
+) -> Path:
+    """Save a visualization of H&E separation and empirical HDI statistics.
+
+    Args:
+        slide_path (Path): Path to the analyzed tissue slide.
+        rgb_image (np.ndarray): RGB analysis image.
+        tissue_mask (np.ndarray): Boolean tissue mask.
+        hematoxylin (np.ndarray): Hematoxylin signal array.
+        eosin (np.ndarray): Eosin signal array.
+        hematoxylin_values (np.ndarray): Hematoxylin values used for HDI analysis.
+        eosin_values (np.ndarray): Eosin values used for HDI analysis.
+        hematoxylin_hdi (HDIStainStatistics): Empirical HDI statistics for Hematoxylin.
+        eosin_hdi (HDIStainStatistics): Empirical HDI statistics for Eosin.
+        output_dir (Path): Directory where the visualization PNG will be written.
+        histogram_bins (int): Number of histogram bins.
+        histogram_xmax_percentile (float): Upper percentile used to limit histogram x-axes.
+        hematoxylin_rgb_threshold_stds (float): Number of HDI standard deviations above the
+            Hematoxylin HDI mean used for the RGB threshold visualization.
+        eosin_rgb_threshold_stds (float): Number of HDI standard deviations above the Eosin HDI mean
+            used for the RGB threshold visualization.
+
+    Returns:
+        Path: Path to the saved visualization PNG.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{safe_output_stem(slide_path)}_he_hdi95.png"
+
+    hematoxylin_threshold = hematoxylin_hdi.mean + hematoxylin_rgb_threshold_stds * hematoxylin_hdi.std
+    eosin_threshold = eosin_hdi.mean + eosin_rgb_threshold_stds * eosin_hdi.std
+    hematoxylin_rgb = create_thresholded_rgb_stain_image(
+        rgb_image,
+        hematoxylin,
+        tissue_mask,
+        hematoxylin_threshold,
+    )
+    eosin_rgb = create_thresholded_rgb_stain_image(
+        rgb_image,
+        eosin,
+        tissue_mask,
+        eosin_threshold,
+    )
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+    axes[0, 0].imshow(rgb_image)
+    axes[0, 0].set_title("Original RGB")
+    axes[0, 0].axis("off")
+
+    axes[0, 1].imshow(hematoxylin_rgb)
+    axes[0, 1].set_title(
+        f"RGB Pixels: Hematoxylin >= HDI Mean + {hematoxylin_rgb_threshold_stds:g} Std"
+    )
+    axes[0, 1].axis("off")
+
+    axes[0, 2].imshow(eosin_rgb)
+    axes[0, 2].set_title(f"RGB Pixels: Eosin >= HDI Mean + {eosin_rgb_threshold_stds:g} Std")
+    axes[0, 2].axis("off")
+
+    axes[1, 0].imshow(tissue_mask, cmap="gray")
+    axes[1, 0].set_title("Tissue Mask")
+    axes[1, 0].axis("off")
+
+    plot_signal_with_hdi(
+        axes[1, 1],
+        hematoxylin_values,
+        hematoxylin_hdi,
+        "Hematoxylin 95% HDI",
+        histogram_bins,
+        histogram_xmax_percentile,
+    )
+    plot_signal_with_hdi(
+        axes[1, 2],
+        eosin_values,
+        eosin_hdi,
+        "Eosin 95% HDI",
+        histogram_bins,
+        histogram_xmax_percentile,
+    )
+
+    fig.suptitle(str(slide_path), fontsize=11)
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    return output_path
+
+
 def analyze_slide(
     slide_path: Path,
     analysis_max_side: int,
@@ -701,6 +986,89 @@ def analyze_slide(
         n_tissue_pixels_used=int(hematoxylin_values.size),
         hematoxylin=hematoxylin_fit,
         eosin=eosin_fit,
+        visualization_path=visualization_path,
+    )
+
+
+def analyze_slide_hdi(
+    slide_path: Path,
+    analysis_max_side: int,
+    max_fit_pixels: int,
+    hsv_lower: tuple[int, int, int],
+    hsv_upper: tuple[int, int, int],
+    output_dir: Path,
+    histogram_bins: int,
+    histogram_xmax_percentile: float,
+    hdi_probability: float,
+    random_state: int,
+    hematoxylin_rgb_threshold_stds: float,
+    eosin_rgb_threshold_stds: float,
+) -> SlideHDIStatistics:
+    """Analyze one tissue slide with empirical positive-signal HDI statistics.
+
+    Args:
+        slide_path (Path): Path to one tissue slide.
+        analysis_max_side (int): Maximum width or height used for analysis and visualization.
+        max_fit_pixels (int): Maximum number of tissue pixels sampled for HDI analysis.
+        hsv_lower (tuple[int, int, int]): Lower HSV threshold for tissue masking.
+        hsv_upper (tuple[int, int, int]): Upper HSV threshold for tissue masking.
+        output_dir (Path): Directory where HDI visualization PNGs will be written.
+        histogram_bins (int): Number of histogram bins.
+        histogram_xmax_percentile (float): Upper percentile used to limit histogram x-axes.
+        hdi_probability (float): Probability mass contained in each empirical HDI.
+        random_state (int): Random seed for reproducible sampling.
+        hematoxylin_rgb_threshold_stds (float): Number of HDI standard deviations above the
+            Hematoxylin HDI mean used for the RGB threshold visualization.
+        eosin_rgb_threshold_stds (float): Number of HDI standard deviations above the Eosin HDI mean
+            used for the RGB threshold visualization.
+
+    Returns:
+        SlideHDIStatistics: Empirical H&E HDI statistics for the slide.
+    """
+    rgb_image, full_dimensions = read_slide_thumbnail(slide_path, analysis_max_side)
+    tissue_mask = create_tissue_mask(rgb_image, hsv_lower, hsv_upper)
+    hematoxylin, eosin = separate_he_signals(rgb_image)
+
+    rng = np.random.default_rng(random_state)
+    hematoxylin_values, n_available = sample_tissue_values(
+        hematoxylin,
+        tissue_mask,
+        max_fit_pixels,
+        rng,
+    )
+    eosin_values, _ = sample_tissue_values(eosin, tissue_mask, max_fit_pixels, rng)
+
+    hematoxylin_hdi = compute_empirical_hdi(hematoxylin_values, hdi_probability)
+    eosin_hdi = compute_empirical_hdi(eosin_values, hdi_probability)
+    visualization_path = save_hdi_visualization(
+        slide_path=slide_path,
+        rgb_image=rgb_image,
+        tissue_mask=tissue_mask,
+        hematoxylin=hematoxylin,
+        eosin=eosin,
+        hematoxylin_values=hematoxylin_values,
+        eosin_values=eosin_values,
+        hematoxylin_hdi=hematoxylin_hdi,
+        eosin_hdi=eosin_hdi,
+        output_dir=output_dir,
+        histogram_bins=histogram_bins,
+        histogram_xmax_percentile=histogram_xmax_percentile,
+        hematoxylin_rgb_threshold_stds=hematoxylin_rgb_threshold_stds,
+        eosin_rgb_threshold_stds=eosin_rgb_threshold_stds,
+    )
+
+    full_width, full_height = full_dimensions
+    analysis_height, analysis_width = rgb_image.shape[:2]
+    return SlideHDIStatistics(
+        slide_path=slide_path,
+        slide_width=full_width,
+        slide_height=full_height,
+        analysis_width=analysis_width,
+        analysis_height=analysis_height,
+        n_tissue_pixels_available=n_available,
+        n_tissue_pixels_used=int(hematoxylin_values.size),
+        hematoxylin=hematoxylin_hdi,
+        eosin=eosin_hdi,
         visualization_path=visualization_path,
     )
 
@@ -804,6 +1172,84 @@ def write_statistics_csv(statistics: Sequence[SlideStainStatistics], output_csv:
                     "eosin_q99": stat.eosin.q99,
                     "eosin_fit_percentile": stat.eosin.fit_percentile,
                     "eosin_aic": stat.eosin.aic,
+                    "visualization_path": str(stat.visualization_path),
+                }
+            )
+
+    return output_csv
+
+
+def write_hdi_statistics_csv(statistics: Sequence[SlideHDIStatistics], output_csv: Path) -> Path:
+    """Write empirical HDI stain statistics to a CSV file.
+
+    Args:
+        statistics (Sequence[SlideHDIStatistics]): Per-slide empirical HDI stain statistics.
+        output_csv (Path): Path where the CSV file will be written.
+
+    Returns:
+        Path: Path to the written CSV file.
+    """
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "slide_path",
+        "slide_width",
+        "slide_height",
+        "analysis_width",
+        "analysis_height",
+        "n_tissue_pixels_available",
+        "n_tissue_pixels_used",
+        "hematoxylin_hdi_probability",
+        "hematoxylin_positive_fraction",
+        "hematoxylin_zero_fraction",
+        "hematoxylin_hdi_lower",
+        "hematoxylin_hdi_upper",
+        "hematoxylin_hdi_mean",
+        "hematoxylin_hdi_std",
+        "hematoxylin_n_positive_values",
+        "hematoxylin_n_hdi_values",
+        "eosin_hdi_probability",
+        "eosin_positive_fraction",
+        "eosin_zero_fraction",
+        "eosin_hdi_lower",
+        "eosin_hdi_upper",
+        "eosin_hdi_mean",
+        "eosin_hdi_std",
+        "eosin_n_positive_values",
+        "eosin_n_hdi_values",
+        "visualization_path",
+    ]
+
+    with output_csv.open("w", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for stat in statistics:
+            writer.writerow(
+                {
+                    "slide_path": str(stat.slide_path),
+                    "slide_width": stat.slide_width,
+                    "slide_height": stat.slide_height,
+                    "analysis_width": stat.analysis_width,
+                    "analysis_height": stat.analysis_height,
+                    "n_tissue_pixels_available": stat.n_tissue_pixels_available,
+                    "n_tissue_pixels_used": stat.n_tissue_pixels_used,
+                    "hematoxylin_hdi_probability": stat.hematoxylin.probability,
+                    "hematoxylin_positive_fraction": stat.hematoxylin.positive_fraction,
+                    "hematoxylin_zero_fraction": 1.0 - stat.hematoxylin.positive_fraction,
+                    "hematoxylin_hdi_lower": stat.hematoxylin.lower,
+                    "hematoxylin_hdi_upper": stat.hematoxylin.upper,
+                    "hematoxylin_hdi_mean": stat.hematoxylin.mean,
+                    "hematoxylin_hdi_std": stat.hematoxylin.std,
+                    "hematoxylin_n_positive_values": stat.hematoxylin.n_positive_values,
+                    "hematoxylin_n_hdi_values": stat.hematoxylin.n_hdi_values,
+                    "eosin_hdi_probability": stat.eosin.probability,
+                    "eosin_positive_fraction": stat.eosin.positive_fraction,
+                    "eosin_zero_fraction": 1.0 - stat.eosin.positive_fraction,
+                    "eosin_hdi_lower": stat.eosin.lower,
+                    "eosin_hdi_upper": stat.eosin.upper,
+                    "eosin_hdi_mean": stat.eosin.mean,
+                    "eosin_hdi_std": stat.eosin.std,
+                    "eosin_n_positive_values": stat.eosin.n_positive_values,
+                    "eosin_n_hdi_values": stat.eosin.n_hdi_values,
                     "visualization_path": str(stat.visualization_path),
                 }
             )
