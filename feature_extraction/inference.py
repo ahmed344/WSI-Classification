@@ -3,10 +3,10 @@ from torchvision import transforms
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import pandas as pd
-import os
 from pathlib import Path
 
 from dataset import WSI_tiles
+from utils import collect_slides, ensure_tiles_and_qc
 
 # Determine the device to run the model on (GPU or CPU)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -14,25 +14,11 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Hyperparameters
 path = "/workspaces/WSI-Classification/data/HE-MYO/Processed/"
 TILE_SIZE= (448, 448)
-BATCH_SIZE = 256
+BATCH_SIZE = 512
+QC_DIR = Path("/workspaces/WSI-Classification/data/HE-MYO/Quality_controls/create_tiles")
 
 # List the slides  all category directories (Dystrophic, Healthy, Inflammatory, Myopathic, Neurogenic)
-slides = []
-for category_dir in os.listdir(path):
-    category_path = Path(path) / category_dir
-    if category_path.is_dir():
-        # For each category, scan slide directories
-        for slide_dir in os.listdir(category_path):
-            slide_dir_path = category_path / slide_dir
-            if slide_dir_path.is_dir():
-                # Find .ome.tiff files in the slide directory
-                for slide_file in slide_dir_path.glob("*.ome.tiff"):
-                    slides.append({
-                        'name': slide_file.name,
-                        'path': str(slide_file),
-                        'category': category_dir,
-                        'slide_dir': slide_dir
-                    })
+slides = collect_slides(path)
 
 # # Create the model
 # model = timm.create_model("hf-hub:bioptimus/H-optimus-0", pretrained=True, init_values=1e-5, dynamic_img_size=False)
@@ -67,20 +53,23 @@ for slide_info in slides:
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Check if the embedding features already exist
-    slide_base_name = Path(slide_name).stem
-    features_path = output_dir / f"{slide_base_name.split('.')[0]}_features.pt"
+    slide_base_name = Path(slide_name).name.removesuffix(".ome.tiff")
+    features_path = output_dir / f"{slide_base_name}_features_hoptimus.pt"
     if features_path.exists():
-        print(f"{slide_base_name.split('.')[0]} already processed")
+        print(f"{slide_base_name} already processed")
         continue
 
-    # Check if the tiles is missing
-    tiles_path = output_dir / f"{slide_base_name.split('.')[0]}_tiles.csv"
-    if not tiles_path.exists():
-        print(f"{slide_base_name.split('.')[0]} tiles is missing")
-        continue
+    tiles_path = ensure_tiles_and_qc(
+        slide_path=slide_path,
+        output_dir=output_dir,
+        slide_base_name=slide_base_name,
+        tile_size=TILE_SIZE,
+        qc_dir=QC_DIR,
+        quantile=0.75,
+    )
     
     # Print the slide name with category
-    print(f"Processing [{category}] {slide_name.split('.')[0]}")
+    print(f"Processing [{category}] {slide_base_name}")
 
     # Load the tiles
     tiles = pd.read_csv(tiles_path)
