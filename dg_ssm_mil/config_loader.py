@@ -165,6 +165,12 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("dynamic_graph_top_k must be positive.")
     if int(config.get("dynamic_graph_chunk_size", 512)) <= 0:
         raise ValueError("dynamic_graph_chunk_size must be positive.")
+    if int(config.get("gradient_accumulation_steps", 1)) <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive.")
+    for key in ["max_tiles_per_tissue_train", "max_tiles_per_tissue_val"]:
+        value = config.get(key)
+        if value is not None and int(value) <= 0:
+            raise ValueError(f"{key} must be positive or null.")
     if str(config.get("coordinate_mismatch", "trim")) not in {"error", "trim"}:
         raise ValueError("coordinate_mismatch must be either 'error' or 'trim'.")
     get_coordinate_columns(config)

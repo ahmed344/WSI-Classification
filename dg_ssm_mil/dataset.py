@@ -29,6 +29,7 @@ class DGSSMMILTissueDataset(Dataset):
         coordinate_mismatch: str = "trim",
         sort_tiles_spatially: bool = True,
         normalize_coordinates: bool = True,
+        max_tiles_per_tissue: Optional[int] = None,
     ) -> None:
         """
         Initialize the tissue-level DG-SSM-MIL dataset.
@@ -47,6 +48,8 @@ class DGSSMMILTissueDataset(Dataset):
             sort_tiles_spatially (bool): Whether to sort tiles by y then x.
             normalize_coordinates (bool): Whether to center and scale coordinates
                 per tissue before returning them.
+            max_tiles_per_tissue (Optional[int]): Maximum number of contiguous
+                tiles to return per tissue. If None, all tiles are returned.
 
         Returns:
             None: This constructor initializes dataset metadata in-place.
@@ -58,6 +61,7 @@ class DGSSMMILTissueDataset(Dataset):
         self.coordinate_mismatch = coordinate_mismatch
         self.sort_tiles_spatially = sort_tiles_spatially
         self.normalize_coordinates = normalize_coordinates
+        self.max_tiles_per_tissue = max_tiles_per_tissue
 
         if split not in {"train", "val"}:
             raise ValueError("split must be either 'train' or 'val'.")
@@ -65,6 +69,8 @@ class DGSSMMILTissueDataset(Dataset):
             raise ValueError("coordinate_mismatch must be either 'error' or 'trim'.")
         if not feature_file_suffix:
             raise ValueError("feature_file_suffix must be a non-empty string.")
+        if max_tiles_per_tissue is not None and max_tiles_per_tissue <= 0:
+            raise ValueError("max_tiles_per_tissue must be positive or None.")
 
         if class_folders is None:
             class_folders = sorted(
@@ -201,6 +207,11 @@ class DGSSMMILTissueDataset(Dataset):
             tissue["feature_path"],
             tissue["tiles_path"],
         )
+        features, coords = _select_contiguous_region(
+            features,
+            coords,
+            self.max_tiles_per_tissue,
+        )
         if self.sort_tiles_spatially:
             features, coords = _sort_by_spatial_position(features, coords)
         if self.normalize_coordinates:
@@ -334,6 +345,38 @@ def _sort_by_spatial_position(
     order = np.lexsort((coords[:, 0].numpy(), coords[:, 1].numpy()))
     order_tensor = torch.as_tensor(order, dtype=torch.long)
     return features[order_tensor], coords[order_tensor]
+
+
+def _select_contiguous_region(
+    features: torch.Tensor,
+    coords: torch.Tensor,
+    max_tiles: Optional[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Select a spatially contiguous tile region around a random center tile.
+
+    Args:
+        features (torch.Tensor): Feature tensor of shape `[n_tiles, D]`.
+        coords (torch.Tensor): Raw coordinate tensor of shape `[n_tiles, 2]`.
+        max_tiles (Optional[int]): Maximum number of nearest tiles to keep. If
+            None or greater than/equal to `n_tiles`, all tiles are returned.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Cropped features and coordinates with
+        at most `max_tiles` rows.
+    """
+    if max_tiles is None or features.shape[0] <= max_tiles:
+        return features, coords
+
+    center_idx = torch.randint(features.shape[0], size=(1,)).item()
+    distances = torch.linalg.vector_norm(coords - coords[center_idx], dim=1)
+    selected_indices = torch.topk(
+        distances,
+        k=max_tiles,
+        largest=False,
+    ).indices
+    selected_indices, _ = torch.sort(selected_indices)
+    return features[selected_indices], coords[selected_indices]
 
 
 def _normalize_coordinates(coords: torch.Tensor) -> torch.Tensor:

@@ -16,6 +16,7 @@ qp-projects/
 *.key
 *.bin
 *.csv
+*.pdf
 .gitattributes
 config.json
 

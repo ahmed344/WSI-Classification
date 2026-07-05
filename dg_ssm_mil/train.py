@@ -12,7 +12,12 @@ import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+)
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
@@ -112,8 +117,16 @@ def create_datasets(config: Dict[str, Any]) -> Tuple[DGSSMMILTissueDataset, DGSS
         "sort_tiles_spatially": bool(config.get("sort_tiles_spatially", True)),
         "normalize_coordinates": bool(config.get("normalize_coordinates", True)),
     }
-    train_dataset = DGSSMMILTissueDataset(split="train", **dataset_kwargs)
-    val_dataset = DGSSMMILTissueDataset(split="val", **dataset_kwargs)
+    train_dataset = DGSSMMILTissueDataset(
+        split="train",
+        max_tiles_per_tissue=config.get("max_tiles_per_tissue_train"),
+        **dataset_kwargs,
+    )
+    val_dataset = DGSSMMILTissueDataset(
+        split="val",
+        max_tiles_per_tissue=config.get("max_tiles_per_tissue_val"),
+        **dataset_kwargs,
+    )
     return train_dataset, val_dataset
 
 
@@ -176,6 +189,7 @@ def train_epoch(
     optimizer: optim.Optimizer,
     device: torch.device,
     gradient_clip_norm: float,
+    gradient_accumulation_steps: int = 1,
 ) -> Dict[str, float]:
     """
     Train DG-SSM-MIL for one epoch.
@@ -187,6 +201,8 @@ def train_epoch(
         optimizer (optim.Optimizer): Optimizer for model parameters.
         device (torch.device): Device used for tensor computation.
         gradient_clip_norm (float): Max norm for gradient clipping; <=0 disables it.
+        gradient_accumulation_steps (int): Number of micro-batches to accumulate
+            before each optimizer step. Defaults to 1.
 
     Returns:
         Dict[str, float]: Mean loss, accuracy, and balanced accuracy.
@@ -195,8 +211,10 @@ def train_epoch(
     running_loss = 0.0
     all_preds: List[int] = []
     all_labels: List[int] = []
+    accumulation_steps = max(1, int(gradient_accumulation_steps))
+    optimizer.zero_grad()
 
-    for batch in dataloader:
+    for batch_idx, batch in enumerate(dataloader):
         features = batch["features"].to(device)
         coords = batch["coords"].to(device)
         masks = batch["masks"].to(device)
@@ -205,11 +223,17 @@ def train_epoch(
         outputs = model(features, coords, masks)
         loss = criterion(outputs["logits"], labels)
 
-        optimizer.zero_grad()
-        loss.backward()
-        if gradient_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
-        optimizer.step()
+        scaled_loss = loss / accumulation_steps
+        scaled_loss.backward()
+        is_accumulation_boundary = (
+            (batch_idx + 1) % accumulation_steps == 0
+            or (batch_idx + 1) == len(dataloader)
+        )
+        if is_accumulation_boundary:
+            if gradient_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+            optimizer.step()
+            optimizer.zero_grad()
 
         running_loss += float(loss.item())
         preds = torch.argmax(outputs["logits"], dim=1).detach().cpu().numpy()
@@ -503,6 +527,14 @@ def main() -> None:
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
     print(f"Classes: {train_dataset.class_folders}")
+    batch_size = int(config["batch_size"])
+    gradient_accumulation_steps = int(config.get("gradient_accumulation_steps", 1))
+    effective_batch_size = batch_size * gradient_accumulation_steps
+    print(f"Physical batch size: {batch_size}")
+    print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+    print(f"Effective batch size: {effective_batch_size}")
+    print(f"Max train tiles per tissue: {config.get('max_tiles_per_tissue_train')}")
+    print(f"Max val tiles per tissue: {config.get('max_tiles_per_tissue_val')}")
     print_class_counts(train_dataset, val_dataset)
 
     class_weights = compute_class_weights(train_dataset)
@@ -554,6 +586,7 @@ def main() -> None:
             optimizer,
             device,
             float(config.get("gradient_clip_norm", 1.0)),
+            gradient_accumulation_steps,
         )
         val_metrics = validate(model, val_loader, criterion, device)
         scheduler.step(float(val_metrics["loss"]))
@@ -591,6 +624,21 @@ def main() -> None:
                 epoch,
                 config,
                 val_metrics,
+            )
+            report = classification_report(
+                val_metrics["labels"],
+                val_metrics["predictions"],
+                target_names=train_dataset.class_folders,
+                labels=list(range(len(train_dataset.class_folders))),
+                output_dict=True,
+                zero_division=0,
+            )
+            save_json(
+                os.path.join(
+                    os.path.dirname(config["paths"]["checkpoint"]),
+                    "best_model_report.json",
+                ),
+                report,
             )
             save_json(
                 config["paths"]["training_report"],
