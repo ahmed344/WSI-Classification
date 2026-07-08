@@ -53,6 +53,26 @@ def _assert_batch_shapes(batch: Dict[str, Any]) -> None:
     assert batch["labels"].ndim == 1
 
 
+def _assert_attention_weights(attention_weights: torch.Tensor, mask: torch.Tensor) -> None:
+    """
+    Assert that MIL attention weights are finite and normalized on valid tiles.
+
+    Args:
+        attention_weights (torch.Tensor): Attention weights with shape `[B, N]`.
+        mask (torch.Tensor): Boolean valid-tile mask with shape `[B, N]`.
+
+    Returns:
+        None: Raises AssertionError if the attention contract is invalid.
+    """
+    assert attention_weights.shape == mask.shape
+    assert torch.isfinite(attention_weights).all()
+    padded_weights = attention_weights.masked_select(~mask)
+    assert torch.allclose(padded_weights, torch.zeros_like(padded_weights))
+    valid_attention_sums = attention_weights.sum(dim=1)
+    expected_sums = torch.ones_like(valid_attention_sums)
+    assert torch.allclose(valid_attention_sums, expected_sums, atol=1e-5)
+
+
 def test_integration() -> bool:
     """
     Run the DG-SSM-MIL integration smoke test.
@@ -104,7 +124,7 @@ def test_integration() -> bool:
 
         outputs = model(features, coords, masks)
         assert outputs["logits"].shape == (1, int(config["num_classes"]))
-        assert outputs["attention_weights"].shape == masks.shape
+        _assert_attention_weights(outputs["attention_weights"], masks)
         loss = criterion(outputs["logits"], labels)
         optimizer.zero_grad()
         loss.backward()

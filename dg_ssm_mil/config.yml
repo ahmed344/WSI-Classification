@@ -6,7 +6,7 @@ checkpoint_dir: "dg_ssm_mil/checkpoints"
 output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results/dg_ssm_mil"
 
 # Feature source selection
-feature_model: "hoptimus"
+feature_model: "uni2h"
 feature_model_suffixes:
   default: "_features.pt"
   hoptimus: "_features_hoptimus.pt"
@@ -20,14 +20,14 @@ sort_tiles_spatially: true
 coordinate_columns: ["x", "y"]
 coordinate_mismatch: "trim"  # Options: error, trim
 normalize_coordinates: true
-max_tiles_per_tissue_train: 1024  # Contiguous spatial crop for oversized training tissues; null disables
+max_tiles_per_tissue_train: 2048  # Contiguous spatial crop for oversized training tissues; null disables
 max_tiles_per_tissue_val: null  # Validation tile cap; null keeps all tiles
 
 # Model architecture
 input_dim: 1536
 hidden_dim: 256
 projection_dropout: 0.15
-spatial_knn_k: 8
+spatial_knn_k: 24
 gat_heads: 4
 gat_dropout: 0.15
 dynamic_graph_top_k: 6
@@ -39,23 +39,24 @@ mamba_expand: 2
 use_conv_branch: true
 conv_kernel_size: 3
 block_dropout: 0.15
+attention_type: "gated"  # Options: standard, gated
 attention_hidden_dim: 256
 classifier_dropout: 0.3
 
 # Training parameters
 batch_size: 64
-gradient_accumulation_steps: 2  # Effective batch size is batch_size * this value
+gradient_accumulation_steps: 1  # Effective batch size is batch_size * this value
 epochs: 200
-learning_rate: 0.000001
-weight_decay: 0.1
+learning_rate: 0.0001
+weight_decay: 0.01
 gradient_clip_norm: 1.0
 use_weighted_sampler: true
 use_class_weighted_loss: false
 best_checkpoint_metric: "balanced_accuracy"  # Options: balanced_accuracy, accuracy, loss
 lr_scheduler_factor: 0.5
 lr_scheduler_patience: 15
-min_epochs_before_early_stopping: 50
-patience: 25
+min_epochs_before_early_stopping: 20
+patience: 10
 num_workers: 0
 device: "auto"  # Options: auto, cpu, cuda
 evaluation_batch_size: 1  # Keep evaluation memory stable for large tissue bags

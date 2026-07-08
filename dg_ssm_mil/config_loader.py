@@ -165,6 +165,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("dynamic_graph_top_k must be positive.")
     if int(config.get("dynamic_graph_chunk_size", 512)) <= 0:
         raise ValueError("dynamic_graph_chunk_size must be positive.")
+    if str(config.get("attention_type", "standard")) not in {"standard", "gated"}:
+        raise ValueError("attention_type must be either 'standard' or 'gated'.")
     if int(config.get("gradient_accumulation_steps", 1)) <= 0:
         raise ValueError("gradient_accumulation_steps must be positive.")
     for key in ["max_tiles_per_tissue_train", "max_tiles_per_tissue_val"]:

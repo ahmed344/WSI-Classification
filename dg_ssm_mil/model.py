@@ -298,6 +298,7 @@ class ABMILPooling(nn.Module):
         attention_hidden_dim: int,
         num_classes: int,
         dropout: float = 0.3,
+        attention_type: str = "standard",
     ) -> None:
         """
         Initialize ABMIL pooling.
@@ -307,16 +308,31 @@ class ABMILPooling(nn.Module):
             attention_hidden_dim (int): Hidden dimension for attention scoring.
             num_classes (int): Number of output classes.
             dropout (float): Dropout probability before classification.
+            attention_type (str): Attention scorer type, either `standard` or `gated`.
 
         Returns:
             None: This constructor initializes module layers in-place.
         """
         super().__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_dim, attention_hidden_dim),
-            nn.Tanh(),
-            nn.Linear(attention_hidden_dim, 1),
-        )
+        if attention_type not in {"standard", "gated"}:
+            raise ValueError("attention_type must be one of: standard, gated.")
+        self.attention_type = attention_type
+        if attention_type == "gated":
+            self.attention_v = nn.Sequential(
+                nn.Linear(hidden_dim, attention_hidden_dim),
+                nn.Tanh(),
+            )
+            self.attention_u = nn.Sequential(
+                nn.Linear(hidden_dim, attention_hidden_dim),
+                nn.Sigmoid(),
+            )
+            self.attention = nn.Linear(attention_hidden_dim, 1)
+        else:
+            self.attention = nn.Sequential(
+                nn.Linear(hidden_dim, attention_hidden_dim),
+                nn.Tanh(),
+                nn.Linear(attention_hidden_dim, 1),
+            )
         self.classifier = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_classes),
@@ -338,7 +354,12 @@ class ABMILPooling(nn.Module):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Logits `[B, C]`,
             attention weights `[B, N]`, and pooled embeddings `[B, D]`.
         """
-        scores = self.attention(features).squeeze(-1)
+        if self.attention_type == "gated":
+            scores = self.attention(
+                self.attention_v(features) * self.attention_u(features)
+            ).squeeze(-1)
+        else:
+            scores = self.attention(features).squeeze(-1)
         scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
         attention_weights = F.softmax(scores, dim=1)
         attention_weights = attention_weights.masked_fill(~mask, 0.0)
@@ -372,6 +393,7 @@ class DGSSMMILModel(nn.Module):
         block_dropout: float = 0.15,
         attention_hidden_dim: int = 256,
         classifier_dropout: float = 0.3,
+        attention_type: str = "standard",
     ) -> None:
         """
         Initialize the DG-SSM-MIL model.
@@ -396,6 +418,7 @@ class DGSSMMILModel(nn.Module):
             block_dropout (float): Dropout after SSM branch fusion.
             attention_hidden_dim (int): Hidden dimension for ABMIL attention.
             classifier_dropout (float): Dropout before final classifier.
+            attention_type (str): Bag-level MIL attention scorer type.
 
         Returns:
             None: This constructor initializes module layers in-place.
@@ -433,6 +456,7 @@ class DGSSMMILModel(nn.Module):
             attention_hidden_dim=attention_hidden_dim,
             num_classes=num_classes,
             dropout=classifier_dropout,
+            attention_type=attention_type,
         )
 
     def forward(
@@ -505,6 +529,7 @@ class DGSSMMILModel(nn.Module):
             block_dropout=float(config.get("block_dropout", 0.15)),
             attention_hidden_dim=int(config.get("attention_hidden_dim", 256)),
             classifier_dropout=float(config.get("classifier_dropout", 0.3)),
+            attention_type=str(config.get("attention_type", "standard")),
         )
 
 
