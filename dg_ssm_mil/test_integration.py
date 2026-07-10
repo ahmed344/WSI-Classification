@@ -7,12 +7,22 @@ from typing import Any, Dict
 import torch
 
 try:
-    from .config_loader import load_config, resolve_device
+    from .config_loader import (
+        load_config,
+        resolve_device,
+        resolve_feature_file_suffix,
+        resolve_input_dim,
+    )
     from .dataset import DGSSMMILTissueDataset, collate_fn
     from .train import create_datasets
     from .model import DGSSMMILModel
 except ImportError:
-    from config_loader import load_config, resolve_device  # type: ignore
+    from config_loader import (  # type: ignore
+        load_config,
+        resolve_device,
+        resolve_feature_file_suffix,
+        resolve_input_dim,
+    )
     from dataset import DGSSMMILTissueDataset, collate_fn  # type: ignore
     from train import create_datasets  # type: ignore
     from model import DGSSMMILModel  # type: ignore
@@ -88,6 +98,10 @@ def test_integration() -> bool:
 
     try:
         config = load_config()
+        genbio_config = dict(config)
+        genbio_config["feature_model"] = "genbio"
+        assert resolve_feature_file_suffix(genbio_config) == "_features_genbio.pt"
+        assert resolve_input_dim(genbio_config) == 4608
         train_dataset, _ = create_datasets(config)
         print(f"Loaded training samples: {len(train_dataset)}")
         print(f"Classes: {train_dataset.class_folders}")
@@ -102,6 +116,11 @@ def test_integration() -> bool:
     try:
         max_tiles = int(config.get("integration_max_tiles", 128))
         sample = _trim_sample(train_dataset[0], max_tiles)
+        assert sample["features"].shape[-1] == int(config["input_dim"]), (
+            "Feature dimension mismatch: "
+            f"sample has {sample['features'].shape[-1]}, "
+            f"config expects {config['input_dim']}"
+        )
         batch = collate_fn([sample])
         _assert_batch_shapes(batch)
         print(f"Batch features: {tuple(batch['features'].shape)}")

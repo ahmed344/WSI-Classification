@@ -59,6 +59,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             output_dir, "attention_heatmaps"
         )
 
+    config["input_dim"] = resolve_input_dim(config)
     validate_config(config)
     return config
 
@@ -89,6 +90,34 @@ def resolve_feature_file_suffix(config: Mapping[str, Any]) -> str:
             f"Invalid feature suffix '{suffix}' for model '{selected_model}'."
         )
     return suffix
+
+
+def resolve_input_dim(config: Mapping[str, Any]) -> int:
+    """
+    Resolve the input feature dimension for the selected feature model.
+
+    Args:
+        config (Mapping[str, Any]): Parsed configuration containing
+            `feature_model` and `feature_model_input_dims`.
+
+    Returns:
+        int: Positive input feature dimension used by `DGSSMMILModel`.
+    """
+    selected_model = str(config.get("feature_model", "default"))
+    input_dim_map = config.get("feature_model_input_dims", {})
+    if not isinstance(input_dim_map, Mapping):
+        raise ValueError("feature_model_input_dims must be a mapping.")
+    if selected_model not in input_dim_map:
+        available = ", ".join(sorted(str(key) for key in input_dim_map.keys()))
+        raise ValueError(
+            f"Unknown feature_model '{selected_model}'. Available input dims: {available}."
+        )
+    input_dim = int(input_dim_map[selected_model])
+    if input_dim <= 0:
+        raise ValueError(
+            f"Invalid input_dim '{input_dim}' for model '{selected_model}'."
+        )
+    return input_dim
 
 
 def resolve_device(config: Mapping[str, Any]) -> str:
@@ -142,7 +171,6 @@ def validate_config(config: Mapping[str, Any]) -> None:
     """
     required_keys = [
         "data_root",
-        "input_dim",
         "hidden_dim",
         "num_classes",
         "spatial_knn_k",
@@ -157,7 +185,8 @@ def validate_config(config: Mapping[str, Any]) -> None:
 
     if int(config["num_classes"]) <= 1:
         raise ValueError("num_classes must be greater than 1.")
-    if int(config["input_dim"]) <= 0 or int(config["hidden_dim"]) <= 0:
+    input_dim = resolve_input_dim(config)
+    if input_dim <= 0 or int(config["hidden_dim"]) <= 0:
         raise ValueError("input_dim and hidden_dim must be positive.")
     if int(config["spatial_knn_k"]) <= 0:
         raise ValueError("spatial_knn_k must be positive.")

@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from clam_dataset import WSIFeatureDataset, collate_fn
 from clam_model import CLAM_MB, compute_clustering_loss
-from config_loader import load_config, resolve_feature_file_suffix
+from config_loader import load_config, resolve_feature_file_suffix, resolve_input_dim
 
 
 def test_integration() -> bool:
@@ -38,6 +38,10 @@ def test_integration() -> bool:
         data_root = '/workspaces/WSI-Classification/data/HE-MYO/Processed'
         config = load_config()
         feature_file_suffix = resolve_feature_file_suffix(config)
+        genbio_config = dict(config)
+        genbio_config['feature_model'] = 'genbio'
+        assert resolve_feature_file_suffix(genbio_config) == '_features_genbio.pt'
+        assert resolve_input_dim(genbio_config) == 4608
         train_dataset = WSIFeatureDataset(
             data_root,
             split='train',
@@ -57,6 +61,11 @@ def test_integration() -> bool:
         # Get a sample and verify structure
         sample = train_dataset[0]
         print(f"   ✓ Sample features shape: {sample['features'].shape}")
+        assert sample['features'].shape[-1] == config['input_dim'], (
+            "Feature dimension mismatch: "
+            f"sample has {sample['features'].shape[-1]}, "
+            f"config expects {config['input_dim']}"
+        )
         print(
             f"   ✓ Sample label: {sample['label']} "
             f"({train_dataset.idx_to_class[sample['label']]})"
@@ -97,7 +106,7 @@ def test_integration() -> bool:
         
         # Create model with standard configuration
         model = CLAM_MB(
-            input_dim=1536,
+            input_dim=config['input_dim'],
             hidden_dim=512,
             num_classes=5,
             k_clusters=2

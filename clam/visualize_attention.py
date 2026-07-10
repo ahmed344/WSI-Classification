@@ -444,7 +444,9 @@ def main() -> None:
     # Resolve output directory
     output_dir = config['paths']['attention_output']
     if output_dir is None:
-        output_dir = os.path.join(config['output_dir'], 'attention_heatmaps')
+        output_dir = os.path.join(
+            config['output_dir'], 'clam', 'attention_heatmaps'
+        )
     
     # Get visualization parameters from config
     vis_config = config.get('visualization', {})

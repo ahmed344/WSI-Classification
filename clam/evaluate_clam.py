@@ -411,7 +411,9 @@ def main() -> None:
     # Resolve output directory
     output_dir = config['paths']['evaluation_output']
     if output_dir is None:
-        output_dir = os.path.join(config['output_dir'], 'evaluation_results')
+        output_dir = os.path.join(
+            config['output_dir'], 'clam', 'evaluation_results'
+        )
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)

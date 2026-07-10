@@ -6,11 +6,17 @@ checkpoint_dir: "dg_ssm_mil/checkpoints"
 output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results/dg_ssm_mil"
 
 # Feature source selection
-feature_model: "uni2h"
+feature_model: "genbio"
 feature_model_suffixes:
   default: "_features.pt"
   hoptimus: "_features_hoptimus.pt"
   uni2h: "_features_uni2h.pt"
+  genbio: "_features_genbio.pt"
+feature_model_input_dims:
+  default: 1536
+  hoptimus: 1536
+  uni2h: 1536
+  genbio: 4608
 
 # Dataset and coordinate handling
 num_classes: 5
@@ -24,8 +30,7 @@ max_tiles_per_tissue_train: 2048  # Contiguous spatial crop for oversized traini
 max_tiles_per_tissue_val: null  # Validation tile cap; null keeps all tiles
 
 # Model architecture
-input_dim: 1536
-hidden_dim: 256
+hidden_dim: 512
 projection_dropout: 0.15
 spatial_knn_k: 24
 gat_heads: 4
@@ -44,7 +49,7 @@ attention_hidden_dim: 256
 classifier_dropout: 0.3
 
 # Training parameters
-batch_size: 64
+batch_size: 16
 gradient_accumulation_steps: 1  # Effective batch size is batch_size * this value
 epochs: 200
 learning_rate: 0.0001

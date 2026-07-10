@@ -38,6 +38,8 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     # Load YAML configuration file
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+
+    config['input_dim'] = resolve_input_dim(config)
     
     # Set default paths if not specified in config
     if config.get('paths', {}).get('checkpoint') is None:
@@ -51,20 +53,55 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if config.get('paths', {}).get('evaluation_output') is None:
         output_dir = config.get('output_dir', 'evaluation_results')
         config['paths'] = config.get('paths', {})
-        # Default evaluation output: output_dir/evaluation_results
+        # Default evaluation output: output_dir/clam/evaluation_results
         config['paths']['evaluation_output'] = os.path.join(
-            output_dir, 'evaluation_results'
+            output_dir, 'clam', 'evaluation_results'
         )
     
     if config.get('paths', {}).get('attention_output') is None:
         output_dir = config.get('output_dir', 'evaluation_results')
         config['paths'] = config.get('paths', {})
-        # Default attention output: output_dir/attention_heatmaps
+        # Default attention output: output_dir/clam/attention_heatmaps
         config['paths']['attention_output'] = os.path.join(
-            output_dir, 'attention_heatmaps'
+            output_dir, 'clam', 'attention_heatmaps'
         )
     
     return config
+
+
+def resolve_input_dim(config: Mapping[str, Any]) -> int:
+    """
+    Resolve the input feature dimensionality based on selected feature model.
+
+    Args:
+        config (Mapping[str, Any]): Parsed configuration dictionary that may include
+            `feature_model` and `feature_model_input_dims` keys.
+
+    Returns:
+        int: Input feature dimensionality consumed by the CLAM model.
+    """
+    selected_model = str(config.get('feature_model', 'default'))
+    input_dim_map = config.get('feature_model_input_dims', {})
+
+    if not isinstance(input_dim_map, Mapping):
+        raise ValueError(
+            "Invalid config key 'feature_model_input_dims': expected a mapping."
+        )
+
+    if selected_model not in input_dim_map:
+        available_models = ', '.join(sorted(str(k) for k in input_dim_map.keys()))
+        raise ValueError(
+            f"Unknown feature_model '{selected_model}'. "
+            f"Available input dimensions: {available_models}."
+        )
+
+    input_dim = int(input_dim_map[selected_model])
+    if input_dim <= 0:
+        raise ValueError(
+            f"Invalid input_dim '{input_dim}' for feature_model '{selected_model}'. "
+            "Input dimension must be positive."
+        )
+    return input_dim
 
 
 def resolve_feature_file_suffix(config: Mapping[str, Any]) -> str:

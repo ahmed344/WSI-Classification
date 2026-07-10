@@ -7,15 +7,20 @@ output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results"  # Directory fo
 
 # Feature source selection
 # Choose which extracted feature set CLAM should load.
-feature_model: "hoptimus"  # Active feature extractor name used to select feature files
+feature_model: "genbio"  # Active feature extractor name used to select feature files
 feature_model_suffixes:  # Mapping from feature model names to filename suffixes
   default: "_features.pt"  # Suffix for the default feature set
   hoptimus: "_features_hoptimus.pt"  # Suffix for H-Optimus feature files
   uni2h: "_features_uni2h.pt"  # Suffix for UNI2-H feature files
+  genbio: "_features_genbio.pt"  # Suffix for GenBio-PathFM feature files
+feature_model_input_dims:  # Mapping from feature model names to input dimensions
+  default: 1536  # Input dimension for the default feature set
+  hoptimus: 1536  # Input dimension for H-Optimus features
+  uni2h: 1536  # Input dimension for UNI2-H features
+  genbio: 4608  # Input dimension for GenBio-PathFM features
 
 # Model architecture
-input_dim: 1536  # Input feature dimensionality consumed by CLAM
-hidden_dim: 512  # Hidden dimensionality in shared embedding layers
+hidden_dim: 1024  # Hidden dimensionality in shared embedding layers
 attention_hidden_dim: 512  # Intermediate dimension for attention network
 attention_dim: 512  # Projection dimension for attention scoring
 feature_projection_dropout: 0.5  # Dropout in shared input feature projection
@@ -27,8 +32,8 @@ num_classes: 5  # Number of slide-level target classes
 k_clusters: 10  # Number of top and bottom patches sampled for clustering supervision
 
 # Training parameters
-batch_size: 128  # Physical number of bags processed per micro-batch
-gradient_accumulation_steps: 2  # Optimizer step frequency; effective batch size is batch_size * this value
+batch_size: 32  # Physical number of bags processed per micro-batch
+gradient_accumulation_steps: 1  # Optimizer step frequency; effective batch size is batch_size * this value
 max_tiles_per_tissue_train: 1024  # Randomly subsample training tissues above this tile count; null disables
 max_tiles_per_tissue_val: null  # Validation tile cap; null keeps all tiles
 epochs: 1000  # Maximum number of training epochs
@@ -60,6 +65,6 @@ visualization:  # Settings controlling attention/diagnostic visualization output
 # Paths (can be overridden)
 paths:  # Optional explicit output/checkpoint paths overriding default derivations
   checkpoint: null  # Will be set to checkpoints/best_model.pth if null
-  evaluation_output: null  # Will use output_dir/evaluation_results if null
-  attention_output: null  # Will use output_dir/attention_heatmaps if null
+  evaluation_output: null  # Will use output_dir/clam/evaluation_results if null
+  attention_output: null  # Will use output_dir/clam/attention_heatmaps if null
 
