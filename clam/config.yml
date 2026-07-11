@@ -1,4 +1,4 @@
-# CLAM-MB Configuration File
+# CLAM Configuration File
 
 # Data paths
 data_root: "/workspaces/WSI-Classification/data/HE-MYO/Processed"  # Root directory containing processed slide-level data
@@ -7,7 +7,7 @@ output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results"  # Directory fo
 
 # Feature source selection
 # Choose which extracted feature set CLAM should load.
-feature_model: "genbio"  # Active feature extractor name used to select feature files
+feature_model: "uni2h"  # Active feature extractor name used to select feature files
 feature_model_suffixes:  # Mapping from feature model names to filename suffixes
   default: "_features.pt"  # Suffix for the default feature set
   hoptimus: "_features_hoptimus.pt"  # Suffix for H-Optimus feature files
@@ -20,45 +20,44 @@ feature_model_input_dims:  # Mapping from feature model names to input dimension
   genbio: 4608  # Input dimension for GenBio-PathFM features
 
 # Model architecture
-hidden_dim: 1024  # Hidden dimensionality in shared embedding layers
-attention_hidden_dim: 512  # Intermediate dimension for attention network
-attention_dim: 512  # Projection dimension for attention scoring
-feature_projection_dropout: 0.5  # Dropout in shared input feature projection
-attention_branch_feature_dropout: 0.5  # Dropout in attention branch feature extractors
-clustering_branch_feature_dropout: 0.5  # Dropout in clustering branch feature extractor
-final_classifier_dropout: 0.5  # Dropout in final classifier MLP
-cluster_head_hidden_dim: 512  # Hidden dimension in clustering head MLP
+model_type: "clam_mb"  # Options: clam_mb, clam_sb
+gated_attention: true  # Use the canonical gated attention network
+hidden_dim: 512  # Shared tile embedding dimension
+attention_dim: 256  # Hidden dimension of the gated attention network
+dropout: 0.25  # Dropout in the shared embedding and attention projections
 num_classes: 5  # Number of slide-level target classes
-k_clusters: 10  # Number of top and bottom patches sampled for clustering supervision
+k_sample: 8  # Number of positive/negative instances sampled per bag
+subtyping: true  # Apply out-of-class instance supervision
+bag_weight: 0.7  # Weight of bag loss; instance loss receives 1 - bag_weight
 
 # Training parameters
-batch_size: 32  # Physical number of bags processed per micro-batch
-gradient_accumulation_steps: 1  # Optimizer step frequency; effective batch size is batch_size * this value
-max_tiles_per_tissue_train: 1024  # Randomly subsample training tissues above this tile count; null disables
-max_tiles_per_tissue_val: null  # Validation tile cap; null keeps all tiles
+batch_size: 128  # Physical number of variable-length bags per micro-batch
+gradient_accumulation_steps: 1  # Effective batch size is batch_size * this value
+bag_level: "tissue"  # Options: tissue, slide
+feature_normalization: "none"  # Options: none, l2, layer_norm
+max_tiles_per_bag:  # Applied after constructing a complete tissue or slide bag
+  train: 2048
+  val: null
+  test: null
+tile_sampling: "random"  # Options: random, uniform, first
 epochs: 1000  # Maximum number of training epochs
 lr_cls: 0.0001  # Initial learning rate for classification-related parameters
-lr_cluster: 0.1  # Initial learning rate for clustering branch parameters
 lr_scheduler_factor_cls: 0.5  # ReduceLROnPlateau factor for classification branch
-lr_scheduler_patience_cls: 10  # ReduceLROnPlateau patience for classification branch
-lr_scheduler_factor_cluster: 0.2  # ReduceLROnPlateau factor for clustering branch
-lr_scheduler_patience_cluster: 5  # ReduceLROnPlateau patience for clustering branch
+lr_scheduler_patience_cls: 3  # ReduceLROnPlateau patience for classification branch
 use_weighted_sampler: true  # If true, train DataLoader uses WeightedRandomSampler
 use_class_weighted_loss: false  # If true, CrossEntropyLoss uses inverse-frequency class weights
-best_checkpoint_metric: "balanced_accuracy"  # Options: balanced_accuracy, accuracy, loss, classification_loss, clustering_loss
+best_checkpoint_metric: "balanced_accuracy"  # Options: balanced_accuracy, accuracy, loss, classification_loss, instance_loss
 weight_decay_cls: 0.01  # Weight decay for feature projection, attention branches, and classifier
-weight_decay_cluster: 0.01  # Weight decay for clustering branch
-clustering_weight_start: 0.1  # Initial weight applied to clustering loss
-clustering_weight_end: 50.0  # Final clustering-loss weight after warmup
-clustering_warmup_epochs: 20  # Epochs used to ramp clustering weight from start to end
 train_ratio: 0.8  # Fraction of slides used for training split
-min_epochs_before_early_stopping: 30  # Minimum epochs before early stopping checks begin
-patience: 25  # Early stopping patience based on the selected checkpoint metric
+val_ratio: 0.1  # Fraction of slides used for validation split
+test_ratio: 0.1  # Fraction of slides used for test split
+min_epochs_before_early_stopping: 10  # Minimum epochs before early stopping checks begin
+patience: 10  # Early stopping patience based on the selected checkpoint metric
 random_seed: 42  # Random seed for deterministic data splitting and training behavior
 
 # Visualization parameters
 visualization:  # Settings controlling attention/diagnostic visualization outputs
-  split: "val"  # 'train' or 'val'
+  split: "val"  # Options: train, val, test
   max_slides: null  # null for all slides, or specify a number
   tile_size: 448  # Pixel size used when rendering visualization tiles
 

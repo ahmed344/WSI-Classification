@@ -1,511 +1,537 @@
-"""
-Evaluation script for CLAM-MB model.
+"""Evaluate canonical CLAM checkpoints using their exact saved data contract."""
 
-This module provides evaluation functionality for trained CLAM-MB models,
-including accuracy calculation, confusion matrix generation, and detailed
-classification reports.
-"""
-from typing import Dict, Any, List, Optional
-import os
-import torch
-import numpy as np
-from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from __future__ import annotations
+
+import csv
 import json
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence
+
 import matplotlib.pyplot as plt
+import numpy as np
 import seaborn as sns
+import torch
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    roc_auc_score,
+)
+from torch import nn
+from torch.utils.data import DataLoader
 
-from clam_dataset import WSIFeatureDataset, WSISlideBagDataset, collate_fn
-from clam_model import CLAM_MB
-from config_loader import load_config, resolve_feature_file_suffix
+try:
+    from .clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
+    from .config_loader import load_config
+    from .train_clam import MODEL_SCHEMA, create_model, seed_everything, seed_worker
+except ImportError:
+    from clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
+    from config_loader import load_config
+    from train_clam import MODEL_SCHEMA, create_model, seed_everything, seed_worker
 
 
-def get_class_sample_counts(dataset: Any) -> Dict[str, int]:
-    """
-    Calculate sample counts per class for a dataset split.
+def get_class_sample_counts(dataset: WSIBagDataset) -> Dict[str, int]:
+    """Count evaluated bag units per class.
 
     Args:
-        dataset (Any): Dataset instance containing split indices and either tissue
-            metadata (`tissues`) or slide metadata (`slides`).
+        dataset (WSIBagDataset): Tissue- or slide-level split dataset.
 
     Returns:
-        Dict[str, int]: Mapping from class name to number of samples in the dataset split.
+        Dict[str, int]: Counts keyed by ordered class name.
     """
-    class_counts: Dict[str, int] = {class_name: 0 for class_name in dataset.class_folders}
-    if hasattr(dataset, 'tissues'):
-        for sample_idx in dataset.indices:
-            class_name = dataset.tissues[sample_idx]['class']
-            class_counts[class_name] += 1
-        return class_counts
+    counts = {class_name: 0 for class_name in dataset.class_folders}
+    for bag_index in dataset.indices:
+        counts[dataset._bags[bag_index]["class_name"]] += 1
+    return counts
 
-    if hasattr(dataset, 'slides'):
-        for sample_idx in dataset.indices:
-            class_name = dataset.slides[sample_idx]['class']
-            class_counts[class_name] += 1
-        return class_counts
 
-    raise AttributeError(
-        "Dataset must provide either 'tissues' or 'slides' metadata for class counting."
-    )
+def _multiclass_auc(
+    labels: Sequence[int],
+    probabilities: Sequence[Sequence[float]],
+    num_classes: int,
+) -> Optional[float]:
+    """Compute macro one-vs-rest ROC AUC when every class is represented.
+
+    Args:
+        labels (Sequence[int]): Ground-truth class indices.
+        probabilities (Sequence[Sequence[float]]): Per-class probabilities.
+        num_classes (int): Fixed checkpoint class count.
+
+    Returns:
+        Optional[float]: Macro ROC AUC, or ``None`` when mathematically invalid.
+    """
+    if len(set(labels)) != num_classes:
+        return None
+    try:
+        probability_array = np.asarray(probabilities, dtype=np.float64)
+        if num_classes == 2:
+            return float(roc_auc_score(labels, probability_array[:, 1]))
+        return float(
+            roc_auc_score(
+                labels,
+                probability_array,
+                labels=list(range(num_classes)),
+                multi_class="ovr",
+                average="macro",
+            )
+        )
+    except ValueError:
+        return None
 
 
 def evaluate(
-    model: CLAM_MB,
+    model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    class_names: List[str]
+    class_names: Sequence[str],
 ) -> Dict[str, Any]:
-    """
-    Evaluate the model and compute detailed metrics.
-    
+    """Evaluate one split with fixed-class metrics and predictions.
+
     Args:
-        model (CLAM_MB): Trained CLAM-MB model in evaluation mode.
-        dataloader (DataLoader): DataLoader providing batches of samples to evaluate.
-        device (torch.device): Device to run evaluation on (CPU or CUDA).
-        class_names (List[str]): List of class names for labeling metrics.
-    
+        model (nn.Module): Loaded canonical CLAM model.
+        dataloader (DataLoader): Evaluation bag DataLoader.
+        device (torch.device): Compute device.
+        class_names (Sequence[str]): Checkpoint class names in label order.
+
     Returns:
-        Dict[str, Any]: Dictionary containing evaluation metrics:
-            - 'accuracy' (float): Overall classification accuracy.
-            - 'confusion_matrix' (np.ndarray): Confusion matrix of shape [n_classes, n_classes].
-            - 'classification_report' (Dict[str, Any]): Detailed per-class metrics including
-              precision, recall, F1-score, and support.
-            - 'predictions' (List[int]): List of predicted class indices.
-            - 'labels' (List[int]): List of true class indices.
-            - 'probabilities' (List[List[float]]): List of prediction probabilities for each sample.
-            - 'slide_names' (List[str]): List of slide names for each sample.
-            - 'tissue_names' (List[str]): List of tissue names for each sample.
-            - 'attention_weights' (List[np.ndarray]): List of attention weight arrays (if available).
+        Dict[str, Any]: Aggregate metrics, per-class report, fixed confusion
+            matrix, probabilities, predictions, and bag identifiers.
     """
+    if len(dataloader.dataset) == 0:
+        raise ValueError("Cannot evaluate an empty dataset split.")
     model.eval()
-    all_preds: List[int] = []
-    all_labels: List[int] = []
-    all_probs: List[List[float]] = []
-    all_slide_names: List[str] = []
-    all_tissue_names: List[str] = []
-    all_attention_weights: List[np.ndarray] = []
-    
-    # Disable gradient computation for evaluation
+    labels_all: List[int] = []
+    predictions_all: List[int] = []
+    probabilities_all: List[List[float]] = []
+    slide_names: List[str] = []
+    tissue_names: List[str] = []
+
     with torch.no_grad():
         for batch in dataloader:
-            # Move batch data to device
-            features = batch['features'].to(device)
-            labels = batch['labels'].to(device)
-            masks = batch['masks'].to(device)
-            slide_names = batch['slide_names']
-            tissue_names = batch['tissue_names']
-            
-            # Forward pass through model
-            outputs = model(features, masks)
-            logits = outputs['logits']
-            attention_weights = outputs['attention_weights']
-            
-            # Get predictions and probabilities
-            probs = torch.softmax(logits, dim=1)
-            preds = torch.argmax(logits, dim=1).cpu().numpy()
-            
-            # Collect predictions, labels, and probabilities
-            all_preds.extend(preds)
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
-            all_slide_names.extend(slide_names)
-            all_tissue_names.extend(tissue_names)
-            
-            # Store attention weights (average across branches for visualization)
-            if attention_weights:
-                # Average attention across all branches
-                avg_attention = torch.stack(attention_weights).mean(dim=0).cpu().numpy()
-                all_attention_weights.extend(avg_attention)
-    
-    # Calculate overall accuracy
-    accuracy = accuracy_score(all_labels, all_preds)
-    
-    # Generate confusion matrix
-    cm = confusion_matrix(
-        all_labels, all_preds, labels=list(range(len(class_names)))
+            features = batch["features"].to(device, non_blocking=True)
+            masks = batch["masks"].to(device, non_blocking=True)
+            outputs = model(features, mask=masks, labels=None, instance_eval=False)
+            labels_all.extend(batch["labels"].tolist())
+            predictions_all.extend(outputs["predictions"].cpu().tolist())
+            probabilities_all.extend(outputs["probabilities"].cpu().tolist())
+            slide_names.extend(str(name) for name in batch["slide_names"])
+            tissue_names.extend(str(name) for name in batch["tissue_names"])
+
+    fixed_labels = list(range(len(class_names)))
+    matrix = confusion_matrix(
+        labels_all, predictions_all, labels=fixed_labels
     )
-    
-    # Generate detailed classification report
     report = classification_report(
-        all_labels, all_preds,
-        target_names=class_names,
-        labels=list(range(len(class_names))),
+        labels_all,
+        predictions_all,
+        labels=fixed_labels,
+        target_names=list(class_names),
         output_dict=True,
-        zero_division=0
+        zero_division=0,
     )
-    
     return {
-        'accuracy': accuracy,
-        'confusion_matrix': cm,
-        'classification_report': report,
-        'predictions': all_preds,
-        'labels': all_labels,
-        'probabilities': all_probs,
-        'slide_names': all_slide_names,
-        'tissue_names': all_tissue_names,
-        'attention_weights': all_attention_weights
+        "accuracy": float(accuracy_score(labels_all, predictions_all)),
+        "balanced_accuracy": float(
+            balanced_accuracy_score(labels_all, predictions_all)
+        ),
+        "macro_f1": float(
+            f1_score(
+                labels_all,
+                predictions_all,
+                labels=fixed_labels,
+                average="macro",
+                zero_division=0,
+            )
+        ),
+        "multiclass_roc_auc": _multiclass_auc(
+            labels_all, probabilities_all, len(class_names)
+        ),
+        "classification_report": report,
+        "confusion_matrix": matrix,
+        "labels": labels_all,
+        "predictions": predictions_all,
+        "probabilities": probabilities_all,
+        "slide_names": slide_names,
+        "tissue_names": tissue_names,
     }
 
 
 def plot_confusion_matrix(
     cm: np.ndarray,
-    class_names: List[str],
-    save_path: Optional[str] = None
+    class_names: Sequence[str],
+    save_path: Optional[str] = None,
 ) -> None:
-    """
-    Plot confusion matrix as a heatmap.
-    
+    """Plot a fixed-label confusion matrix.
+
     Args:
-        cm (np.ndarray): Confusion matrix of shape [n_classes, n_classes].
-        class_names (List[str]): List of class names for axis labels.
-        save_path (Optional[str]): Path to save the figure. If None, displays the plot.
-            Defaults to None.
+        cm (np.ndarray): Integer matrix shaped ``[classes, classes]``.
+        class_names (Sequence[str]): Ordered axis labels.
+        save_path (Optional[str]): PNG path, or ``None`` to display.
+
+    Returns:
+        None: The plot is saved or displayed.
     """
-    plt.figure(figsize=(10, 10))
-    ax = sns.heatmap(
-        cm, annot=True, fmt='d', cmap='Blues',
-        xticklabels=class_names,
-        yticklabels=class_names,
+    figure, axis = plt.subplots(figsize=(10, 9))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=list(class_names),
+        yticklabels=list(class_names),
         cbar=False,
-        annot_kws={'size': 20}
+        annot_kws={"size": 16},
+        ax=axis,
     )
-    ax.tick_params(axis='both', labelsize=14)
-    plt.xlabel('Predicted', fontsize=16)
-    plt.ylabel('Actual', fontsize=16)
-    plt.title('Confusion Matrix', fontsize=18)
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f'Confusion matrix saved to {save_path}')
-    else:
+    axis.tick_params(axis="both", labelsize=14)
+    axis.set_xlabel("Predicted", fontsize=16)
+    axis.set_ylabel("Actual", fontsize=16)
+    figure.tight_layout()
+    if save_path is None:
         plt.show()
-    plt.close()
+    else:
+        figure.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(figure)
 
 
-def print_metrics(metrics: Dict[str, Any], class_names: List[str]) -> None:
-    """
-    Print evaluation metrics in a formatted format.
-    
+def print_metrics(metrics: Mapping[str, Any], class_names: Sequence[str]) -> None:
+    """Print aggregate and per-class evaluation metrics.
+
     Args:
-        metrics (Dict[str, Any]): Dictionary containing evaluation metrics from evaluate().
-        class_names (List[str]): List of class names for labeling.
+        metrics (Mapping[str, Any]): Result returned by ``evaluate``.
+        class_names (Sequence[str]): Ordered checkpoint class names.
+
+    Returns:
+        None: Metrics are printed to standard output.
     """
-    print('\n' + '='*60)
-    print('EVALUATION RESULTS')
-    print('='*60)
-    print(f'\nOverall Accuracy: {metrics["accuracy"]:.4f}')
-    
-    # Print per-class metrics
-    print('\nPer-class Metrics:')
-    print('-'*60)
-    report = metrics['classification_report']
-    
-    for i, class_name in enumerate(class_names):
-        if class_name in report:
-            precision = report[class_name]['precision']
-            recall = report[class_name]['recall']
-            f1 = report[class_name]['f1-score']
-            support = report[class_name]['support']
-            print(
-                f'{class_name:20s} | Precision: {precision:.4f} | '
-                f'Recall: {recall:.4f} | F1: {f1:.4f} | Support: {support}'
-            )
-    
-    # Print macro averages
-    print('\nMacro Average:')
-    macro = report['macro avg']
+    auc = metrics["multiclass_roc_auc"]
+    auc_text = "not valid" if auc is None else f"{float(auc):.4f}"
     print(
-        f'Precision: {macro["precision"]:.4f} | '
-        f'Recall: {macro["recall"]:.4f} | '
-        f'F1: {macro["f1-score"]:.4f}'
+        f"accuracy={metrics['accuracy']:.4f} "
+        f"balanced_accuracy={metrics['balanced_accuracy']:.4f} "
+        f"macro_f1={metrics['macro_f1']:.4f} "
+        f"multiclass_roc_auc={auc_text}"
     )
-    
-    # Print weighted averages
-    print('\nWeighted Average:')
-    weighted = report['weighted avg']
-    print(
-        f'Precision: {weighted["precision"]:.4f} | '
-        f'Recall: {weighted["recall"]:.4f} | '
-        f'F1: {weighted["f1-score"]:.4f}'
-    )
-    
-    print('='*60)
+    report = metrics["classification_report"]
+    for class_name in class_names:
+        values = report[class_name]
+        print(
+            f"  {class_name}: precision={values['precision']:.4f} "
+            f"recall={values['recall']:.4f} f1={values['f1-score']:.4f} "
+            f"support={int(values['support'])}"
+        )
 
 
 def create_dataset_for_level(
     level: str,
-    data_root: str,
-    class_folders: List[str],
+    config: Mapping[str, Any],
+    class_folders: Sequence[str],
     split: str,
-    train_ratio: float,
-    random_seed: int,
-    feature_file_suffix: str
-) -> Any:
-    """
-    Create a dataset for the selected evaluation level and split.
+) -> WSIBagDataset:
+    """Create an evaluation dataset from checkpoint configuration.
 
     Args:
-        level (str): Evaluation level name (`'tissue'` or `'slide'`).
-        data_root (str): Root directory containing class folders.
-        class_folders (List[str]): Ordered class folder names.
-        split (str): Dataset split (`'train'` or `'val'`).
-        train_ratio (float): Ratio of slides assigned to training split.
-        random_seed (int): Seed for reproducible split generation.
-        feature_file_suffix (str): Feature suffix used to select input files.
+        level (str): ``tissue`` or ``slide``.
+        config (Mapping[str, Any]): Exact configuration stored in the checkpoint.
+        class_folders (Sequence[str]): Exact checkpoint class order.
+        split (str): ``train``, ``val``, or ``test``.
 
     Returns:
-        Any: Instantiated dataset object for the requested level.
+        WSIBagDataset: Configured evaluation bag dataset.
     """
-    if level == 'tissue':
-        return WSIFeatureDataset(
-            data_root=data_root,
-            class_folders=class_folders,
-            split=split,
-            train_ratio=train_ratio,
-            random_seed=random_seed,
-            feature_file_suffix=feature_file_suffix
-        )
-    if level == 'slide':
-        return WSISlideBagDataset(
-            data_root=data_root,
-            class_folders=class_folders,
-            split=split,
-            train_ratio=train_ratio,
-            random_seed=random_seed,
-            feature_file_suffix=feature_file_suffix
-        )
-    raise ValueError(f"Invalid level '{level}'. Expected 'tissue' or 'slide'.")
+    if level not in ("tissue", "slide"):
+        raise ValueError("level must be 'tissue' or 'slide'.")
+    return create_bag_dataset(
+        config,
+        split,
+        class_folders=class_folders,
+        bag_level=level,
+    )
+
+
+def _json_summary(metrics: Mapping[str, Any]) -> Dict[str, Any]:
+    """Convert evaluation metrics to a JSON-safe summary.
+
+    Args:
+        metrics (Mapping[str, Any]): Complete result returned by ``evaluate``.
+
+    Returns:
+        Dict[str, Any]: Aggregate metrics, report, and fixed confusion matrix.
+    """
+    return {
+        "accuracy": float(metrics["accuracy"]),
+        "balanced_accuracy": float(metrics["balanced_accuracy"]),
+        "macro_f1": float(metrics["macro_f1"]),
+        "multiclass_roc_auc": (
+            None
+            if metrics["multiclass_roc_auc"] is None
+            else float(metrics["multiclass_roc_auc"])
+        ),
+        "classification_report": metrics["classification_report"],
+        "confusion_matrix": np.asarray(metrics["confusion_matrix"]).tolist(),
+        "num_bags": len(metrics["labels"]),
+    }
 
 
 def save_level_results(
-    metrics: Dict[str, Any],
-    class_folders: List[str],
+    metrics: Mapping[str, Any],
+    class_folders: Sequence[str],
     output_dir: str,
     level: str,
-    split: str
-) -> None:
-    """
-    Save evaluation summaries, confusion matrix, and per-sample predictions.
+    split: str,
+) -> Dict[str, str]:
+    """Save summary JSON, prediction CSV/JSON, and confusion plot.
 
     Args:
-        metrics (Dict[str, Any]): Output dictionary returned by `evaluate`.
-        class_folders (List[str]): Ordered class names.
-        output_dir (str): Directory where artifacts are written.
-        level (str): Evaluation level label (`'tissue'` or `'slide'`).
-        split (str): Dataset split label (`'train'` or `'val'`).
+        metrics (Mapping[str, Any]): Complete result returned by ``evaluate``.
+        class_folders (Sequence[str]): Ordered checkpoint class names.
+        output_dir (str): Artifact directory.
+        level (str): Evaluated bag level.
+        split (str): Evaluated dataset split.
 
     Returns:
-        None: This function writes files to disk.
+        Dict[str, str]: Paths to all saved artifacts.
     """
-    results = {
-        'accuracy': float(metrics['accuracy']),
-        'confusion_matrix': metrics['confusion_matrix'].tolist(),
-        'classification_report': metrics['classification_report'],
-        'predictions': [int(p) for p in metrics['predictions']],
-        'labels': [int(l) for l in metrics['labels']],
-        'slide_names': metrics['slide_names'],
-        'tissue_names': metrics['tissue_names']
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    stem = f"{level}_{split}"
+    summary_path = destination / f"{stem}_evaluation.json"
+    predictions_json_path = destination / f"{stem}_predictions.json"
+    predictions_csv_path = destination / f"{stem}_predictions.csv"
+    matrix_path = destination / f"{stem}_confusion_matrix.png"
+
+    with summary_path.open("w", encoding="utf-8") as summary_file:
+        json.dump(_json_summary(metrics), summary_file, indent=2)
+
+    rows: List[Dict[str, Any]] = []
+    for index, label in enumerate(metrics["labels"]):
+        prediction = int(metrics["predictions"][index])
+        row: Dict[str, Any] = {
+            "slide_name": metrics["slide_names"][index],
+            "tissue_name": metrics["tissue_names"][index],
+            "true_label": int(label),
+            "predicted_label": prediction,
+            "true_class": class_folders[int(label)],
+            "predicted_class": class_folders[prediction],
+        }
+        for class_index, class_name in enumerate(class_folders):
+            row[f"probability_{class_name}"] = float(
+                metrics["probabilities"][index][class_index]
+            )
+        rows.append(row)
+
+    with predictions_json_path.open("w", encoding="utf-8") as predictions_file:
+        json.dump(rows, predictions_file, indent=2)
+    with predictions_csv_path.open(
+        "w", encoding="utf-8", newline=""
+    ) as predictions_csv:
+        writer = csv.DictWriter(predictions_csv, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    plot_confusion_matrix(
+        np.asarray(metrics["confusion_matrix"]),
+        class_folders,
+        str(matrix_path),
+    )
+    return {
+        "summary": str(summary_path),
+        "predictions_json": str(predictions_json_path),
+        "predictions_csv": str(predictions_csv_path),
+        "confusion_matrix": str(matrix_path),
     }
-    results_path = os.path.join(output_dir, f'{level}_evaluation_{split}.json')
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f'Results saved to {results_path}')
-
-    predictions: List[Dict[str, Any]] = []
-    for i, slide_name in enumerate(metrics['slide_names']):
-        predictions.append({
-            'slide_name': slide_name,
-            'tissue_name': metrics['tissue_names'][i],
-            'true_label': int(metrics['labels'][i]),
-            'predicted_label': int(metrics['predictions'][i]),
-            'true_class': class_folders[metrics['labels'][i]],
-            'predicted_class': class_folders[metrics['predictions'][i]],
-            'probabilities': {
-                class_folders[j]: float(metrics['probabilities'][i][j])
-                for j in range(len(class_folders))
-            }
-        })
-    predictions_path = os.path.join(output_dir, f'{level}_predictions_{split}.json')
-    with open(predictions_path, 'w') as f:
-        json.dump(predictions, f, indent=2)
-    print(f'Predictions saved to {predictions_path}')
-
-    cm_path = os.path.join(output_dir, f'{level}_confusion_matrix_{split}.png')
-    plot_confusion_matrix(metrics['confusion_matrix'], class_folders, cm_path)
 
 
 def run_level_split_evaluation(
-    model: CLAM_MB,
-    config: Dict[str, Any],
-    class_folders: List[str],
-    feature_file_suffix: str,
+    model: nn.Module,
+    config: Mapping[str, Any],
+    class_folders: Sequence[str],
     device: torch.device,
     output_dir: str,
     level: str,
-    split: str
-) -> None:
-    """
-    Run one evaluation job for a level/split pair and persist artifacts.
+    split: str,
+) -> Dict[str, Any]:
+    """Evaluate and persist one bag-level/split pair.
 
     Args:
-        model (CLAM_MB): Loaded CLAM model in evaluation mode.
-        config (Dict[str, Any]): Global configuration dictionary.
-        class_folders (List[str]): Ordered class names for label decoding.
-        feature_file_suffix (str): Feature suffix selected in config.
-        device (torch.device): Evaluation device.
-        output_dir (str): Evaluation output directory.
-        level (str): Evaluation level (`'tissue'` or `'slide'`).
-        split (str): Dataset split (`'train'` or `'val'`).
+        model (nn.Module): Loaded canonical CLAM model.
+        config (Mapping[str, Any]): Exact checkpoint configuration.
+        class_folders (Sequence[str]): Exact checkpoint class order.
+        device (torch.device): Compute device.
+        output_dir (str): Artifact directory.
+        level (str): Evaluated bag level.
+        split (str): Evaluated split.
 
     Returns:
-        None: This function runs evaluation and writes artifacts to disk.
+        Dict[str, Any]: JSON-safe summary plus artifact paths.
     """
-    print('\n' + '-' * 60)
-    print(f'Running {level} evaluation on {split} split...')
-    dataset = create_dataset_for_level(
-        level=level,
-        data_root=config['data_root'],
-        class_folders=class_folders,
-        split=split,
-        train_ratio=config['train_ratio'],
-        random_seed=config['random_seed'],
-        feature_file_suffix=feature_file_suffix
-    )
-    class_counts = get_class_sample_counts(dataset)
-    print(f'Number of {level} samples ({split}): {len(dataset)}')
-    print(f'{split.capitalize()} samples per class:')
-    for class_name in class_folders:
-        print(f'  {class_name}: {class_counts[class_name]}')
-
+    dataset = create_dataset_for_level(level, config, class_folders, split)
+    if dataset.num_classes != int(config["num_classes"]):
+        raise ValueError(
+            f"Checkpoint num_classes={config['num_classes']} does not equal "
+            f"dataset classes={dataset.num_classes}."
+        )
+    generator = torch.Generator().manual_seed(int(config["random_seed"]))
     dataloader = DataLoader(
         dataset,
-        batch_size=config['batch_size'],
+        batch_size=int(config["batch_size"]),
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=0
+        num_workers=int(config.get("num_workers", 0)),
+        worker_init_fn=seed_worker,
+        generator=generator,
+        pin_memory=torch.cuda.is_available(),
     )
     metrics = evaluate(model, dataloader, device, class_folders)
+    print(f"{level}/{split} bags={len(dataset)} counts={get_class_sample_counts(dataset)}")
     print_metrics(metrics, class_folders)
-    save_level_results(metrics, class_folders, output_dir, level, split)
+    artifacts = save_level_results(
+        metrics, class_folders, output_dir, level, split
+    )
+    return {**_json_summary(metrics), "artifacts": artifacts}
+
+
+def _evaluation_controls(
+    runtime_config: Mapping[str, Any],
+    primary_level: str,
+    supplementary_level: Optional[str],
+    include_train: Optional[bool],
+) -> tuple[List[str], bool]:
+    """Resolve optional evaluation controls without changing checkpoint data choices.
+
+    Args:
+        runtime_config (Mapping[str, Any]): Runtime config used only for controls.
+        primary_level (str): Checkpoint training bag level.
+        supplementary_level (Optional[str]): Explicit extra evaluation level.
+        include_train (Optional[bool]): Explicit train-diagnostic switch.
+
+    Returns:
+        tuple[List[str], bool]: Ordered levels and train-diagnostic setting.
+    """
+    section = runtime_config.get("evaluation", {})
+    if not isinstance(section, Mapping):
+        raise ValueError("evaluation config must be a mapping when present.")
+    configured_level = section.get(
+        "supplementary_bag_level",
+        runtime_config.get("supplementary_bag_level"),
+    )
+    extra = supplementary_level if supplementary_level is not None else configured_level
+    levels = [primary_level]
+    if extra is not None:
+        extra = str(extra)
+        if extra not in ("tissue", "slide"):
+            raise ValueError("supplementary bag level must be tissue or slide.")
+        if extra not in levels:
+            levels.append(extra)
+    configured_train = bool(
+        section.get("include_train", runtime_config.get("evaluate_train", False))
+    )
+    return levels, configured_train if include_train is None else bool(include_train)
+
+
+def evaluate_checkpoint(
+    config_path: Optional[str] = None,
+    supplementary_level: Optional[str] = None,
+    include_train: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Load and evaluate a canonical checkpoint on validation and test splits.
+
+    Args:
+        config_path (Optional[str]): Runtime YAML path used to locate checkpoint
+            and outputs, or ``None`` for the module default.
+        supplementary_level (Optional[str]): Explicit extra ``tissue`` or
+            ``slide`` evaluation, in addition to the checkpoint bag level.
+        include_train (Optional[bool]): Whether to add a train diagnostic;
+            ``None`` reads the optional evaluation config.
+
+    Returns:
+        Dict[str, Any]: Results keyed by ``bag_level/split``.
+    """
+    runtime_config = load_config(config_path)
+    checkpoint_path = Path(runtime_config["paths"]["checkpoint"])
+    output_dir = str(runtime_config["paths"]["evaluation_output"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if checkpoint.get("model_schema") != MODEL_SCHEMA:
+        raise ValueError(
+            f"Checkpoint model_schema must be '{MODEL_SCHEMA}'; old formats "
+            "are not supported."
+        )
+    checkpoint_config = checkpoint.get("config")
+    class_folders = checkpoint.get("class_folders")
+    if not isinstance(checkpoint_config, Mapping):
+        raise ValueError("Checkpoint must contain a configuration mapping.")
+    if not isinstance(class_folders, list) or not all(
+        isinstance(name, str) for name in class_folders
+    ):
+        raise ValueError("Checkpoint must contain an ordered class_folders list.")
+    if len(class_folders) != int(checkpoint_config["num_classes"]):
+        raise ValueError("Checkpoint class order length does not equal num_classes.")
+    primary_level = str(checkpoint.get("bag_level"))
+    if primary_level != str(checkpoint_config["bag_level"]):
+        raise ValueError("Checkpoint bag_level disagrees with checkpoint config.")
+
+    seed_everything(int(checkpoint_config["random_seed"]))
+    model = create_model(checkpoint_config).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    levels, train_diagnostic = _evaluation_controls(
+        runtime_config, primary_level, supplementary_level, include_train
+    )
+    splits = ["val", "test"]
+    if train_diagnostic:
+        splits.append("train")
+
+    results: Dict[str, Any] = {}
+    for level in levels:
+        for split in splits:
+            dataset = create_dataset_for_level(
+                level, checkpoint_config, class_folders, split
+            )
+            if len(dataset) == 0:
+                results[f"{level}/{split}"] = {
+                    "skipped": True,
+                    "reason": "empty split",
+                }
+                continue
+            results[f"{level}/{split}"] = run_level_split_evaluation(
+                model,
+                checkpoint_config,
+                class_folders,
+                device,
+                output_dir,
+                level,
+                split,
+            )
+
+    manifest_path = Path(output_dir) / "evaluation_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", encoding="utf-8") as manifest_file:
+        json.dump(
+            {
+                "checkpoint": str(checkpoint_path),
+                "model_schema": MODEL_SCHEMA,
+                "class_folders": class_folders,
+                "primary_bag_level": primary_level,
+                "results": results,
+            },
+            manifest_file,
+            indent=2,
+        )
+    return results
 
 
 def main() -> None:
+    """Evaluate the configured checkpoint.
+
+    Args:
+        None: This entry point takes no arguments.
+
+    Returns:
+        None: Evaluation artifacts are written to configured paths.
     """
-    Main evaluation function.
-    
-    Loads model checkpoint, creates dataset, evaluates model performance,
-    and saves results including confusion matrix and classification report.
-    """
-    # Load configuration from config.yml
-    config = load_config()
-    feature_file_suffix = resolve_feature_file_suffix(config)
-    
-    # Resolve checkpoint path
-    checkpoint_path = config['paths']['checkpoint']
-    if checkpoint_path is None:
-        checkpoint_path = os.path.join(
-            config['checkpoint_dir'], 'best_model.pth'
-        )
-    
-    # Resolve output directory
-    output_dir = config['paths']['evaluation_output']
-    if output_dir is None:
-        output_dir = os.path.join(
-            config['output_dir'], 'clam', 'evaluation_results'
-        )
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Determine device (GPU if available, else CPU)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
-    
-    # Load model checkpoint
-    print(f'Loading checkpoint from {checkpoint_path}...')
-    checkpoint = torch.load(
-        checkpoint_path, map_location=device, weights_only=False
-    )
-    
-    # Require new-format checkpoints that contain full model config.
-    if 'config' not in checkpoint:
-        raise KeyError(
-            "Checkpoint is missing 'config'. "
-            "Only new-format checkpoints are supported."
-        )
-    model_config = checkpoint['config']
-    input_dim = model_config.get('input_dim', config['input_dim'])
-    hidden_dim = model_config.get('hidden_dim', config['hidden_dim'])
-    num_classes = model_config.get('num_classes', config['num_classes'])
-    k_clusters = model_config.get('k_clusters', config['k_clusters'])
-    architecture_source = model_config
-    class_folders = checkpoint.get('class_folders', None)
-    
-    # Auto-detect class folders if not in checkpoint
-    if class_folders is None:
-        class_folders = sorted([
-            d for d in os.listdir(config['data_root'])
-            if os.path.isdir(os.path.join(config['data_root'], d))
-        ])
-    
-    print(f'Classes: {class_folders}')
-    print(
-        f"Using feature model '{config['feature_model']}' "
-        f"with suffix '{feature_file_suffix}'"
-    )
-    
-    # Create model with extracted configuration
-    print('Creating model...')
-    model_kwargs: Dict[str, Any] = {
-        'input_dim': input_dim,
-        'hidden_dim': hidden_dim,
-        'num_classes': num_classes,
-        'k_clusters': k_clusters
-    }
-    for key in [
-        'attention_hidden_dim',
-        'attention_dim',
-        'cluster_head_hidden_dim'
-    ]:
-        value = architecture_source.get(key)
-        if value is None:
-            value = config.get(key)
-        if value is not None:
-            model_kwargs[key] = value
-
-    dropout_keys = [
-        'feature_projection_dropout',
-        'attention_branch_feature_dropout',
-        'clustering_branch_feature_dropout',
-        'final_classifier_dropout'
-    ]
-    for key in dropout_keys:
-        value = architecture_source.get(key)
-        if value is None:
-            value = config.get(key)
-        if value is not None:
-            model_kwargs[key] = value
-    model = CLAM_MB(**model_kwargs).to(device)
-    
-    # Load model weights from checkpoint
-    model.load_state_dict(checkpoint['model_state_dict'])
-    print('Model loaded successfully')
-    
-    # Run both levels on both splits.
-    for split in ['train', 'val']:
-        for level in ['tissue', 'slide']:
-            run_level_split_evaluation(
-                model=model,
-                config=config,
-                class_folders=class_folders,
-                feature_file_suffix=feature_file_suffix,
-                device=device,
-                output_dir=output_dir,
-                level=level,
-                split=split
-            )
+    evaluate_checkpoint()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

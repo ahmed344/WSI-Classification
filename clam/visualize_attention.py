@@ -1,569 +1,630 @@
-"""
-Attention visualization module for CLAM-MB model.
+"""Generate aligned tissue heatmaps from canonical CLAM attention branches."""
 
-This module provides functions to visualize attention weights from the CLAM-MB model
-as heatmaps overlaid on tissue slides. It generates multi-branch attention visualizations
-showing how the model attends to different regions of the tissue.
-"""
-import os
-from typing import List, Dict, Any, Optional
-import torch
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+
 import matplotlib.patches as patches
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from matplotlib.axes import Axes
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import json
-import openslide
 
-from clam_dataset import WSIFeatureDataset, collate_fn
-from clam_model import CLAM_MB
-from config_loader import load_config, resolve_feature_file_suffix
+try:
+    import openslide
+except ImportError:  # pragma: no cover - depends on system OpenSlide packages.
+    openslide = None
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - optional thumbnail fallback.
+    Image = None
+
+try:
+    from .clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
+    from .clam_model import CLAM_MB, CLAM_SB
+    from .config_loader import load_config
+except ImportError:
+    from clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
+    from clam_model import CLAM_MB, CLAM_SB
+    from config_loader import load_config
 
 
-def load_tile_coordinates(
-    data_root: str,
-    slide_name: str,
-    tissue_name: str,
-    class_folder: str
-) -> Optional[np.ndarray]:
-    """
-    Load tile coordinates for a tissue from a slide directory.
-    
-    Expected file location: data_root/class_folder/slide_name/tissue_name_tiles.csv
-    
+CLAMModel = Union[CLAM_SB, CLAM_MB]
+CHECKPOINT_SCHEMA = "canonical_clam_v1"
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line overrides.
+
     Args:
-        data_root (str): Root directory containing class folders.
-        slide_name (str): Name of the slide directory.
-        tissue_name (str): Name of the tissue (used to construct filename).
-        class_folder (str): Name of the class folder (category).
-    
+        None: Arguments are read from the command line.
+
     Returns:
-        Optional[np.ndarray]: Array of shape [n_tiles, 2] containing (x, y) coordinates
-            for each tile. Returns None if file not found or cannot be read.
+        argparse.Namespace: Parsed configuration and visualization overrides.
     """
-    slide_path = os.path.join(data_root, class_folder, slide_name)
-    if not os.path.isdir(slide_path):
-        return None
-    
-    # Load tile coordinates from CSV file
-    tiles_path = os.path.join(slide_path, f"{tissue_name}_tiles.csv")
-    if os.path.exists(tiles_path):
-        try:
-            tiles_df = pd.read_csv(tiles_path)
-            return tiles_df[['x', 'y']].values
-        except Exception as e:
-            print(f"Warning: Could not load tile coordinates from {tiles_path}: {e}")
-            return None
-    
-    return None
+    parser = argparse.ArgumentParser(
+        description="Generate canonical CLAM attention heatmaps."
+    )
+    parser.add_argument("--config", type=str, default=None)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--split", choices=("train", "val", "test"), default=None)
+    parser.add_argument("--max-slides", type=int, default=None)
+    return parser.parse_args()
 
 
-def load_slide_thumbnail(
-    data_root: str,
-    slide_name: str,
-    tissue_name: str,
-    class_folder: str,
-    thumbnail_size: int = 512
-) -> Optional[np.ndarray]:
-    """
-    Load thumbnail image of a tissue slide.
-    
-    Expected file location: data_root/class_folder/slide_name/tissue_name.ome.tiff
-    
+def create_model(config: Mapping[str, Any]) -> CLAMModel:
+    """Build the canonical CLAM architecture recorded in a checkpoint.
+
     Args:
-        data_root (str): Root directory containing class folders.
-        slide_name (str): Name of the slide directory.
-        tissue_name (str): Name of the tissue (used to construct filename).
-        class_folder (str): Name of the class folder (category).
-        thumbnail_size (int): Size of the thumbnail to generate (width and height).
-            Defaults to 512.
-    
+        config (Mapping[str, Any]): Exact checkpoint configuration.
+
     Returns:
-        Optional[np.ndarray]: Thumbnail image as numpy array of shape
-            [thumbnail_size, thumbnail_size, 3] (RGB). Returns None if file not found
-            or cannot be loaded.
+        CLAMModel: Configured CLAM-SB or CLAM-MB model.
     """
-    slide_path = os.path.join(data_root, class_folder, slide_name)
-    if not os.path.isdir(slide_path):
-        return None
-    
-    # Load thumbnail from tissue slide file
-    tissue_slide_path = os.path.join(slide_path, f"{tissue_name}.ome.tiff")
-    if os.path.exists(tissue_slide_path):
-        try:
-            slide = openslide.OpenSlide(tissue_slide_path)
-            thumbnail = slide.get_thumbnail(size=(thumbnail_size, thumbnail_size))
-            slide.close()
-            return np.array(thumbnail)
-        except Exception as e:
-            print(f"Warning: Could not load tissue thumbnail from {tissue_slide_path}: {e}")
-            return None
-    
-    return None
+    model_type = str(config["model_type"])
+    model_class = CLAM_SB if model_type == "clam_sb" else CLAM_MB
+    if model_type not in {"clam_sb", "clam_mb"}:
+        raise ValueError(f"Unsupported checkpoint model_type '{model_type}'.")
+    return model_class(
+        input_dim=int(config["input_dim"]),
+        hidden_dim=int(config["hidden_dim"]),
+        attention_dim=int(config["attention_dim"]),
+        num_classes=int(config["num_classes"]),
+        gated=bool(config["gated_attention"]),
+        dropout=float(config["dropout"]),
+        k_sample=int(config["k_sample"]),
+        subtyping=bool(config["subtyping"]),
+    )
 
 
-def visualize_attention_branches(
-    attention_weights_list: List[np.ndarray],
-    avg_attention: np.ndarray,
-    tile_coords: np.ndarray,
-    slide_name: str,
-    tissue_name: str,
+def load_checkpoint_model(
+    checkpoint_path: str,
+    device: torch.device,
+) -> Tuple[CLAMModel, Dict[str, Any], List[str], str]:
+    """Load a canonical model and its complete data contract.
+
+    Args:
+        checkpoint_path (str): Path to a canonical CLAM checkpoint.
+        device (torch.device): Device on which to materialize model parameters.
+
+    Returns:
+        Tuple[CLAMModel, Dict[str, Any], List[str], str]: Loaded model, exact
+            checkpoint config, ordered classes, and checkpoint bag level.
+    """
+    loaded = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if not isinstance(loaded, Mapping):
+        raise TypeError("Checkpoint must contain a mapping.")
+    required = {
+        "model_state_dict",
+        "config",
+        "class_folders",
+        "model_schema",
+        "bag_level",
+    }
+    missing = required.difference(loaded)
+    if missing:
+        raise KeyError(
+            "Checkpoint is not a complete canonical CLAM checkpoint; missing: "
+            + ", ".join(sorted(missing))
+        )
+    if loaded["model_schema"] != CHECKPOINT_SCHEMA:
+        raise ValueError(
+            f"Unsupported model schema '{loaded['model_schema']}'; "
+            f"expected '{CHECKPOINT_SCHEMA}'."
+        )
+    if not isinstance(loaded["config"], Mapping):
+        raise TypeError("Checkpoint 'config' must be a mapping.")
+    checkpoint_config = dict(loaded["config"])
+    class_folders = [str(name) for name in loaded["class_folders"]]
+    if len(class_folders) != int(checkpoint_config["num_classes"]):
+        raise ValueError(
+            "Checkpoint class order length does not match config num_classes."
+        )
+    bag_level = str(loaded["bag_level"])
+    if bag_level not in {"tissue", "slide"}:
+        raise ValueError(f"Invalid checkpoint bag_level '{bag_level}'.")
+    if str(checkpoint_config.get("bag_level")) != bag_level:
+        raise ValueError("Checkpoint bag_level disagrees with checkpoint config.")
+
+    model = create_model(checkpoint_config).to(device)
+    model.load_state_dict(loaded["model_state_dict"])
+    model.eval()
+    return model, checkpoint_config, class_folders, bag_level
+
+
+def create_visualization_dataset(
+    config: Mapping[str, Any],
+    split: str,
+    class_folders: Sequence[str],
+    bag_level: str,
+    max_bags: Optional[int],
+) -> WSIBagDataset:
+    """Create the checkpoint-defined bag dataset for visualization.
+
+    Args:
+        config (Mapping[str, Any]): Exact checkpoint configuration.
+        split (str): Visualization split: train, validation, or test.
+        class_folders (Sequence[str]): Ordered checkpoint class names.
+        bag_level (str): Checkpoint bag level, either tissue or slide.
+        max_bags (Optional[int]): Maximum bags to retain at ``bag_level``.
+
+    Returns:
+        WSIBagDataset: Dataset preserving aligned coordinates and provenance.
+    """
+    dataset = create_bag_dataset(
+        config,
+        split,
+        class_folders=class_folders,
+        bag_level=bag_level,
+    )
+    if max_bags is not None:
+        if max_bags <= 0:
+            raise ValueError("visualization.max_slides must be positive or null.")
+        dataset.indices = dataset.indices[:max_bags]
+    return dataset
+
+
+def find_tissue_image(
+    data_root: str,
     class_name: str,
-    predicted_class: str,
-    class_folders: List[str],
-    output_path: str,
-    data_root: str,
-    class_folder: str,
-    tile_size: int = 448,
-    thumbnail_size: int = 512
-) -> None:
-    """
-    Visualize attention weights from all branches as heatmaps.
-    
-    Creates a multi-panel figure showing:
-    1. Original tissue thumbnail
-    2. Average attention across all branches
-    3. Individual attention for each branch (one per class)
-    
+    slide_name: str,
+    tissue_name: str,
+) -> Optional[Path]:
+    """Locate a tissue image without assuming one TIFF suffix.
+
     Args:
-        attention_weights_list (List[np.ndarray]): List of attention weight arrays,
-            one per branch. Each array has shape [n_tiles].
-        avg_attention (np.ndarray): Average attention weights across all branches.
-            Shape [n_tiles].
-        tile_coords (np.ndarray): Tile coordinates array of shape [n_tiles, 2]
-            containing (x, y) coordinates for each tile.
-        slide_name (str): Name of the slide directory.
-        tissue_name (str): Name of the tissue.
-        class_name (str): True class label for this tissue.
-        predicted_class (str): Predicted class label from the model.
-        class_folders (List[str]): List of all class names (for branch labels).
-        output_path (str): Full path where the figure should be saved.
-        data_root (str): Root directory containing slide files.
-        class_folder (str): Class folder name for this slide (used to load thumbnail).
-        tile_size (int): Size of each tile in pixels. Defaults to 448.
-        thumbnail_size (int): Size of thumbnail to generate. Defaults to 512.
+        data_root (str): Root directory containing class and slide folders.
+        class_name (str): Ground-truth class folder.
+        slide_name (str): Slide directory name.
+        tissue_name (str): Tissue basename used by features and coordinates.
+
+    Returns:
+        Optional[Path]: Best matching tissue image, or ``None`` if unavailable.
     """
-    if tile_coords is None or len(tile_coords) == 0:
-        print(f"Warning: No tile coordinates found for {slide_name}/{tissue_name}")
-        return
-    
-    # Load thumbnail image
-    thumbnail = load_slide_thumbnail(
-        data_root, slide_name, tissue_name, class_folder, thumbnail_size
-    )
-    
-    # Calculate number of subplots: thumbnail + average + one per branch
-    n_branches = len(attention_weights_list)
-    n_subplots = 1 + 1 + n_branches  # thumbnail + average + branches
-    
-    # Create figure with horizontal layout
-    fig, axes = plt.subplots(1, n_subplots, figsize=(4 * n_subplots, 4))
-    
-    # Calculate coordinate ranges for consistent axis limits across all plots
-    x_min, x_max = tile_coords[:, 0].min(), tile_coords[:, 0].max()
-    y_min, y_max = tile_coords[:, 1].min(), tile_coords[:, 1].max()
-    # Add padding equal to half tile size for better visualization
-    x_min -= tile_size // 2
-    x_max += tile_size // 2
-    y_min -= tile_size // 2
-    y_max += tile_size // 2
-    
-    subplot_idx = 0
-    
-    # Plot thumbnail (first subplot)
-    if thumbnail is not None:
-        axes[subplot_idx].imshow(thumbnail)
-        axes[subplot_idx].set_title('Original', fontsize=10)
-        axes[subplot_idx].axis('off')
-    else:
-        # Show placeholder if thumbnail unavailable
-        axes[subplot_idx].text(
-            0.5, 0.5, 'Thumbnail\nNot Available',
-            ha='center', va='center', fontsize=10
-        )
-        axes[subplot_idx].axis('off')
-    subplot_idx += 1
-    
-    # Plot average attention (second subplot)
-    # Normalize attention weights to [0, 1] for color mapping
-    avg_norm = (avg_attention - avg_attention.min()) / (
-        avg_attention.max() - avg_attention.min() + 1e-8
-    )
-    
-    # Draw colored rectangles for each tile based on attention weight
-    for j, (x, y) in enumerate(tile_coords):
-        rect = patches.Rectangle(
-            (x - tile_size // 2, y - tile_size // 2),
-            tile_size, tile_size,
-            linewidth=0, edgecolor='none',
-            facecolor=plt.cm.jet(avg_norm[j])  # Use jet colormap
-        )
-        axes[subplot_idx].add_patch(rect)
-    
-    # Set axis limits and properties
-    axes[subplot_idx].set_xlim(x_min, x_max)
-    axes[subplot_idx].set_ylim(y_max, y_min)  # Invert y-axis (image coordinates)
-    axes[subplot_idx].set_aspect('equal', adjustable='box')
-    axes[subplot_idx].axis('off')
-    axes[subplot_idx].set_title('Average', fontsize=10)
-    
-    # Add colorbar for average attention
-    sm_avg = plt.cm.ScalarMappable(
-        cmap=plt.cm.jet,
-        norm=plt.Normalize(vmin=avg_attention.min(), vmax=avg_attention.max())
-    )
-    sm_avg.set_array([])
-    cbar_avg = plt.colorbar(
-        sm_avg, ax=axes[subplot_idx], orientation='vertical', pad=0.05
-    )
-    cbar_avg.ax.xaxis.set_label_position('top')
-    subplot_idx += 1
-    
-    # Plot each branch's attention (one subplot per class)
-    for i, (attn_weights, class_name_branch) in enumerate(
-        zip(attention_weights_list, class_folders)
-    ):
-        ax = axes[subplot_idx]
-        
-        # Normalize this branch's attention weights
-        attn_norm = (attn_weights - attn_weights.min()) / (
-            attn_weights.max() - attn_weights.min() + 1e-8
-        )
-        
-        # Draw colored rectangles for each tile
-        for j, (x, y) in enumerate(tile_coords):
-            rect = patches.Rectangle(
-                (x - tile_size // 2, y - tile_size // 2),
-                tile_size, tile_size,
-                linewidth=0, edgecolor='none',
-                facecolor=plt.cm.jet(attn_norm[j])
+    slide_dir = Path(data_root) / class_name / slide_name
+    if not slide_dir.is_dir():
+        return None
+    suffixes = (".ome.tiff", ".ome.tif", ".tiff", ".tif", ".svs", ".png", ".jpg")
+    exact_candidates = [slide_dir / f"{tissue_name}{suffix}" for suffix in suffixes]
+    for candidate in exact_candidates:
+        if candidate.is_file():
+            return candidate
+    tissue_lower = tissue_name.lower()
+    candidates = [
+        path
+        for path in slide_dir.iterdir()
+        if path.is_file()
+        and path.name.lower().startswith(tissue_lower)
+        and any(path.name.lower().endswith(suffix) for suffix in suffixes)
+    ]
+    return sorted(candidates, key=lambda path: (len(path.name), path.name))[0] if candidates else None
+
+
+def load_tissue_thumbnail(
+    image_path: Optional[Path],
+    thumbnail_size: int,
+) -> Optional[np.ndarray]:
+    """Load a tissue thumbnail with OpenSlide and Pillow fallbacks.
+
+    Args:
+        image_path (Optional[Path]): Located tissue image path.
+        thumbnail_size (int): Maximum thumbnail width and height.
+
+    Returns:
+        Optional[np.ndarray]: RGB thumbnail array, or ``None`` on failure.
+    """
+    if image_path is None:
+        return None
+    if openslide is not None:
+        try:
+            with openslide.OpenSlide(str(image_path)) as slide:
+                return np.asarray(
+                    slide.get_thumbnail((thumbnail_size, thumbnail_size)).convert("RGB")
+                )
+        except Exception:
+            pass
+    if Image is not None:
+        try:
+            with Image.open(image_path) as image:
+                image.thumbnail((thumbnail_size, thumbnail_size))
+                return np.asarray(image.convert("RGB"))
+        except Exception as error:
+            tqdm.write(f"Warning: Could not load thumbnail '{image_path}': {error}")
+    return None
+
+
+def normalize_attention(attention: np.ndarray) -> np.ndarray:
+    """Normalize one attention branch for color mapping.
+
+    Args:
+        attention (np.ndarray): One-dimensional attention weights.
+
+    Returns:
+        np.ndarray: Attention rescaled to the closed interval ``[0, 1]``.
+    """
+    minimum = float(attention.min())
+    maximum = float(attention.max())
+    return (attention - minimum) / (maximum - minimum + 1e-12)
+
+
+def draw_attention(
+    axis: Axes,
+    coordinates: np.ndarray,
+    attention: np.ndarray,
+    tile_size: int,
+) -> None:
+    """Draw aligned attention rectangles on one spatial axis.
+
+    Args:
+        axis (Axes): Matplotlib axis receiving tile rectangles.
+        coordinates (np.ndarray): Coordinates shaped ``[N, 2]``.
+        attention (np.ndarray): Branch attention shaped ``[N]``.
+        tile_size (int): Tile width and height in source-image pixels.
+
+    Returns:
+        None: Rectangles and spatial limits are applied in place.
+    """
+    if coordinates.shape != (attention.shape[0], 2):
+        raise ValueError("Attention and coordinates are not exactly aligned.")
+    normalized = normalize_attention(attention)
+    half_tile = tile_size / 2.0
+    for (x_coord, y_coord), weight in zip(coordinates, normalized):
+        axis.add_patch(
+            patches.Rectangle(
+                (float(x_coord) - half_tile, float(y_coord) - half_tile),
+                tile_size,
+                tile_size,
+                linewidth=0,
+                facecolor=plt.cm.jet(float(weight)),
             )
-            ax.add_patch(rect)
-        
-        # Set axis limits and properties
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_max, y_min)  # Invert y-axis
-        ax.set_aspect('equal', adjustable='box')
-        ax.axis('off')
-        ax.set_title(class_name_branch, fontsize=10)
-        
-        # Add colorbar for this branch
-        sm = plt.cm.ScalarMappable(
-            cmap=plt.cm.jet,
-            norm=plt.Normalize(vmin=attn_weights.min(), vmax=attn_weights.max())
         )
-        sm.set_array([])
-        cbar = plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.05)
-        
-        subplot_idx += 1
-    
-    # Set figure title with slide/tissue info and predictions
-    fig.suptitle(
-        f'Slide: {slide_name} | Tissue: {tissue_name}\n'
-        f'True: {class_name} | Predicted: {predicted_class}',
-        fontsize=12, fontweight='bold'
+    axis.set_xlim(float(coordinates[:, 0].min()) - half_tile, float(coordinates[:, 0].max()) + half_tile)
+    axis.set_ylim(float(coordinates[:, 1].max()) + half_tile, float(coordinates[:, 1].min()) - half_tile)
+    axis.set_aspect("equal", adjustable="box")
+    axis.axis("off")
+
+
+def save_attention_figure(
+    branch_attention: np.ndarray,
+    coordinates: np.ndarray,
+    branch_names: Sequence[str],
+    predicted_index: int,
+    slide_name: str,
+    tissue_name: str,
+    true_class: str,
+    predicted_class: str,
+    predicted_probability: float,
+    image_path: Optional[Path],
+    output_path: Path,
+    tile_size: int,
+    thumbnail_size: int,
+) -> None:
+    """Save original tissue and canonical attention branch panels.
+
+    Args:
+        branch_attention (np.ndarray): Attention shaped ``[K, N]``.
+        coordinates (np.ndarray): Aligned coordinates shaped ``[N, 2]``.
+        branch_names (Sequence[str]): Display name for each attention branch.
+        predicted_index (int): Predicted class index; ignored for shared SB attention.
+        slide_name (str): Slide directory name.
+        tissue_name (str): Tissue basename.
+        true_class (str): Ground-truth class name.
+        predicted_class (str): Predicted class name.
+        predicted_probability (float): Probability of the predicted class.
+        image_path (Optional[Path]): Optional tissue image for the original panel.
+        output_path (Path): Destination PNG path.
+        tile_size (int): Tile size in source-image pixels.
+        thumbnail_size (int): Maximum thumbnail width and height.
+
+    Returns:
+        None: Figure is written to ``output_path``.
+    """
+    if branch_attention.ndim != 2 or branch_attention.shape[1] == 0:
+        raise ValueError("branch_attention must have nonempty shape [K, N].")
+    if len(branch_names) != branch_attention.shape[0]:
+        raise ValueError("Branch labels do not match the attention branch count.")
+    if coordinates.shape != (branch_attention.shape[1], 2):
+        raise ValueError("Coordinates do not exactly match attention tile order.")
+
+    panel_count = 1 + branch_attention.shape[0]
+    figure, axes = plt.subplots(1, panel_count, figsize=(4 * panel_count, 4))
+    axes_array = np.atleast_1d(axes)
+    thumbnail = load_tissue_thumbnail(image_path, thumbnail_size)
+    if thumbnail is None:
+        axes_array[0].text(
+            0.5, 0.5, "Thumbnail\nNot Available", ha="center", va="center"
+        )
+    else:
+        axes_array[0].imshow(thumbnail)
+    axes_array[0].set_title("Original")
+    axes_array[0].axis("off")
+
+    is_multi_branch = branch_attention.shape[0] > 1
+    for branch_index, branch_name in enumerate(branch_names):
+        axis = axes_array[branch_index + 1]
+        attention = branch_attention[branch_index]
+        draw_attention(axis, coordinates, attention, tile_size)
+        is_predicted = is_multi_branch and branch_index == predicted_index
+        title = f"★ Predicted: {branch_name}" if is_predicted else branch_name
+        axis.set_title(
+            title,
+            fontweight="bold" if is_predicted else "normal",
+            bbox=(
+                {"facecolor": "gold", "alpha": 0.35, "edgecolor": "darkorange"}
+                if is_predicted
+                else None
+            ),
+        )
+        minimum = float(attention.min())
+        maximum = float(attention.max())
+        scalar_mappable = plt.cm.ScalarMappable(
+            cmap=plt.cm.jet,
+            norm=plt.Normalize(
+                vmin=minimum,
+                vmax=maximum if maximum > minimum else minimum + 1e-12,
+            ),
+        )
+        scalar_mappable.set_array([])
+        figure.colorbar(scalar_mappable, ax=axis, orientation="vertical", pad=0.04)
+
+    figure.suptitle(
+        f"Slide: {slide_name} | Tissue: {tissue_name}\n"
+        f"True: {true_class} | Predicted: {predicted_class} "
+        f"({predicted_probability:.3f})",
+        fontsize=12,
+        fontweight="bold",
     )
-    
-    # Save figure
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(figure)
     tqdm.write(f"Saved attention heatmap to {output_path}")
 
 
+def safe_filename(value: str) -> str:
+    """Convert metadata to a safe filename component.
+
+    Args:
+        value (str): Raw slide or tissue identifier.
+
+    Returns:
+        str: Identifier containing only conservative filename characters.
+    """
+    return "".join(
+        character if character.isalnum() or character in "-_." else "_"
+        for character in value
+    )
+
+
+def validate_aligned_bag(
+    attention: torch.Tensor,
+    coordinates: torch.Tensor,
+    tissue_indices: torch.Tensor,
+    tissue_names: Sequence[str],
+) -> None:
+    """Validate exact post-collation alignment for one unpadded bag.
+
+    Args:
+        attention (torch.Tensor): Attention weights shaped ``[K, N]``.
+        coordinates (torch.Tensor): Coordinates shaped ``[N, 2]``.
+        tissue_indices (torch.Tensor): Tissue provenance shaped ``[N]``.
+        tissue_names (Sequence[str]): Tissue names indexed by provenance values.
+
+    Returns:
+        None: Validation succeeds by returning normally.
+    """
+    tile_count = attention.shape[1]
+    if attention.ndim != 2:
+        raise ValueError("Canonical attention must have shape [K, N].")
+    if coordinates.shape != (tile_count, 2):
+        raise ValueError("Collated coordinates are not aligned with attention.")
+    if tissue_indices.shape != (tile_count,):
+        raise ValueError("Collated tissue indices are not aligned with attention.")
+    if not torch.isfinite(attention).all() or not torch.isfinite(coordinates).all():
+        raise ValueError("Valid attention and coordinates must be finite.")
+    if tile_count == 0:
+        raise ValueError("Cannot visualize an empty bag.")
+    if bool(((tissue_indices < 0) | (tissue_indices >= len(tissue_names))).any()):
+        raise ValueError("A valid tile has an invalid tissue provenance index.")
+
+
 def evaluate_with_attention(
-    model: CLAM_MB,
+    model: CLAMModel,
     dataloader: DataLoader,
     device: torch.device,
-    class_names: List[str],
+    class_names: Sequence[str],
     data_root: str,
     output_dir: str,
-    tile_size: int = 448
+    bag_level: str,
+    tile_size: int = 448,
+    thumbnail_size: int = 512,
 ) -> List[Dict[str, Any]]:
-    """
-    Evaluate model and extract attention weights for visualization.
-    
-    Processes batches from the dataloader, extracts attention weights from the model,
-    and generates attention heatmaps for each tissue sample.
-    
+    """Render exactly aligned canonical attention for each bag and tissue.
+
     Args:
-        model (CLAM_MB): Trained CLAM-MB model in evaluation mode.
-        dataloader (DataLoader): DataLoader providing batches of tissue samples.
-        device (torch.device): Device to run inference on (CPU or CUDA).
-        class_names (List[str]): List of class names for labeling.
-        data_root (str): Root directory containing slide files.
-        output_dir (str): Directory where attention heatmaps should be saved.
-        tile_size (int): Size of each tile in pixels. Defaults to 448.
-    
+        model (CLAMModel): Loaded canonical CLAM-SB or CLAM-MB model.
+        dataloader (DataLoader): Loader returning the unified collated bag contract.
+        device (torch.device): Inference device.
+        class_names (Sequence[str]): Ordered checkpoint class names.
+        data_root (str): Root containing class and slide directories.
+        output_dir (str): Directory receiving figures.
+        bag_level (str): Checkpoint bag level, tissue or slide.
+        tile_size (int): Tile size in source-image pixels.
+        thumbnail_size (int): Maximum thumbnail width and height.
+
     Returns:
-        List[Dict[str, Any]]: List of dictionaries, one per sample, containing:
-            - 'slide_name' (str): Name of the slide.
-            - 'tissue_name' (str): Name of the tissue.
-            - 'true_class' (str): True class label.
-            - 'predicted_class' (str): Predicted class label.
-            - 'max_attention' (float): Maximum attention weight value.
-            - 'mean_attention' (float): Mean attention weight value.
-            - 'attention_entropy' (float): Entropy of attention distribution.
+        List[Dict[str, Any]]: One summary record per rendered tissue.
     """
+    results: List[Dict[str, Any]] = []
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
     model.eval()
-    all_results: List[Dict[str, Any]] = []
-    
     with torch.no_grad():
-        pbar = tqdm(dataloader, desc='Extracting attention')
-        for batch in pbar:
-            # Move batch to device
-            features = batch['features'].to(device)
-            labels = batch['labels'].to(device)
-            masks = batch['masks'].to(device)
-            slide_names = batch['slide_names']
-            tissue_names = batch.get('tissue_names', [None] * len(slide_names))
-            
-            # Forward pass through model
-            outputs = model(features, masks)
-            logits = outputs['logits']
-            attention_weights_list = outputs['attention_weights']
-            
-            # Get predictions from logits
-            probs = torch.softmax(logits, dim=1)
-            preds = torch.argmax(logits, dim=1).cpu().numpy()
-            
-            # Process each tissue sample in the batch
-            for i, slide_name in enumerate(slide_names):
-                tissue_name = tissue_names[i] if i < len(tissue_names) else None
-                
-                # Compute average attention across all branches
-                avg_attention = torch.stack([
-                    aw[i] for aw in attention_weights_list
-                ]).mean(dim=0).cpu().numpy()
-                
-                # Get individual branch attentions
-                branch_attentions = [
-                    aw[i].cpu().numpy() for aw in attention_weights_list
-                ]
-                
-                # Remove padding: only keep valid tiles
-                valid_mask = masks[i].cpu().numpy()
-                avg_attention = avg_attention[valid_mask]
-                branch_attentions = [
-                    attn[valid_mask] for attn in branch_attentions
-                ]
-                
-                # Get true and predicted class labels
-                true_label = int(labels[i].cpu().numpy())
-                pred_label = int(preds[i])
-                true_class = class_names[true_label]
-                pred_class = class_names[pred_label]
-                
-                # Find class folder and load tile coordinates
-                class_folder = None
-                tile_coords = None
-                for cf in class_names:
-                    if tissue_name:
-                        tile_coords = load_tile_coordinates(
-                            data_root, slide_name, tissue_name, cf
-                        )
-                        if tile_coords is not None:
-                            class_folder = cf
-                            break
-                
-                # Generate visualization if coordinates are available
-                if tile_coords is not None:
-                    # tile_coords are already tissue-level (unpadded), while valid_mask is
-                    # batch-padded length. Align by count to avoid shape mismatch.
-                    n_attn_tiles = avg_attention.shape[0]
-                    n_coord_tiles = tile_coords.shape[0]
-                    if n_attn_tiles != n_coord_tiles:
-                        n_common_tiles = min(n_attn_tiles, n_coord_tiles)
-                        tqdm.write(
-                            f"Warning: Tile count mismatch for "
-                            f"{slide_name}/{tissue_name}: "
-                            f"attention={n_attn_tiles}, coords={n_coord_tiles}. "
-                            f"Using first {n_common_tiles} tiles."
-                        )
-                        avg_attention = avg_attention[:n_common_tiles]
-                        branch_attentions = [
-                            attn[:n_common_tiles] for attn in branch_attentions
-                        ]
-                        tile_coords = tile_coords[:n_common_tiles]
-                    
-                    # Create safe filenames (replace problematic characters)
-                    slide_safe_name = slide_name.replace('/', '_').replace(' ', '_')
-                    tissue_safe_name = (
-                        tissue_name.replace('/', '_').replace(' ', '_')
-                        if tissue_name else 'unknown'
+        for batch in tqdm(dataloader, desc=f"Visualizing {bag_level} bags"):
+            features = batch["features"].to(device)
+            masks = batch["masks"].to(device)
+            outputs = model(features, mask=masks, instance_eval=False)
+            attention_weights = outputs["attention_weights"]
+            if not isinstance(attention_weights, torch.Tensor) or attention_weights.ndim != 3:
+                raise ValueError(
+                    "Canonical model attention_weights must be a tensor shaped [B, K, N]."
+                )
+            probabilities = outputs["probabilities"].detach().cpu()
+            predictions = outputs["predictions"].detach().cpu()
+            labels = batch["labels"].detach().cpu()
+
+            for bag_index, slide_name in enumerate(batch["slide_names"]):
+                valid_mask = batch["masks"][bag_index]
+                attention = attention_weights[bag_index, :, valid_mask.to(device)].detach().cpu()
+                coordinates = batch["coordinates"][bag_index, valid_mask].detach().cpu()
+                tissue_indices = batch["tissue_indices"][bag_index, valid_mask].detach().cpu()
+                tissue_names = [str(name) for name in batch["bag_tissue_names"][bag_index]]
+                validate_aligned_bag(
+                    attention, coordinates, tissue_indices, tissue_names
+                )
+
+                true_index = int(labels[bag_index].item())
+                predicted_index = int(predictions[bag_index].item())
+                true_class = class_names[true_index]
+                predicted_class = class_names[predicted_index]
+                predicted_probability = float(
+                    probabilities[bag_index, predicted_index].item()
+                )
+                branch_names = (
+                    list(class_names)
+                    if isinstance(model, CLAM_MB)
+                    else ["Shared attention"]
+                )
+                expected_branches = len(branch_names)
+                if attention.shape[0] != expected_branches:
+                    raise ValueError(
+                        f"Expected {expected_branches} attention branches, "
+                        f"received {attention.shape[0]}."
                     )
-                    
-                    # Generate output path and create visualization
-                    multi_path = os.path.join(
-                        output_dir,
-                        f'{slide_safe_name}_{tissue_safe_name}_attention_branches.png'
+
+                for tissue_index, tissue_name in enumerate(tissue_names):
+                    tissue_mask = tissue_indices == tissue_index
+                    if not bool(tissue_mask.any()):
+                        continue
+                    tissue_attention = attention[:, tissue_mask].numpy()
+                    tissue_coordinates = coordinates[tissue_mask].numpy()
+                    if tissue_attention.shape[1] != tissue_coordinates.shape[0]:
+                        raise RuntimeError("Internal tissue alignment invariant failed.")
+                    image_path = find_tissue_image(
+                        data_root, true_class, str(slide_name), tissue_name
                     )
-                    visualize_attention_branches(
-                        branch_attentions, avg_attention, tile_coords,
-                        slide_name, tissue_name, true_class, pred_class,
-                        class_names, multi_path, data_root, class_folder,
-                        tile_size=tile_size
+                    output_path = output_root / (
+                        f"{safe_filename(str(slide_name))}_"
+                        f"{safe_filename(tissue_name)}_attention.png"
                     )
-                
-                # Store results for summary
-                all_results.append({
-                    'slide_name': slide_name,
-                    'tissue_name': tissue_name,
-                    'true_class': true_class,
-                    'predicted_class': pred_class,
-                    'max_attention': float(avg_attention.max()),
-                    'mean_attention': float(avg_attention.mean()),
-                    'attention_entropy': float(
-                        -np.sum(avg_attention * np.log(avg_attention + 1e-8))
+                    save_attention_figure(
+                        branch_attention=tissue_attention,
+                        coordinates=tissue_coordinates,
+                        branch_names=branch_names,
+                        predicted_index=predicted_index,
+                        slide_name=str(slide_name),
+                        tissue_name=tissue_name,
+                        true_class=true_class,
+                        predicted_class=predicted_class,
+                        predicted_probability=predicted_probability,
+                        image_path=image_path,
+                        output_path=output_path,
+                        tile_size=tile_size,
+                        thumbnail_size=thumbnail_size,
                     )
-                })
-    
-    return all_results
+                    primary_index = predicted_index if isinstance(model, CLAM_MB) else 0
+                    primary_attention = tissue_attention[primary_index]
+                    results.append(
+                        {
+                            "bag_level": bag_level,
+                            "slide_name": str(slide_name),
+                            "tissue_name": tissue_name,
+                            "true_class": true_class,
+                            "predicted_class": predicted_class,
+                            "predicted_probability": predicted_probability,
+                            "primary_attention_branch": branch_names[primary_index],
+                            "num_tiles": int(primary_attention.size),
+                            "attention_mass": float(primary_attention.sum()),
+                            "max_attention": float(primary_attention.max()),
+                            "mean_attention": float(primary_attention.mean()),
+                            "heatmap_path": str(output_path),
+                        }
+                    )
+    return results
 
 
 def main() -> None:
+    """Run checkpoint-driven canonical CLAM attention visualization.
+
+    Args:
+        None: Configuration and overrides are read from the command line.
+
+    Returns:
+        None: Heatmaps and a JSON summary are written to disk.
     """
-    Main function to generate attention visualizations.
-    
-    Loads model checkpoint, creates dataset, and generates attention heatmaps
-    for all samples in the specified split (train or val).
-    """
-    # Load configuration from config.yml
-    config = load_config()
-    feature_file_suffix = resolve_feature_file_suffix(config)
-    
-    # Resolve checkpoint path
-    checkpoint_path = config['paths']['checkpoint']
-    if checkpoint_path is None:
-        checkpoint_path = os.path.join(
-            config['checkpoint_dir'], 'best_model.pth'
-        )
-    
-    # Resolve output directory
-    output_dir = config['paths']['attention_output']
-    if output_dir is None:
-        output_dir = os.path.join(
-            config['output_dir'], 'clam', 'attention_heatmaps'
-        )
-    
-    # Get visualization parameters from config
-    vis_config = config.get('visualization', {})
-    split = vis_config.get('split', 'val')
-    max_slides = vis_config.get('max_slides', None)
-    tile_size = vis_config.get('tile_size', 448)
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Determine device (GPU if available, else CPU)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
-    
-    # Load model checkpoint
-    print(f'Loading checkpoint from {checkpoint_path}...')
-    checkpoint = torch.load(
-        checkpoint_path, map_location=device, weights_only=False
+    args = parse_args()
+    launcher_config = load_config(args.config)
+    checkpoint_path = args.checkpoint or launcher_config["paths"]["checkpoint"]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, checkpoint_config, class_folders, bag_level = load_checkpoint_model(
+        str(checkpoint_path), device
     )
-    
-    # Require new-format checkpoints that contain full model config.
-    if 'config' not in checkpoint:
-        raise KeyError(
-            "Checkpoint is missing 'config'. "
-            "Only new-format checkpoints are supported."
-        )
-    model_config = checkpoint['config']
-    input_dim = model_config.get('input_dim', config['input_dim'])
-    hidden_dim = model_config.get('hidden_dim', config['hidden_dim'])
-    num_classes = model_config.get('num_classes', config['num_classes'])
-    k_clusters = model_config.get('k_clusters', config['k_clusters'])
-    architecture_source = model_config
-    class_folders = checkpoint.get('class_folders', None)
-    
-    # Auto-detect class folders if not in checkpoint
-    if class_folders is None:
-        class_folders = sorted([
-            d for d in os.listdir(config['data_root'])
-            if os.path.isdir(os.path.join(config['data_root'], d))
-        ])
-    
-    print(f'Classes: {class_folders}')
-    print(
-        f"Using feature model '{config['feature_model']}' "
-        f"with suffix '{feature_file_suffix}'"
+    visualization = checkpoint_config.get("visualization", {}) or {}
+    if not isinstance(visualization, Mapping):
+        raise TypeError("Checkpoint visualization config must be a mapping.")
+    split = args.split or str(visualization.get("split", "val"))
+    max_bags_value = (
+        args.max_slides
+        if args.max_slides is not None
+        else visualization.get("max_slides")
     )
-    
-    # Create model with extracted configuration
-    print('Creating model...')
-    model_kwargs: Dict[str, Any] = {
-        'input_dim': input_dim,
-        'hidden_dim': hidden_dim,
-        'num_classes': num_classes,
-        'k_clusters': k_clusters
-    }
-    for key in [
-        'attention_hidden_dim',
-        'attention_dim',
-        'cluster_head_hidden_dim',
-        'feature_projection_dropout',
-        'attention_branch_feature_dropout',
-        'clustering_branch_feature_dropout',
-        'final_classifier_dropout'
-    ]:
-        value = architecture_source.get(key)
-        if value is None:
-            value = config.get(key)
-        if value is not None:
-            model_kwargs[key] = value
-    model = CLAM_MB(**model_kwargs).to(device)
-    
-    # Load model weights from checkpoint
-    model.load_state_dict(checkpoint['model_state_dict'])
-    print('Model loaded successfully')
-    
-    # Create dataset for specified split
-    print(f'Loading {split} dataset...')
-    dataset = WSIFeatureDataset(
-        config['data_root'],
-        class_folders=class_folders,
-        split=split,
-        train_ratio=config['train_ratio'],
-        random_seed=config['random_seed'],
-        feature_file_suffix=feature_file_suffix
+    max_bags = int(max_bags_value) if max_bags_value is not None else None
+    output_dir = (
+        args.output_dir
+        or checkpoint_config.get("paths", {}).get("attention_output")
+        or launcher_config["paths"]["attention_output"]
     )
-    
-    # Optionally limit number of samples for faster processing
-    if max_slides:
-        dataset.indices = dataset.indices[:max_slides]
-    
-    print(f'Number of samples: {len(dataset)}')
-    
-    # Create dataloader
+    dataset = create_visualization_dataset(
+        checkpoint_config,
+        split,
+        class_folders,
+        bag_level,
+        max_bags,
+    )
     dataloader = DataLoader(
         dataset,
-        batch_size=config['batch_size'],
+        batch_size=int(checkpoint_config.get("batch_size", 1)),
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=0
+        num_workers=int(checkpoint_config.get("num_workers", 0)),
     )
-    
-    # Extract attention weights and generate visualizations
-    print('Extracting attention weights and creating heatmaps...')
+    print(f"Using device: {device}")
+    print(f"Model: {checkpoint_config['model_type']} | bag level: {bag_level}")
+    print(f"Split: {split} | bags: {len(dataset)} | classes: {class_folders}")
     results = evaluate_with_attention(
-        model, dataloader, device, class_folders,
-        config['data_root'], output_dir, tile_size
+        model=model,
+        dataloader=dataloader,
+        device=device,
+        class_names=class_folders,
+        data_root=str(checkpoint_config["data_root"]),
+        output_dir=str(output_dir),
+        bag_level=bag_level,
+        tile_size=int(visualization.get("tile_size", 448)),
+        thumbnail_size=int(visualization.get("thumbnail_size", 512)),
     )
-    
-    # Save summary JSON file
-    summary_path = os.path.join(output_dir, f'attention_summary_{split}.json')
-    with open(summary_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f'\nAttention summary saved to {summary_path}')
-    
-    print(f'\nGenerated {len(results)} attention heatmaps')
-    print(f'Results saved to: {output_dir}')
+    summary_path = Path(output_dir) / f"attention_summary_{split}.json"
+    with summary_path.open("w", encoding="utf-8") as summary_file:
+        json.dump(results, summary_file, indent=2)
+    print(f"Rendered {len(results)} tissue heatmaps from {len(dataset)} bags.")
+    print(f"Attention summary saved to {summary_path}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

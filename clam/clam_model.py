@@ -1,385 +1,469 @@
-"""
-CLAM-MB (Multi-Branch) model implementation.
+"""Canonical batched CLAM single-branch and multi-branch models."""
 
-This module implements the CLAM-MB architecture for weakly supervised learning
-on whole slide images. The model uses multiple attention branches (one per class)
-and a clustering branch for unsupervised learning constraints.
-"""
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
+from torch import nn
+from torch.nn import functional as F
 
 
-class AttentionBranch(nn.Module):
-    """
-    Single attention branch for CLAM-MB.
-    
-    Uses attention pooling to aggregate patch features into a single representation
-    for classification. Each branch learns to attend to class-specific regions.
-    """
-    
+class _AttentionNetwork(nn.Module):
+    """Compute canonical gated or ungated CLAM attention scores."""
+
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int = 512,
-        attention_hidden_dim: int = 512,
-        attention_dim: int = 256,
-        feature_dropout: float = 0.25
+        attention_dim: int,
+        branches: int,
+        gated: bool,
+        dropout: float,
     ) -> None:
-        """
-        Initialize attention branch.
-        
+        """Initialize the attention network.
+
         Args:
-            input_dim (int): Dimension of input features (typically 1536 for H-Optimus).
-            hidden_dim (int): Dimension of hidden layers. Defaults to 512.
-            attention_hidden_dim (int): Intermediate attention MLP dimension.
-                Defaults to 512.
-            attention_dim (int): Attention projection dimension before scalar score.
-                Defaults to 256.
-            feature_dropout (float): Dropout probability used in branch feature
-                extractor.
-                Defaults to 0.25.
+            input_dim (int): Embedded tile feature dimension.
+            attention_dim (int): Hidden attention dimension.
+            branches (int): Number of attention branches.
+            gated (bool): Whether to use gated attention.
+            dropout (float): Dropout probability in attention projections.
 
         Returns:
-            None: This constructor initializes attention branch modules in-place.
+            None: The initialized module.
         """
-        super(AttentionBranch, self).__init__()
-        # Intermediate dimensions for attention computation
-        self.L = attention_hidden_dim
-        self.D = attention_dim
-        
-        # Feature extraction network
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(feature_dropout)
-        )
-        
-        # Attention network: computes attention weights for each tile
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_dim, self.L),
+        super().__init__()
+        self.gated = gated
+        self.attention_v = nn.Sequential(
+            nn.Linear(input_dim, attention_dim),
             nn.Tanh(),
-            nn.Linear(self.L, self.D),
-            nn.Tanh(),
-            nn.Linear(self.D, 1)  # Output single attention score per tile
+            nn.Dropout(dropout),
         )
-        
-        # Classification head: maps aggregated features to logit
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, 1)
-        )
-    
-    def forward(
-        self,
-        features: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass through attention branch.
-        
+        if gated:
+            self.attention_u: Optional[nn.Sequential] = nn.Sequential(
+                nn.Linear(input_dim, attention_dim),
+                nn.Sigmoid(),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.attention_u = None
+        self.attention_out = nn.Linear(attention_dim, branches)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """Compute unnormalized attention scores.
+
         Args:
-            features (torch.Tensor): Input features of shape [batch_size, n_tiles, input_dim].
-            mask (Optional[torch.Tensor]): Boolean mask of shape [batch_size, n_tiles].
-                True indicates valid tiles, False indicates padding. Defaults to None.
-        
+            features (torch.Tensor): Embedded features shaped ``[B, N, H]``.
+
         Returns:
-            tuple[torch.Tensor, torch.Tensor]: Tuple containing:
-                - logits (torch.Tensor): Classification logits of shape [batch_size, 1].
-                - attention_weights (torch.Tensor): Attention weights of shape [batch_size, n_tiles].
+            torch.Tensor: Raw scores shaped ``[B, branches, N]``.
         """
-        # Extract features through feature extractor
-        H = self.feature_extractor(features)  # [batch_size, n_tiles, hidden_dim]
-        
-        # Compute attention scores for each tile
-        A = self.attention(H)  # [batch_size, n_tiles, 1]
-        A = A.squeeze(-1)  # [batch_size, n_tiles]
-        
-        # Apply mask to ignore padding tiles
-        if mask is not None:
-            A = A.masked_fill(~mask, float('-inf'))
-        
-        # Normalize attention weights with softmax
-        A = F.softmax(A, dim=1)  # [batch_size, n_tiles]
-        
-        # Attention pooling: weighted sum of features
-        M = torch.bmm(A.unsqueeze(1), H).squeeze(1)  # [batch_size, hidden_dim]
-        
-        # Classification: map aggregated features to logit
-        logits = self.classifier(M)  # [batch_size, 1]
-        
-        return logits, A
+        attention = self.attention_v(features)
+        if self.attention_u is not None:
+            attention = attention * self.attention_u(features)
+        return self.attention_out(attention).transpose(1, 2)
 
 
-class ClusteringBranch(nn.Module):
-    """
-    Clustering branch for unsupervised learning constraint.
-    
-    Uses K-means-like clustering to separate patches into clusters, encouraging
-    the model to learn discriminative features.
-    """
-    
+class _CLAMBase(nn.Module):
+    """Shared implementation for canonical CLAM-SB and CLAM-MB."""
+
     def __init__(
         self,
         input_dim: int,
-        hidden_dim: int = 512,
-        k_clusters: int = 2,
-        feature_dropout: float = 0.25,
-        cluster_head_hidden_dim: Optional[int] = None
+        hidden_dim: int,
+        attention_dim: int,
+        num_classes: int,
+        gated: bool,
+        dropout: float,
+        k_sample: int,
+        subtyping: bool,
+        attention_branches: int,
     ) -> None:
-        """
-        Initialize clustering branch.
-        
+        """Initialize common CLAM modules.
+
         Args:
-            input_dim (int): Dimension of input features.
-            hidden_dim (int): Dimension of hidden layers. Defaults to 512.
-            k_clusters (int): Number of clusters to assign tiles to. Defaults to 2.
-            feature_dropout (float): Dropout probability used in branch feature
-                extractor.
-                Defaults to 0.25.
-            cluster_head_hidden_dim (Optional[int]): Hidden dimension of clustering
-                head MLP. If None, uses hidden_dim // 2. Defaults to None.
+            input_dim (int): Input tile feature dimension.
+            hidden_dim (int): Shared embedding dimension.
+            attention_dim (int): Attention hidden dimension.
+            num_classes (int): Number of bag classes.
+            gated (bool): Whether to use gated attention.
+            dropout (float): Dropout probability.
+            k_sample (int): Maximum positive and negative instances per class.
+            subtyping (bool): Whether to supervise out-of-class branches.
+            attention_branches (int): One for SB or ``num_classes`` for MB.
 
         Returns:
-            None: This constructor initializes clustering branch modules in-place.
+            None: The initialized model.
         """
-        super(ClusteringBranch, self).__init__()
-        self.k_clusters = k_clusters
-        cluster_mlp_hidden_dim = (
-            hidden_dim // 2 if cluster_head_hidden_dim is None
-            else cluster_head_hidden_dim
-        )
-        
-        # Feature extraction network
-        self.feature_extractor = nn.Sequential(
+        super().__init__()
+        if input_dim <= 0 or hidden_dim <= 0 or attention_dim <= 0:
+            raise ValueError("Model dimensions must be positive.")
+        if num_classes < 2:
+            raise ValueError("num_classes must be at least 2.")
+        if k_sample <= 0:
+            raise ValueError("k_sample must be positive.")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1).")
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.num_classes = num_classes
+        self.k_sample = k_sample
+        self.subtyping = subtyping
+        self.num_attention_branches = attention_branches
+
+        self.embedding = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(feature_dropout)
+            nn.Dropout(dropout),
         )
-        
-        # Cluster assignment network: maps features to cluster logits
-        self.cluster_head = nn.Sequential(
-            nn.Linear(hidden_dim, cluster_mlp_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(cluster_mlp_hidden_dim, k_clusters)
+        self.attention = _AttentionNetwork(
+            input_dim=hidden_dim,
+            attention_dim=attention_dim,
+            branches=attention_branches,
+            gated=gated,
+            dropout=dropout,
         )
-    
+        self.instance_classifiers = nn.ModuleList(
+            nn.Linear(hidden_dim, 2) for _ in range(num_classes)
+        )
+        self._initialize_weights()
+
+    def _initialize_weights(self) -> None:
+        """Initialize linear layers with canonical Xavier weights.
+
+        Args:
+            None.
+
+        Returns:
+            None: Parameters are initialized in place.
+        """
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def _validate_inputs(
+        self,
+        features: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Validate inputs and materialize a mask.
+
+        Args:
+            features (torch.Tensor): Tile features shaped ``[B, N, D]``.
+            mask (Optional[torch.Tensor]): Boolean valid-tile mask shaped ``[B, N]``.
+            labels (Optional[torch.Tensor]): Integer class labels shaped ``[B]``.
+
+        Returns:
+            Tuple[torch.Tensor, Optional[torch.Tensor]]: Validated mask and labels.
+        """
+        if features.ndim != 3:
+            raise ValueError("features must have shape [B, N, D].")
+        batch_size, tile_count, feature_dim = features.shape
+        if batch_size == 0 or tile_count == 0:
+            raise ValueError("features must contain at least one bag and tile.")
+        if feature_dim != self.input_dim:
+            raise ValueError(
+                f"Expected feature dimension {self.input_dim}, got {feature_dim}."
+            )
+
+        if mask is None:
+            validated_mask = torch.ones(
+                (batch_size, tile_count),
+                dtype=torch.bool,
+                device=features.device,
+            )
+        else:
+            if mask.shape != (batch_size, tile_count):
+                raise ValueError("mask must have shape [B, N].")
+            if mask.dtype != torch.bool:
+                raise TypeError("mask must have boolean dtype.")
+            if mask.device != features.device:
+                raise ValueError("features and mask must be on the same device.")
+            validated_mask = mask
+
+        empty_bags = (~validated_mask.any(dim=1)).nonzero(as_tuple=False).flatten()
+        if empty_bags.numel() > 0:
+            indices = empty_bags.detach().cpu().tolist()
+            raise ValueError(f"All-empty bags are not allowed; bag indices: {indices}.")
+
+        if labels is not None:
+            if labels.shape != (batch_size,):
+                raise ValueError("labels must have shape [B].")
+            if labels.device != features.device:
+                raise ValueError("features and labels must be on the same device.")
+            if labels.dtype not in (torch.int32, torch.int64):
+                raise TypeError("labels must have an integer dtype.")
+            labels = labels.to(dtype=torch.long)
+            if bool(((labels < 0) | (labels >= self.num_classes)).any()):
+                raise ValueError("labels contain a class index outside the valid range.")
+
+        return validated_mask, labels
+
+    def _classify_bags(self, pooled_features: torch.Tensor) -> torch.Tensor:
+        """Classify pooled bag representations.
+
+        Args:
+            pooled_features (torch.Tensor): Pooled features shaped ``[B, K, H]``.
+
+        Returns:
+            torch.Tensor: Bag logits shaped ``[B, C]``.
+        """
+        raise NotImplementedError
+
+    def _instance_supervision(
+        self,
+        embedded: torch.Tensor,
+        attention_scores: torch.Tensor,
+        mask: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute label-aware CLAM instance supervision.
+
+        Args:
+            embedded (torch.Tensor): Embedded tile features shaped ``[B, N, H]``.
+            attention_scores (torch.Tensor): Raw attention shaped ``[B, K, N]``.
+            mask (torch.Tensor): Boolean valid-tile mask shaped ``[B, N]``.
+            labels (torch.Tensor): Bag labels shaped ``[B]``.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Mean CE loss, flattened
+            instance predictions, and flattened binary targets.
+        """
+        logits_parts: List[torch.Tensor] = []
+        loss_parts: List[torch.Tensor] = []
+        target_parts: List[torch.Tensor] = []
+
+        for bag_index in range(embedded.shape[0]):
+            valid_features = embedded[bag_index, mask[bag_index]]
+            valid_count = valid_features.shape[0]
+            label = int(labels[bag_index].item())
+
+            for class_index, classifier in enumerate(self.instance_classifiers):
+                branch_index = (
+                    class_index if self.num_attention_branches > 1 else 0
+                )
+                valid_scores = attention_scores[
+                    bag_index, branch_index, mask[bag_index]
+                ]
+                order = torch.argsort(valid_scores)
+
+                if class_index == label:
+                    k = min(self.k_sample, valid_count // 2)
+                    if k == 0:
+                        continue
+                    selected = torch.cat((order[-k:], order[:k]))
+                    targets = torch.cat(
+                        (
+                            torch.ones(k, dtype=torch.long, device=embedded.device),
+                            torch.zeros(k, dtype=torch.long, device=embedded.device),
+                        )
+                    )
+                elif self.subtyping:
+                    k = min(self.k_sample, valid_count)
+                    selected = order[-k:]
+                    targets = torch.zeros(
+                        k, dtype=torch.long, device=embedded.device
+                    )
+                else:
+                    continue
+
+                instance_logits = classifier(valid_features[selected])
+                logits_parts.append(instance_logits)
+                loss_parts.append(F.cross_entropy(instance_logits, targets))
+                target_parts.append(targets)
+
+        if not logits_parts:
+            zero = embedded.sum() * 0.0
+            empty = torch.empty(0, dtype=torch.long, device=embedded.device)
+            return zero, empty, empty
+
+        instance_logits = torch.cat(logits_parts, dim=0)
+        instance_targets = torch.cat(target_parts, dim=0)
+        instance_loss = torch.stack(loss_parts).mean()
+        instance_predictions = instance_logits.argmax(dim=1)
+        return instance_loss, instance_predictions, instance_targets
+
     def forward(
         self,
         features: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Forward pass through clustering branch.
-        
+        mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        instance_eval: bool = True,
+    ) -> Dict[str, torch.Tensor]:
+        """Run batched, masked CLAM inference and optional instance supervision.
+
         Args:
-            features (torch.Tensor): Input features of shape [batch_size, n_tiles, input_dim].
-            mask (Optional[torch.Tensor]): Boolean mask of shape [batch_size, n_tiles].
-                True indicates valid tiles, False indicates padding. Defaults to None.
-        
+            features (torch.Tensor): Tile features shaped ``[B, N, D]``.
+            mask (Optional[torch.Tensor]): Boolean valid-tile mask shaped ``[B, N]``.
+            labels (Optional[torch.Tensor]): Integer bag labels shaped ``[B]``.
+            instance_eval (bool): Whether to compute instance supervision when
+                labels are supplied.
+
         Returns:
-            torch.Tensor: Soft cluster assignments of shape [batch_size, n_tiles, k_clusters].
-                Each row sums to 1 (softmax probabilities).
+            Dict[str, torch.Tensor]: Stable output dictionary containing bag
+            predictions, attention tensors, pooled features, and instance results.
         """
-        # Extract features
-        H = self.feature_extractor(features)  # [batch_size, n_tiles, hidden_dim]
-        
-        # Get cluster assignment logits
-        cluster_logits = self.cluster_head(H)  # [batch_size, n_tiles, k_clusters]
-        
-        # Apply mask to ignore padding tiles
-        if mask is not None:
-            # Set invalid tiles to uniform distribution (via -inf before softmax)
-            mask_expanded = mask.unsqueeze(-1).expand_as(cluster_logits)
-            cluster_logits = cluster_logits.masked_fill(~mask_expanded, float('-inf'))
-        
-        # Convert logits to soft cluster assignments (probabilities)
-        cluster_assignments = F.softmax(cluster_logits, dim=-1)
-        
-        return cluster_assignments
+        mask, labels = self._validate_inputs(features, mask, labels)
+        embedded = self.embedding(features)
+        attention_scores = self.attention(embedded)
+        attention_scores = attention_scores.masked_fill(
+            ~mask.unsqueeze(1), float("-inf")
+        )
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        attention_weights = attention_weights.masked_fill(~mask.unsqueeze(1), 0.0)
+        pooled_features = torch.bmm(attention_weights, embedded)
+        logits = self._classify_bags(pooled_features)
+        probabilities = F.softmax(logits, dim=1)
+        predictions = probabilities.argmax(dim=1)
+
+        if labels is not None and instance_eval:
+            instance_loss, instance_predictions, instance_targets = (
+                self._instance_supervision(
+                    embedded, attention_scores, mask, labels
+                )
+            )
+        else:
+            instance_loss = embedded.sum() * 0.0
+            instance_predictions = torch.empty(
+                0, dtype=torch.long, device=features.device
+            )
+            instance_targets = torch.empty(
+                0, dtype=torch.long, device=features.device
+            )
+
+        return {
+            "logits": logits,
+            "probabilities": probabilities,
+            "predictions": predictions,
+            "attention_scores": attention_scores,
+            "attention_weights": attention_weights,
+            "pooled_features": pooled_features,
+            "instance_loss": instance_loss,
+            "instance_predictions": instance_predictions,
+            "instance_targets": instance_targets,
+        }
 
 
-class CLAM_MB(nn.Module):
-    """
-    CLAM-MB (Multi-Branch) model for WSI classification.
-    
-    Uses multiple attention branches (one per class) and a clustering branch.
-    Each attention branch learns to attend to class-specific regions, and the
-    clustering branch provides unsupervised learning constraints.
-    """
-    
+class CLAM_SB(_CLAMBase):
+    """Canonical CLAM single-attention-branch model."""
+
     def __init__(
         self,
         input_dim: int = 1536,
         hidden_dim: int = 512,
-        num_classes: int = 5,
-        k_clusters: int = 2,
-        attention_hidden_dim: int = 512,
         attention_dim: int = 256,
-        cluster_head_hidden_dim: Optional[int] = None,
-        feature_projection_dropout: float = 0.25,
-        attention_branch_feature_dropout: float = 0.25,
-        clustering_branch_feature_dropout: float = 0.25,
-        final_classifier_dropout: float = 0.25
+        num_classes: int = 2,
+        gated: bool = True,
+        dropout: float = 0.25,
+        k_sample: int = 8,
+        subtyping: bool = False,
     ) -> None:
-        """
-        Initialize CLAM-MB model.
-        
+        """Initialize CLAM-SB.
+
         Args:
-            input_dim (int): Dimension of input features. Defaults to 1536.
-            hidden_dim (int): Dimension of hidden layers. Defaults to 512.
-            num_classes (int): Number of classification classes. Defaults to 5.
-            k_clusters (int): Number of clusters for clustering branch. Defaults to 2.
-            attention_hidden_dim (int): Intermediate attention MLP dimension used
-                in each attention branch. Defaults to 512.
-            attention_dim (int): Attention projection dimension used in each
-                attention branch. Defaults to 256.
-            cluster_head_hidden_dim (Optional[int]): Hidden dimension used in
-                clustering head MLP. If None, uses hidden_dim // 2.
-                Defaults to None.
-            feature_projection_dropout (float): Dropout probability used in the
-                shared input feature projection block. Defaults to 0.25.
-            attention_branch_feature_dropout (float): Dropout probability used
-                in each attention branch feature extractor. Defaults to 0.25.
-            clustering_branch_feature_dropout (float): Dropout probability used
-                in the clustering branch feature extractor. Defaults to 0.25.
-            final_classifier_dropout (float): Dropout probability used in the
-                final classifier MLP. Defaults to 0.25.
+            input_dim (int): Input tile feature dimension.
+            hidden_dim (int): Shared embedding dimension.
+            attention_dim (int): Attention hidden dimension.
+            num_classes (int): Number of bag classes.
+            gated (bool): Whether to use gated attention.
+            dropout (float): Dropout probability.
+            k_sample (int): Maximum positive and negative instances per class.
+            subtyping (bool): Whether to supervise out-of-class classifiers.
 
         Returns:
-            None: This constructor initializes CLAM-MB modules in-place.
+            None: The initialized CLAM-SB model.
         """
-        super(CLAM_MB, self).__init__()
-        self.num_classes = num_classes
-        self.k_clusters = k_clusters
-        
-        # Shared feature projection: projects input features to hidden dimension
-        self.feature_projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(feature_projection_dropout)
-        )
-        
-        # Multiple attention branches: one per class
-        # Each branch learns to attend to class-specific regions
-        self.attention_branches = nn.ModuleList([
-            AttentionBranch(
-                input_dim=hidden_dim,
-                hidden_dim=hidden_dim,
-                attention_hidden_dim=attention_hidden_dim,
-                attention_dim=attention_dim,
-                feature_dropout=attention_branch_feature_dropout
-            ) for _ in range(num_classes)
-        ])
-        
-        # Clustering branch: provides unsupervised learning constraint
-        self.clustering_branch = ClusteringBranch(
-            input_dim=hidden_dim,
+        super().__init__(
+            input_dim=input_dim,
             hidden_dim=hidden_dim,
-            k_clusters=k_clusters,
-            feature_dropout=clustering_branch_feature_dropout,
-            cluster_head_hidden_dim=cluster_head_hidden_dim
+            attention_dim=attention_dim,
+            num_classes=num_classes,
+            gated=gated,
+            dropout=dropout,
+            k_sample=k_sample,
+            subtyping=subtyping,
+            attention_branches=1,
         )
-        
-        # Final classification head: combines branch outputs
-        self.classifier = nn.Sequential(
-            nn.Linear(num_classes, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(final_classifier_dropout),
-            nn.Linear(hidden_dim, num_classes)
+        self.classifiers = nn.ModuleList(
+            nn.Linear(hidden_dim, 1) for _ in range(num_classes)
         )
-    
-    def forward(
-        self,
-        features: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass through CLAM-MB model.
-        
+        self._initialize_weights()
+
+    def _classify_bags(self, pooled_features: torch.Tensor) -> torch.Tensor:
+        """Classify one shared pooled representation.
+
         Args:
-            features (torch.Tensor): Input features of shape [batch_size, n_tiles, input_dim].
-            mask (Optional[torch.Tensor]): Boolean mask of shape [batch_size, n_tiles].
-                True indicates valid tiles, False indicates padding. Defaults to None.
-        
+            pooled_features (torch.Tensor): Features shaped ``[B, 1, H]``.
+
         Returns:
-            Dict[str, torch.Tensor]: Dictionary containing:
-                - 'logits' (torch.Tensor): Final classification logits of shape
-                  [batch_size, num_classes].
-                - 'attention_weights' (List[torch.Tensor]): List of attention weight tensors,
-                  one per branch. Each has shape [batch_size, n_tiles].
-                - 'cluster_assignments' (torch.Tensor): Cluster assignments of shape
-                  [batch_size, n_tiles, k_clusters].
-                - 'branch_logits' (torch.Tensor): Branch logits before final classifier,
-                  shape [batch_size, num_classes].
+            torch.Tensor: Bag logits shaped ``[B, C]``.
         """
-        # Project input features to hidden dimension
-        H = self.feature_projection(features)  # [batch_size, n_tiles, hidden_dim]
-        
-        # Get outputs from each attention branch
-        branch_outputs: List[torch.Tensor] = []
-        attention_weights_list: List[torch.Tensor] = []
-        
-        for branch in self.attention_branches:
-            logits_branch, attn_weights = branch(H, mask)
-            branch_outputs.append(logits_branch)
-            attention_weights_list.append(attn_weights)
-        
-        # Stack branch outputs: [batch_size, num_classes]
-        branch_logits = torch.cat(branch_outputs, dim=1)
-        
-        # Get clustering assignments
-        cluster_assignments = self.clustering_branch(H, mask)
-        
-        # Final classification: combine branch outputs
-        final_logits = self.classifier(branch_logits)  # [batch_size, num_classes]
-        
-        return {
-            'logits': final_logits,
-            'attention_weights': attention_weights_list,
-            'cluster_assignments': cluster_assignments,
-            'branch_logits': branch_logits
-        }
+        shared_bag = pooled_features[:, 0]
+        return torch.cat(
+            [classifier(shared_bag) for classifier in self.classifiers], dim=1
+        )
 
 
-def compute_clustering_loss(
-    cluster_assignments: torch.Tensor,
-    mask: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    """
-    Compute clustering loss to encourage confident cluster assignments.
-    
-    Uses entropy minimization: encourages the model to make confident (low entropy)
-    cluster assignments rather than uncertain (high entropy) ones.
-    
-    Args:
-        cluster_assignments (torch.Tensor): Soft cluster assignments of shape
-            [batch_size, n_tiles, k_clusters]. Each row should sum to 1.
-        mask (Optional[torch.Tensor]): Boolean mask of shape [batch_size, n_tiles].
-            True indicates valid tiles, False indicates padding. Defaults to None.
-    
-    Returns:
-        torch.Tensor: Scalar tensor containing the clustering loss (entropy).
-    """
-    if mask is not None:
-        # Only compute loss for valid tiles (ignore padding)
-        valid_assignments = cluster_assignments[mask]  # [n_valid_tiles, k_clusters]
-        if valid_assignments.shape[0] == 0:
-            # Return zero loss if no valid tiles
-            return torch.tensor(0.0, device=cluster_assignments.device)
-        
-        # Compute entropy: -sum(p * log(p)) for each tile
-        entropy = -torch.sum(
-            valid_assignments * torch.log(valid_assignments + 1e-8), dim=-1
+class CLAM_MB(_CLAMBase):
+    """Canonical CLAM multi-attention-branch model."""
+
+    def __init__(
+        self,
+        input_dim: int = 1536,
+        hidden_dim: int = 512,
+        attention_dim: int = 256,
+        num_classes: int = 2,
+        gated: bool = True,
+        dropout: float = 0.25,
+        k_sample: int = 8,
+        subtyping: bool = False,
+    ) -> None:
+        """Initialize CLAM-MB.
+
+        Args:
+            input_dim (int): Input tile feature dimension.
+            hidden_dim (int): Shared embedding dimension.
+            attention_dim (int): Attention hidden dimension.
+            num_classes (int): Number of bag classes and attention branches.
+            gated (bool): Whether to use gated attention.
+            dropout (float): Dropout probability.
+            k_sample (int): Maximum positive and negative instances per class.
+            subtyping (bool): Whether to supervise out-of-class branches.
+
+        Returns:
+            None: The initialized CLAM-MB model.
+        """
+        super().__init__(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            attention_dim=attention_dim,
+            num_classes=num_classes,
+            gated=gated,
+            dropout=dropout,
+            k_sample=k_sample,
+            subtyping=subtyping,
+            attention_branches=num_classes,
         )
-        clustering_loss = torch.mean(entropy)
-    else:
-        # Compute entropy for all tiles
-        entropy = -torch.sum(
-            cluster_assignments * torch.log(cluster_assignments + 1e-8), dim=-1
+        self.classifiers = nn.ModuleList(
+            nn.Linear(hidden_dim, 1) for _ in range(num_classes)
         )
-        clustering_loss = torch.mean(entropy)
-    
-    # Return entropy as loss (we want to minimize entropy = maximize confidence)
-    return clustering_loss
+        self._initialize_weights()
+
+    def _classify_bags(self, pooled_features: torch.Tensor) -> torch.Tensor:
+        """Classify each class-specific pooled representation directly.
+
+        Args:
+            pooled_features (torch.Tensor): Features shaped ``[B, C, H]``.
+
+        Returns:
+            torch.Tensor: Direct class logits shaped ``[B, C]``.
+        """
+        return torch.cat(
+            [
+                classifier(pooled_features[:, class_index])
+                for class_index, classifier in enumerate(self.classifiers)
+            ],
+            dim=1,
+        )
