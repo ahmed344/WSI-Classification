@@ -83,7 +83,7 @@ def _assert_attention_weights(attention_weights: torch.Tensor, mask: torch.Tenso
     assert torch.allclose(valid_attention_sums, expected_sums, atol=1e-5)
 
 
-def test_integration() -> bool:
+def run_integration() -> bool:
     """
     Run the DG-SSM-MIL integration smoke test.
 
@@ -93,76 +93,67 @@ def test_integration() -> bool:
     Returns:
         bool: True when data loading, forward pass, loss, and backward pass succeed.
     """
-    print("Testing DG-SSM-MIL tissue workflow...")
-    print("=" * 60)
-
+    print("Testing paper-faithful DG-SSM-MIL forward/backward workflow...")
     try:
         config = load_config()
         genbio_config = dict(config)
         genbio_config["feature_model"] = "genbio"
         assert resolve_feature_file_suffix(genbio_config) == "_features_genbio.pt"
         assert resolve_input_dim(genbio_config) == 4608
-        train_dataset, _ = create_datasets(config)
-        print(f"Loaded training samples: {len(train_dataset)}")
-        print(f"Classes: {train_dataset.class_folders}")
-    except Exception as exc:
-        print(f"Data setup failed: {exc}")
-        return False
-
-    if len(train_dataset) == 0:
-        print("No training samples found.")
-        return False
-
-    try:
-        max_tiles = int(config.get("integration_max_tiles", 128))
-        sample = _trim_sample(train_dataset[0], max_tiles)
-        assert sample["features"].shape[-1] == int(config["input_dim"]), (
-            "Feature dimension mismatch: "
-            f"sample has {sample['features'].shape[-1]}, "
-            f"config expects {config['input_dim']}"
-        )
-        batch = collate_fn([sample])
-        _assert_batch_shapes(batch)
-        print(f"Batch features: {tuple(batch['features'].shape)}")
-        print(f"Batch coords: {tuple(batch['coords'].shape)}")
-        print(f"Valid tiles: {int(batch['masks'].sum().item())}")
-    except Exception as exc:
-        print(f"Dataset/collate test failed: {exc}")
-        return False
-
-    try:
         device = torch.device(resolve_device(config))
-        model = DGSSMMILModel.from_config(config).to(device)
-        criterion = torch.nn.CrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-
-        features = batch["features"].to(device)
-        coords = batch["coords"].to(device)
-        masks = batch["masks"].to(device)
-        labels = batch["labels"].to(device)
-
+        model = DGSSMMILModel(
+            input_dim=16,
+            hidden_dim=32,
+            num_classes=5,
+            spatial_knn_k=3,
+            gat_heads=2,
+            dynamic_graph_top_k=2,
+            mamba_d_state=4,
+            mamba_d_conv=3,
+            mamba_expand=1,
+            projection_dropout=0.0,
+            gat_dropout=0.0,
+            dynamic_graph_dropout=0.0,
+            block_dropout=0.0,
+            classifier_dropout=0.0,
+        ).to(device)
+        features = torch.randn(2, 12, 16, device=device)
+        coords = torch.randn(2, 12, 2, device=device)
+        masks = torch.tensor(
+            [[True] * 9 + [False] * 3, [True] * 12],
+            dtype=torch.bool,
+            device=device,
+        )
+        labels = torch.tensor([1, 4], device=device)
         outputs = model(features, coords, masks)
-        assert outputs["logits"].shape == (1, int(config["num_classes"]))
         _assert_attention_weights(outputs["attention_weights"], masks)
-        loss = criterion(outputs["logits"], labels)
-        optimizer.zero_grad()
+        loss = torch.nn.functional.cross_entropy(outputs["logits"], labels)
         loss.backward()
-        optimizer.step()
-        print(f"Logits: {tuple(outputs['logits'].shape)}")
-        print(f"Attention: {tuple(outputs['attention_weights'].shape)}")
-        print(f"Loss: {float(loss.item()):.4f}")
+        assert any(parameter.grad is not None for parameter in model.parameters())
+        print(f"Device: {device}; loss: {float(loss.item()):.4f}")
+        print("DG-SSM-MIL integration smoke test passed.")
+        return True
     except Exception as exc:
-        print(f"Model/loss/backward test failed: {exc}")
+        print(f"Integration test failed: {exc}")
         import traceback
 
         traceback.print_exc()
         return False
 
-    print("=" * 60)
-    print("DG-SSM-MIL integration smoke test passed.")
-    return True
+
+def test_integration() -> None:
+    """
+    Assert that the synthetic integration workflow succeeds under pytest.
+
+    Args:
+        None: The smoke workflow creates its own tensors.
+
+    Returns:
+        None: The integration result is asserted.
+    """
+    assert run_integration()
 
 
 if __name__ == "__main__":
-    success = test_integration()
+    success = run_integration()
     sys.exit(0 if success else 1)

@@ -194,15 +194,44 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("dynamic_graph_top_k must be positive.")
     if int(config.get("dynamic_graph_chunk_size", 512)) <= 0:
         raise ValueError("dynamic_graph_chunk_size must be positive.")
+    dynamic_lambda = float(config.get("dynamic_graph_lambda", 0.5))
+    if not 0.0 <= dynamic_lambda <= 1.0:
+        raise ValueError("dynamic_graph_lambda must be in [0, 1].")
+    if str(config.get("dynamic_graph_activation", "silu")) not in {
+        "silu",
+        "relu",
+        "gelu",
+    }:
+        raise ValueError("dynamic_graph_activation must be silu, relu, or gelu.")
     if str(config.get("attention_type", "standard")) not in {"standard", "gated"}:
         raise ValueError("attention_type must be either 'standard' or 'gated'.")
     if int(config.get("gradient_accumulation_steps", 1)) <= 0:
         raise ValueError("gradient_accumulation_steps must be positive.")
-    for key in ["max_tiles_per_tissue_train", "max_tiles_per_tissue_val"]:
+    for key in [
+        "max_tiles_per_tissue_train",
+        "max_tiles_per_tissue_val",
+        "max_tiles_per_tissue_test",
+    ]:
         value = config.get(key)
         if value is not None and int(value) <= 0:
             raise ValueError(f"{key} must be positive or null.")
-    if str(config.get("coordinate_mismatch", "trim")) not in {"error", "trim"}:
-        raise ValueError("coordinate_mismatch must be either 'error' or 'trim'.")
+    skip_threshold = config.get("skip_tissues_above_tiles")
+    if skip_threshold is not None and int(skip_threshold) <= 0:
+        raise ValueError("skip_tissues_above_tiles must be positive or null.")
+    if str(config.get("coordinate_mismatch", "error")) != "error":
+        raise ValueError("coordinate_mismatch must be 'error' for spatial alignment.")
+    if bool(config.get("sort_tiles_spatially", False)):
+        raise ValueError("sort_tiles_spatially must be false for the original H path.")
+    if str(config.get("bag_level", "tissue")) not in {"tissue", "slide"}:
+        raise ValueError("bag_level must be tissue or slide.")
+    ratios = [
+        float(config.get("train_ratio", 0.8)),
+        float(config.get("val_ratio", 0.1)),
+        float(config.get("test_ratio", 0.1)),
+    ]
+    if any(ratio < 0.0 for ratio in ratios) or not abs(sum(ratios) - 1.0) < 1e-8:
+        raise ValueError("train_ratio, val_ratio, and test_ratio must sum to 1.")
+    if int(config.get("monte_carlo_repeats", 10)) <= 0:
+        raise ValueError("monte_carlo_repeats must be positive.")
     get_coordinate_columns(config)
     resolve_feature_file_suffix(config)

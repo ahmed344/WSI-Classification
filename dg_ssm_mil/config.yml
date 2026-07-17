@@ -1,88 +1,103 @@
 # DG-SSM-MIL tissue-level configuration.
 
 # Data paths
-data_root: "/workspaces/WSI-Classification/data/HE-MYO/Processed"
-checkpoint_dir: "dg_ssm_mil/checkpoints"
-output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results/dg_ssm_mil"
+data_root: "/workspaces/WSI-Classification/data/HE-MYO/Processed"  # Root containing class/slide/tissue artifacts; set to the processed dataset directory
+checkpoint_dir: "dg_ssm_mil/checkpoints"  # Base checkpoint directory; relative or absolute paths are supported
+output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results/dg_ssm_mil"  # Base metrics/plot directory; use a writable location
 
 # Feature source selection
-feature_model: "genbio"
-feature_model_suffixes:
-  default: "_features.pt"
-  hoptimus: "_features_hoptimus.pt"
-  uni2h: "_features_uni2h.pt"
-  genbio: "_features_genbio.pt"
-feature_model_input_dims:
-  default: 1536
-  hoptimus: 1536
-  uni2h: 1536
-  genbio: 4608
+feature_model: "uni2h"  # Feature extractor to load; recommended values: hoptimus, uni2h, or genbio
+feature_model_suffixes:  # Maps each extractor name to its on-disk tensor suffix; edit only if filenames change
+  default: "_features.pt"  # Generic legacy feature suffix
+  hoptimus: "_features_hoptimus.pt"  # H-Optimus feature suffix
+  uni2h: "_features_uni2h.pt"  # UNI2-H feature suffix
+  genbio: "_features_genbio.pt"  # GenBio PathFM feature suffix
+feature_model_input_dims:  # Maps each extractor to its required feature width; must match saved tensors
+  default: 1536  # Generic legacy feature width
+  hoptimus: 1536  # H-Optimus embedding width
+  uni2h: 1536  # UNI2-H embedding width
+  genbio: 4608  # GenBio PathFM embedding width
 
 # Dataset and coordinate handling
-num_classes: 5
-train_ratio: 0.8
-random_seed: 42
-sort_tiles_spatially: true
-coordinate_columns: ["x", "y"]
-coordinate_mismatch: "trim"  # Options: error, trim
-normalize_coordinates: true
-max_tiles_per_tissue_train: 2048  # Contiguous spatial crop for oversized training tissues; null disables
+num_classes: 5  # Number of diagnostic classes; must equal discovered class folders
+train_ratio: 0.8  # Slide-level training fraction; paper protocol recommends 0.8
+val_ratio: 0.1  # Slide-level validation fraction; paper protocol recommends 0.1
+test_ratio: 0.1  # Slide-level held-out test fraction; ratios must sum to 1
+random_seed: 42  # Base split/sampling seed; any integer is valid
+monte_carlo_repeats: 1  # Independent split repetitions; paper protocol uses 10, use 1 for development
+bag_level: "tissue"  # Keep tissue as the active task; slide remains supported by the data/model contract
+sort_tiles_spatially: false  # Preserve original path-H order; must remain false for paper fidelity
+coordinate_columns: ["x", "y"]  # CSV coordinate columns; currently required to be x and y
+coordinate_mismatch: "error"  # Feature/coordinate mismatch policy; error is required to prevent silent misalignment
+normalize_coordinates: false  # Raw Euclidean coordinates match the article
+tile_sampling: "random"  # Capped-bag strategy: random, uniform, or first; random is recommended for training
+feature_normalization: "none"  # Input normalization: none, l2, or layer_norm; none matches extracted features
+skip_tissues_above_tiles: 8192  # Exclude oversized tissues only from training; null disables this training filter
+max_tiles_per_tissue_train: 4096  # Paper-faithful full bags; set a cap only for memory constraints
 max_tiles_per_tissue_val: null  # Validation tile cap; null keeps all tiles
+max_tiles_per_tissue_test: null  # Test tile cap; null is recommended for unbiased evaluation
 
 # Model architecture
-hidden_dim: 512
-projection_dropout: 0.15
-spatial_knn_k: 24
-gat_heads: 4
-gat_dropout: 0.15
-dynamic_graph_top_k: 6
-dynamic_graph_chunk_size: 512
-dynamic_graph_dropout: 0.15
-mamba_d_state: 16
-mamba_d_conv: 4
-mamba_expand: 2
-use_conv_branch: true
-conv_kernel_size: 3
-block_dropout: 0.15
+hidden_dim: 512  # Shared projected feature width; 256-512 is practical, 512 is recommended
+projection_dropout: 0.1  # Dropout after input projection; recommended range 0.0-0.3
+spatial_knn_k: 8  # Coordinate-neighbor count for GAT; paper default is 8
+gat_heads: 4  # GAT attention heads averaged into hidden_dim; common values: 1, 2, 4, or 8
+gat_dropout: 0.1  # GAT attention dropout; recommended range 0.0-0.3
+dynamic_graph_top_k: 6  # Cross-path semantic neighbors; paper default is 6
+dynamic_graph_chunk_size: 512  # Query rows processed per similarity chunk; lower values reduce peak memory
+dynamic_graph_lambda: 0.5  # Paper leaves lambda unspecified
+dynamic_graph_activation: "silu"  # Paper leaves alpha/beta unspecified
+dynamic_graph_dropout: 0.1  # Dropout inside learned edge scoring; recommended range 0.0-0.3
+use_mamba_block: false  # Enable Bi-SSM sequence processing; false routes graph features directly to ABMIL for smaller tissue bags
+mamba_d_state: 16  # Selective SSM state size; 16 is the standard Mamba default
+mamba_d_conv: 4  # Non-causal Mamba depthwise kernel width; recommended 3 or 4
+mamba_expand: 2  # Mamba inner expansion factor; standard value is 2
+use_conv_branch: true  # Enable the paper's parallel local convolution branch; recommended true
+conv_kernel_size: 3  # Parallel convolution kernel width; odd values such as 3 or 5 are recommended
+block_dropout: 0.1  # Dropout after Bi-SSM branch fusion; recommended range 0.0-0.3
+use_ssm_residual: false  # Add a non-paper outer residual; false is recommended for paper fidelity
 attention_type: "gated"  # Options: standard, gated
-attention_hidden_dim: 256
-classifier_dropout: 0.3
+attention_hidden_dim: 256  # ABMIL attention bottleneck width; common values: 128-256
+classifier_dropout: 0.3  # Dropout before the class head; recommended range 0.0-0.5
 
 # Training parameters
-batch_size: 16
-gradient_accumulation_steps: 1  # Effective batch size is batch_size * this value
-epochs: 200
-learning_rate: 0.0001
-weight_decay: 0.01
-gradient_clip_norm: 1.0
-use_weighted_sampler: true
-use_class_weighted_loss: false
-best_checkpoint_metric: "balanced_accuracy"  # Options: balanced_accuracy, accuracy, loss
-lr_scheduler_factor: 0.5
-lr_scheduler_patience: 15
-min_epochs_before_early_stopping: 20
-patience: 10
-num_workers: 0
-device: "auto"  # Options: auto, cpu, cuda
+batch_size: 64  # Physical bags per step; reduce to 1 if variable-length bags cause OOM
+gradient_accumulation_steps: 1  # Avoid padding full WSI bags to a large shared length
+epochs: 200  # Maximum epochs per repeat; paper uses 200
+learning_rate: 0.00002  # Adam learning rate; paper uses 2e-4
+weight_decay: 0.00001  # Adam weight decay; paper uses 1e-5
+gradient_clip_norm: 1.0  # Maximum gradient norm when clipping is enabled; 1.0 is typical
+use_gradient_clipping: false  # Optional project extension, disabled for paper protocol
+use_weighted_sampler: true  # Oversample minority classes; usually keep false for paper reproduction
+use_class_weighted_loss: false  # Weight cross-entropy by inverse class frequency; avoid combining with weighted sampling
+best_checkpoint_metric: "auc"  # Options: auc, balanced_accuracy, accuracy, loss
+lr_scheduler_factor: 0.5  # LR multiplier after plateau; recommended 0.1-0.5 when scheduler is enabled
+lr_scheduler_patience: 5  # Validation-loss plateau epochs before LR reduction; set below early-stop patience when enabled
+use_lr_scheduler: true  # Optional project extension, disabled for paper protocol
+min_epochs_before_early_stopping: 20  # Earliest epoch where stopping is allowed; recommended at least 20
+patience: 50  # Checkpoint-metric non-improvement epochs before stopping; increase if training is noisy
+num_workers: 0  # DataLoader worker processes; use 0 for stability or 2-8 after benchmarking
+device: "cuda"  # Options: auto, cpu, cuda
 evaluation_batch_size: 1  # Keep evaluation memory stable for large tissue bags
 integration_max_tiles: 128  # Caps tiles used by the integration smoke test
 
 # Attention visualization parameters
-visualization:
+visualization:  # Controls attention heatmap generation only
   split: "val"  # Options: train, val
+  attention_normalization: "percentile"  # Heatmap scaling; percentile matches the article
   max_tissues: null  # null for all tissues, or an integer for a quick subset
-  tile_size: 448
-  thumbnail_size: 512
+  tile_size: 448  # Tile rectangle width in source pixels; match feature extraction
+  thumbnail_size: 512  # Requested preview size in pixels; 512-1024 is practical
   top_k_tiles: 25  # Number of highest-attention tiles to highlight and export
   top_percentile: null  # Optional percentile threshold, e.g. 95
-  save_top_tiles_csv: true
+  save_top_tiles_csv: true  # Export selected tile coordinates and attention values
 
 # Paths (can be overridden)
-paths:
-  checkpoint: null
-  final_checkpoint: null
-  training_history: null
-  training_report: null
-  training_plot: null
-  evaluation_output: null
-  attention_output: null
+paths:  # Optional explicit artifact paths; null derives each path from checkpoint_dir/output_dir
+  checkpoint: null  # Best-model checkpoint path; null uses checkpoint_dir/best_model.pth
+  final_checkpoint: null  # Last-epoch checkpoint path; null uses checkpoint_dir/final_model.pth
+  training_history: null  # Per-epoch metrics JSON path; null uses output_dir/training_history.json
+  training_report: null  # Best/test summary JSON path; null uses output_dir/best_model_report.json
+  training_plot: null  # Training-curves PNG path; null uses output_dir/training_history.png
+  evaluation_output: null  # Evaluation directory; null uses output_dir/evaluation_results
+  attention_output: null  # Heatmap directory; null uses output_dir/attention_heatmaps

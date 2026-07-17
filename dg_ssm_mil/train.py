@@ -4,6 +4,8 @@ Training entrypoint for the independent DG-SSM-MIL tissue workflow.
 import argparse
 import json
 import os
+import subprocess
+import sys
 from typing import Any, Dict, List, Tuple
 
 import matplotlib.pyplot as plt
@@ -17,6 +19,7 @@ from sklearn.metrics import (
     balanced_accuracy_score,
     classification_report,
     confusion_matrix,
+    roc_auc_score,
 )
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
@@ -83,6 +86,7 @@ def resolve_best_checkpoint_metric(metric_name: str) -> Tuple[str, bool, str]:
     """
     normalized = metric_name.strip().lower()
     mapping = {
+        "auc": ("auc", True, "auc"),
         "balanced_accuracy": ("balanced_accuracy", True, "balanced_accuracy"),
         "accuracy": ("accuracy", True, "accuracy"),
         "loss": ("loss", False, "loss"),
@@ -95,31 +99,55 @@ def resolve_best_checkpoint_metric(metric_name: str) -> Tuple[str, bool, str]:
     return mapping[normalized]
 
 
-def create_datasets(config: Dict[str, Any]) -> Tuple[DGSSMMILTissueDataset, DGSSMMILTissueDataset]:
+def create_datasets(
+    config: Dict[str, Any],
+    class_folders: List[str] | None = None,
+    apply_training_filter: bool = True,
+) -> Tuple[
+    DGSSMMILTissueDataset,
+    DGSSMMILTissueDataset,
+    DGSSMMILTissueDataset,
+]:
     """
     Create train and validation datasets from config.
 
     Args:
         config (Dict[str, Any]): Parsed DG-SSM-MIL configuration.
+        class_folders (List[str] | None): Optional frozen class order.
+        apply_training_filter (bool): Whether the training split should exclude
+            tissues above `skip_tissues_above_tiles`.
 
     Returns:
-        Tuple[DGSSMMILTissueDataset, DGSSMMILTissueDataset]: Train and validation datasets.
+        Tuple[DGSSMMILTissueDataset, DGSSMMILTissueDataset,
+        DGSSMMILTissueDataset]: Train, validation, and test datasets.
     """
     feature_file_suffix = resolve_feature_file_suffix(config)
     coordinate_columns = get_coordinate_columns(config)
     dataset_kwargs = {
         "data_root": str(config["data_root"]),
+        "class_folders": class_folders,
         "train_ratio": float(config["train_ratio"]),
+        "val_ratio": float(config.get("val_ratio", 0.1)),
+        "test_ratio": float(config.get("test_ratio", 0.1)),
         "random_seed": int(config["random_seed"]),
         "feature_file_suffix": feature_file_suffix,
         "coordinate_columns": coordinate_columns,
-        "coordinate_mismatch": str(config.get("coordinate_mismatch", "trim")),
-        "sort_tiles_spatially": bool(config.get("sort_tiles_spatially", True)),
-        "normalize_coordinates": bool(config.get("normalize_coordinates", True)),
+        "coordinate_mismatch": str(config.get("coordinate_mismatch", "error")),
+        "sort_tiles_spatially": bool(config.get("sort_tiles_spatially", False)),
+        "normalize_coordinates": bool(config.get("normalize_coordinates", False)),
+        "expected_feature_dim": int(config["input_dim"]),
+        "bag_level": str(config.get("bag_level", "tissue")),
+        "tile_sampling": str(config.get("tile_sampling", "random")),
+        "feature_normalization": str(config.get("feature_normalization", "none")),
     }
     train_dataset = DGSSMMILTissueDataset(
         split="train",
         max_tiles_per_tissue=config.get("max_tiles_per_tissue_train"),
+        skip_tissues_above_tiles=(
+            config.get("skip_tissues_above_tiles")
+            if apply_training_filter
+            else None
+        ),
         **dataset_kwargs,
     )
     val_dataset = DGSSMMILTissueDataset(
@@ -127,7 +155,12 @@ def create_datasets(config: Dict[str, Any]) -> Tuple[DGSSMMILTissueDataset, DGSS
         max_tiles_per_tissue=config.get("max_tiles_per_tissue_val"),
         **dataset_kwargs,
     )
-    return train_dataset, val_dataset
+    test_dataset = DGSSMMILTissueDataset(
+        split="test",
+        max_tiles_per_tissue=config.get("max_tiles_per_tissue_test"),
+        **dataset_kwargs,
+    )
+    return train_dataset, val_dataset, test_dataset
 
 
 def create_dataloaders(
@@ -135,7 +168,8 @@ def create_dataloaders(
     val_dataset: DGSSMMILTissueDataset,
     config: Dict[str, Any],
     class_weights: torch.Tensor,
-) -> Tuple[DataLoader, DataLoader]:
+    test_dataset: DGSSMMILTissueDataset | None = None,
+) -> Tuple[DataLoader, ...]:
     """
     Create train and validation dataloaders.
 
@@ -146,7 +180,8 @@ def create_dataloaders(
         class_weights (torch.Tensor): Class weights used for optional sampling.
 
     Returns:
-        Tuple[DataLoader, DataLoader]: Train and validation dataloaders.
+        Tuple[DataLoader, ...]: Train and validation loaders, plus a test loader
+        when `test_dataset` is supplied.
     """
     batch_size = int(config["batch_size"])
     num_workers = int(config.get("num_workers", 0))
@@ -174,12 +209,21 @@ def create_dataloaders(
         )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=int(config.get("evaluation_batch_size", 1)),
         shuffle=False,
         collate_fn=collate_fn,
         num_workers=num_workers,
     )
-    return train_loader, val_loader
+    if test_dataset is None:
+        return train_loader, val_loader
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=int(config.get("evaluation_batch_size", 1)),
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+    )
+    return train_loader, val_loader, test_loader
 
 
 def train_epoch(
@@ -211,6 +255,7 @@ def train_epoch(
     running_loss = 0.0
     all_preds: List[int] = []
     all_labels: List[int] = []
+    all_probs: List[List[float]] = []
     accumulation_steps = max(1, int(gradient_accumulation_steps))
     optimizer.zero_grad()
 
@@ -220,7 +265,10 @@ def train_epoch(
         masks = batch["masks"].to(device)
         labels = batch["labels"].to(device)
 
-        outputs = model(features, coords, masks)
+        tissue_indices = batch.get("tissue_indices")
+        if tissue_indices is not None:
+            tissue_indices = tissue_indices.to(device)
+        outputs = model(features, coords, masks, tissue_indices=tissue_indices)
         loss = criterion(outputs["logits"], labels)
 
         scaled_loss = loss / accumulation_steps
@@ -239,8 +287,11 @@ def train_epoch(
         preds = torch.argmax(outputs["logits"], dim=1).detach().cpu().numpy()
         all_preds.extend(int(pred) for pred in preds)
         all_labels.extend(int(label) for label in labels.detach().cpu().numpy())
+        all_probs.extend(torch.softmax(outputs["logits"], dim=1).detach().cpu().tolist())
 
-    return _compute_epoch_metrics(running_loss, len(dataloader), all_labels, all_preds)
+    return _compute_epoch_metrics(
+        running_loss, len(dataloader), all_labels, all_preds, all_probs
+    )
 
 
 def validate(
@@ -265,6 +316,7 @@ def validate(
     running_loss = 0.0
     all_preds: List[int] = []
     all_labels: List[int] = []
+    all_probs: List[List[float]] = []
 
     with torch.no_grad():
         for batch in dataloader:
@@ -273,14 +325,20 @@ def validate(
             masks = batch["masks"].to(device)
             labels = batch["labels"].to(device)
 
-            outputs = model(features, coords, masks)
+            tissue_indices = batch.get("tissue_indices")
+            if tissue_indices is not None:
+                tissue_indices = tissue_indices.to(device)
+            outputs = model(features, coords, masks, tissue_indices=tissue_indices)
             loss = criterion(outputs["logits"], labels)
             running_loss += float(loss.item())
             preds = torch.argmax(outputs["logits"], dim=1).detach().cpu().numpy()
             all_preds.extend(int(pred) for pred in preds)
             all_labels.extend(int(label) for label in labels.detach().cpu().numpy())
+            all_probs.extend(torch.softmax(outputs["logits"], dim=1).cpu().tolist())
 
-    metrics = _compute_epoch_metrics(running_loss, len(dataloader), all_labels, all_preds)
+    metrics = _compute_epoch_metrics(
+        running_loss, len(dataloader), all_labels, all_preds, all_probs
+    )
     metrics["confusion_matrix"] = confusion_matrix(all_labels, all_preds).tolist()
     metrics["predictions"] = all_preds
     metrics["labels"] = all_labels
@@ -292,6 +350,7 @@ def _compute_epoch_metrics(
     num_batches: int,
     labels: List[int],
     preds: List[int],
+    probabilities: List[List[float]] | None = None,
 ) -> Dict[str, float]:
     """
     Compute common epoch-level classification metrics.
@@ -301,17 +360,54 @@ def _compute_epoch_metrics(
         num_batches (int): Number of processed batches.
         labels (List[int]): Ground-truth class labels.
         preds (List[int]): Predicted class labels.
+        probabilities (List[List[float]] | None): Class probabilities.
 
     Returns:
         Dict[str, float]: Loss, accuracy, and balanced accuracy values.
     """
     if num_batches == 0 or len(labels) == 0:
-        return {"loss": float("nan"), "accuracy": 0.0, "balanced_accuracy": 0.0}
-    return {
+        return {
+            "loss": float("nan"),
+            "accuracy": 0.0,
+            "balanced_accuracy": 0.0,
+            "auc": float("nan"),
+        }
+    metrics = {
         "loss": running_loss / num_batches,
         "accuracy": float(accuracy_score(labels, preds)),
         "balanced_accuracy": float(balanced_accuracy_score(labels, preds)),
     }
+    metrics["auc"] = _safe_multiclass_auc(labels, probabilities)
+    return metrics
+
+
+def _safe_multiclass_auc(
+    labels: List[int],
+    probabilities: List[List[float]] | None,
+) -> float:
+    """
+    Compute macro one-vs-rest AUC when every class is represented.
+
+    Args:
+        labels (List[int]): Ground-truth class indices.
+        probabilities (List[List[float]] | None): Per-class probabilities.
+
+    Returns:
+        float: Macro AUC, or NaN when the split cannot define it.
+    """
+    if not probabilities:
+        return float("nan")
+    probability_array = np.asarray(probabilities)
+    class_aucs = []
+    label_array = np.asarray(labels)
+    for class_idx in range(probability_array.shape[1]):
+        binary_labels = (label_array == class_idx).astype(np.int64)
+        if np.unique(binary_labels).size < 2:
+            continue
+        class_aucs.append(
+            roc_auc_score(binary_labels, probability_array[:, class_idx])
+        )
+    return float(np.mean(class_aucs)) if class_aucs else float("nan")
 
 
 def is_improved(
@@ -351,6 +447,7 @@ def save_checkpoint(
     epoch: int,
     config: Dict[str, Any],
     metrics: Dict[str, Any],
+    class_folders: List[str],
 ) -> None:
     """
     Save a DG-SSM-MIL checkpoint.
@@ -363,6 +460,7 @@ def save_checkpoint(
         epoch (int): One-based epoch number.
         config (Dict[str, Any]): Training configuration.
         metrics (Dict[str, Any]): Validation metrics associated with the checkpoint.
+        class_folders (List[str]): Frozen class order used by the model.
 
     Returns:
         None: Checkpoint is written to disk.
@@ -376,6 +474,7 @@ def save_checkpoint(
             "scheduler_state_dict": scheduler.state_dict(),
             "config": config,
             "metrics": metrics,
+            "class_folders": class_folders,
         },
         path,
     )
@@ -415,7 +514,7 @@ def plot_training_history(
     Returns:
         None: The plot is saved to disk.
     """
-    plot_keys = ["loss", "accuracy", "balanced_accuracy"]
+    plot_keys = ["loss", "accuracy", "balanced_accuracy", "auc"]
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig, axes = plt.subplots(nrows=len(plot_keys), figsize=(10, 12))
     train_handle = None
@@ -494,7 +593,81 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to config.yml. Defaults to dg_ssm_mil/config.yml.",
     )
+    parser.add_argument(
+        "--repeat-index",
+        type=int,
+        default=None,
+        help="Run one zero-based Monte Carlo repeat instead of orchestrating all repeats.",
+    )
     return parser.parse_args()
+
+
+def _scope_repeat_paths(config: Dict[str, Any], repeat_index: int) -> None:
+    """
+    Place one Monte Carlo repeat's artifacts in an isolated directory.
+
+    Args:
+        config (Dict[str, Any]): Resolved mutable configuration.
+        repeat_index (int): Zero-based repeat index.
+
+    Returns:
+        None: Output paths are updated in-place.
+    """
+    repeat_name = f"repeat_{repeat_index:02d}"
+    for key, path in config["paths"].items():
+        if path is None:
+            continue
+        parent, filename = os.path.split(str(path))
+        config["paths"][key] = os.path.join(parent, repeat_name, filename)
+
+
+def _orchestrate_repeats(config_path: str | None, repeats: int) -> None:
+    """
+    Launch all configured Monte Carlo repeats and aggregate their reports.
+
+    Args:
+        config_path (str | None): Optional explicit configuration path.
+        repeats (int): Number of independent repeat seeds.
+
+    Returns:
+        None: Child runs and aggregate JSON output are written to disk.
+    """
+    command_base = [sys.executable, "-m", "dg_ssm_mil.train"]
+    if config_path is not None:
+        command_base.extend(["--config", config_path])
+    for repeat_index in range(repeats):
+        subprocess.run(
+            [*command_base, "--repeat-index", str(repeat_index)],
+            check=True,
+        )
+    config = load_config(config_path)
+    reports = []
+    for repeat_index in range(repeats):
+        repeat_config = dict(config)
+        repeat_config["paths"] = dict(config["paths"])
+        _scope_repeat_paths(repeat_config, repeat_index)
+        with open(
+            repeat_config["paths"]["training_report"], "r", encoding="utf-8"
+        ) as report_file:
+            reports.append(json.load(report_file))
+    aggregate: Dict[str, Any] = {"repeats": repeats, "reports": reports}
+    for split_name in ("val_metrics", "test_metrics"):
+        aggregate[split_name] = {}
+        for metric_name in ("auc", "accuracy", "balanced_accuracy"):
+            values = [
+                float(report[split_name][metric_name])
+                for report in reports
+                if not np.isnan(float(report[split_name][metric_name]))
+            ]
+            aggregate[split_name][metric_name] = {
+                "mean": float(np.mean(values)) if values else float("nan"),
+                "std": float(np.std(values)) if values else float("nan"),
+            }
+    aggregate_path = os.path.join(
+        os.path.dirname(config["paths"]["training_report"]),
+        "monte_carlo_summary.json",
+    )
+    save_json(aggregate_path, aggregate)
 
 
 def main() -> None:
@@ -509,6 +682,16 @@ def main() -> None:
     """
     args = parse_args()
     config = load_config(args.config)
+    repeats = int(config.get("monte_carlo_repeats", 10))
+    if args.repeat_index is None and repeats > 1:
+        _orchestrate_repeats(args.config, repeats)
+        return
+    repeat_index = int(args.repeat_index or 0)
+    if repeat_index < 0 or repeat_index >= repeats:
+        raise ValueError(f"repeat-index must be in [0, {repeats - 1}].")
+    config["repeat_index"] = repeat_index
+    config["random_seed"] = int(config["random_seed"]) + repeat_index
+    _scope_repeat_paths(config, repeat_index)
     set_random_seeds(int(config["random_seed"]))
     device = torch.device(resolve_device(config))
 
@@ -518,14 +701,22 @@ def main() -> None:
         f"with suffix '{resolve_feature_file_suffix(config)}'"
     )
 
-    train_dataset, val_dataset = create_datasets(config)
+    train_dataset, val_dataset, test_dataset = create_datasets(config)
     if len(train_dataset) == 0:
         raise RuntimeError("Training dataset is empty. Check data_root and feature suffix.")
     if len(val_dataset) == 0:
         raise RuntimeError("Validation dataset is empty. Check train_ratio and data layout.")
+    if len(test_dataset) == 0:
+        raise RuntimeError("Test dataset is empty. Check test_ratio and data layout.")
+    if train_dataset.num_classes != int(config["num_classes"]):
+        raise ValueError(
+            f"Configured num_classes={config['num_classes']} but discovered "
+            f"{train_dataset.num_classes} classes: {train_dataset.class_folders}."
+        )
 
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
+    print(f"Test samples: {len(test_dataset)}")
     print(f"Classes: {train_dataset.class_folders}")
     batch_size = int(config["batch_size"])
     gradient_accumulation_steps = int(config.get("gradient_accumulation_steps", 1))
@@ -535,14 +726,20 @@ def main() -> None:
     print(f"Effective batch size: {effective_batch_size}")
     print(f"Max train tiles per tissue: {config.get('max_tiles_per_tissue_train')}")
     print(f"Max val tiles per tissue: {config.get('max_tiles_per_tissue_val')}")
+    print(
+        "Skipped oversized tissues: "
+        f"{len(train_dataset.skipped_tissues)} "
+        f"(threshold={config.get('skip_tissues_above_tiles')})"
+    )
     print_class_counts(train_dataset, val_dataset)
 
     class_weights = compute_class_weights(train_dataset)
-    train_loader, val_loader = create_dataloaders(
+    train_loader, val_loader, test_loader = create_dataloaders(
         train_dataset,
         val_dataset,
         config,
         class_weights,
+        test_dataset,
     )
 
     model = DGSSMMILModel.from_config(config).to(device)
@@ -572,27 +769,33 @@ def main() -> None:
     best_epoch = 0
     patience_counter = 0
     history: Dict[str, Dict[str, List[float]]] = {
-        "train": {"loss": [], "accuracy": [], "balanced_accuracy": []},
-        "val": {"loss": [], "accuracy": [], "balanced_accuracy": []},
+        "train": {"loss": [], "accuracy": [], "balanced_accuracy": [], "auc": []},
+        "val": {"loss": [], "accuracy": [], "balanced_accuracy": [], "auc": []},
     }
 
     print(f"Best checkpoint metric: {metric_name}")
     for epoch_idx in tqdm(range(int(config["epochs"]))):
         epoch = epoch_idx + 1
+        train_dataset.set_epoch(epoch_idx)
         train_metrics = train_epoch(
             model,
             train_loader,
             criterion,
             optimizer,
             device,
-            float(config.get("gradient_clip_norm", 1.0)),
+            (
+                float(config.get("gradient_clip_norm", 1.0))
+                if bool(config.get("use_gradient_clipping", False))
+                else 0.0
+            ),
             gradient_accumulation_steps,
         )
         val_metrics = validate(model, val_loader, criterion, device)
-        scheduler.step(float(val_metrics["loss"]))
+        if bool(config.get("use_lr_scheduler", False)):
+            scheduler.step(float(val_metrics["loss"]))
 
         for split_name, metrics in (("train", train_metrics), ("val", val_metrics)):
-            for key in ["loss", "accuracy", "balanced_accuracy"]:
+            for key in ["loss", "accuracy", "balanced_accuracy", "auc"]:
                 history[split_name][key].append(float(metrics[key]))
 
         tqdm.write(
@@ -602,6 +805,7 @@ def main() -> None:
             "bal_acc "
             f"{train_metrics['balanced_accuracy']:.4f}/"
             f"{val_metrics['balanced_accuracy']:.4f}"
+            f", auc {train_metrics['auc']:.4f}/{val_metrics['auc']:.4f}"
         )
 
         current_metric = float(val_metrics[metric_key])
@@ -624,6 +828,7 @@ def main() -> None:
                 epoch,
                 config,
                 val_metrics,
+                train_dataset.class_folders,
             )
             report = classification_report(
                 val_metrics["labels"],
@@ -667,6 +872,26 @@ def main() -> None:
         epoch,
         config,
         val_metrics,
+        train_dataset.class_folders,
+    )
+    best_checkpoint = torch.load(
+        config["paths"]["checkpoint"], map_location=device, weights_only=False
+    )
+    model.load_state_dict(best_checkpoint["model_state_dict"])
+    test_metrics = validate(model, test_loader, criterion, device)
+    save_json(
+        config["paths"]["training_report"],
+        {
+            "repeat_index": repeat_index,
+            "random_seed": int(config["random_seed"]),
+            "best_epoch": best_epoch,
+            "best_checkpoint_metric": metric_name,
+            "best_metric_value": best_metric,
+            "best_val_loss": best_loss,
+            "val_metrics": best_checkpoint["metrics"],
+            "test_metrics": test_metrics,
+            "class_folders": train_dataset.class_folders,
+        },
     )
     save_json(
         config["paths"]["training_history"],

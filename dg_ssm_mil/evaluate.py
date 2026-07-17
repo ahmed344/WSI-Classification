@@ -23,7 +23,7 @@ try:
     from .config_loader import load_config, resolve_device, resolve_feature_file_suffix
     from .dataset import collate_fn, get_class_sample_counts
     from .model import DGSSMMILModel
-    from .train import create_datasets
+    from .train import _safe_multiclass_auc, create_datasets
 except ImportError:
     from config_loader import (  # type: ignore
         load_config,
@@ -32,7 +32,7 @@ except ImportError:
     )
     from dataset import collate_fn, get_class_sample_counts  # type: ignore
     from model import DGSSMMILModel  # type: ignore
-    from train import create_datasets  # type: ignore
+    from train import _safe_multiclass_auc, create_datasets  # type: ignore
 
 sns.set_theme(style="white")
 
@@ -127,7 +127,10 @@ def evaluate_split(
             masks = batch["masks"].to(device)
             labels = batch["labels"].to(device)
 
-            outputs = model(features, coords, masks)
+            tissue_indices = batch.get("tissue_indices")
+            if tissue_indices is not None:
+                tissue_indices = tissue_indices.to(device)
+            outputs = model(features, coords, masks, tissue_indices=tissue_indices)
             probs = torch.softmax(outputs["logits"], dim=1)
             preds = torch.argmax(outputs["logits"], dim=1)
 
@@ -150,6 +153,7 @@ def evaluate_split(
     return {
         "accuracy": float(accuracy_score(all_labels, all_preds)),
         "balanced_accuracy": float(balanced_accuracy_score(all_labels, all_preds)),
+        "auc": _safe_multiclass_auc(all_labels, all_probs),
         "confusion_matrix": cm,
         "classification_report": report,
         "predictions": all_preds,
@@ -223,6 +227,7 @@ def save_split_results(
         "split": split,
         "accuracy": float(metrics["accuracy"]),
         "balanced_accuracy": float(metrics["balanced_accuracy"]),
+        "auc": float(metrics["auc"]),
         "confusion_matrix": metrics["confusion_matrix"].tolist(),
         "classification_report": metrics["classification_report"],
         "labels": [int(label) for label in metrics["labels"]],
@@ -281,7 +286,8 @@ def print_split_summary(metrics: Dict[str, Any], split: str) -> None:
     """
     print(
         f"{split}: accuracy={metrics['accuracy']:.4f}, "
-        f"balanced_accuracy={metrics['balanced_accuracy']:.4f}"
+        f"balanced_accuracy={metrics['balanced_accuracy']:.4f}, "
+        f"auc={metrics['auc']:.4f}"
     )
 
 
@@ -339,6 +345,9 @@ def main() -> None:
     args = parse_args()
     config = load_config(args.config)
     checkpoint_path = args.checkpoint or config["paths"]["checkpoint"]
+    if args.checkpoint is None and not os.path.exists(checkpoint_path):
+        parent, filename = os.path.split(checkpoint_path)
+        checkpoint_path = os.path.join(parent, "repeat_00", filename)
     output_dir = args.output_dir or config["paths"]["evaluation_output"]
     device = torch.device(resolve_device(config))
 
@@ -348,10 +357,19 @@ def main() -> None:
         f"Using feature model '{config['feature_model']}' "
         f"with suffix '{resolve_feature_file_suffix(config)}'"
     )
-    model, _ = load_trained_model(checkpoint_path, device)
-    train_dataset, val_dataset = create_datasets(config)
+    model, checkpoint = load_trained_model(checkpoint_path, device)
+    checkpoint_config = checkpoint["config"]
+    class_folders = checkpoint.get("class_folders")
+    if not class_folders:
+        raise KeyError("Checkpoint is missing frozen 'class_folders'.")
+    train_dataset, val_dataset, test_dataset = create_datasets(
+        checkpoint_config,
+        class_folders=class_folders,
+        apply_training_filter=False,
+    )
     run_split_evaluation(model, train_dataset, config, device, "train", output_dir)
     run_split_evaluation(model, val_dataset, config, device, "val", output_dir)
+    run_split_evaluation(model, test_dataset, config, device, "test", output_dir)
 
 
 if __name__ == "__main__":

@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--split",
-        choices=["train", "val"],
+        choices=["train", "val", "test"],
         default=None,
         help="Dataset split to visualize. Defaults to visualization.split.",
     )
@@ -107,12 +107,19 @@ def create_dataset_for_split(
         class_folders=class_folders,
         split=split,
         train_ratio=float(config["train_ratio"]),
+        val_ratio=float(config.get("val_ratio", 0.1)),
+        test_ratio=float(config.get("test_ratio", 0.1)),
         random_seed=int(config["random_seed"]),
         feature_file_suffix=resolve_feature_file_suffix(config),
         coordinate_columns=get_coordinate_columns(config),
-        coordinate_mismatch=str(config.get("coordinate_mismatch", "trim")),
-        sort_tiles_spatially=bool(config.get("sort_tiles_spatially", True)),
-        normalize_coordinates=bool(config.get("normalize_coordinates", True)),
+        coordinate_mismatch=str(config.get("coordinate_mismatch", "error")),
+        sort_tiles_spatially=bool(config.get("sort_tiles_spatially", False)),
+        normalize_coordinates=bool(config.get("normalize_coordinates", False)),
+        max_tiles_per_tissue=config.get(f"max_tiles_per_tissue_{split}"),
+        expected_feature_dim=int(config["input_dim"]),
+        bag_level=str(config.get("bag_level", "tissue")),
+        tile_sampling=str(config.get("tile_sampling", "random")),
+        feature_normalization=str(config.get("feature_normalization", "none")),
     )
 
 
@@ -183,9 +190,12 @@ def normalize_attention(attention: np.ndarray) -> np.ndarray:
     Returns:
         np.ndarray: Normalized attention weights with shape `[n_tiles]`.
     """
-    min_value = float(np.min(attention))
-    max_value = float(np.max(attention))
-    return (attention - min_value) / (max_value - min_value + 1e-8)
+    if len(attention) <= 1:
+        return np.zeros_like(attention, dtype=np.float32)
+    order = np.argsort(attention, kind="stable")
+    ranks = np.empty_like(order, dtype=np.float32)
+    ranks[order] = np.arange(len(attention), dtype=np.float32)
+    return ranks / float(len(attention) - 1)
 
 
 def select_top_attention_indices(
@@ -340,10 +350,11 @@ def visualize_attention_heatmap(
     configure_spatial_axis(axes[1], tile_coords, tile_size)
     scalar_mappable = plt.cm.ScalarMappable(
         cmap=plt.cm.jet,
-        norm=plt.Normalize(vmin=float(attention.min()), vmax=float(attention.max())),
+        norm=plt.Normalize(vmin=0.0, vmax=100.0),
     )
     scalar_mappable.set_array([])
     plt.colorbar(scalar_mappable, ax=axes[1], orientation="vertical", pad=0.05)
+    axes[1].set_title("Attention percentile")
 
     fig.suptitle(
         f"Slide: {slide_name} | Tissue: {tissue_name}\n"
@@ -450,7 +461,12 @@ def generate_attention_heatmaps(
     device = torch.device(resolve_device(config))
     model, checkpoint = load_trained_model(checkpoint_path, device)
     class_folders = checkpoint.get("class_folders")
-    dataset = create_dataset_for_split(config, split, class_folders=class_folders)
+    if not class_folders:
+        raise KeyError("Checkpoint is missing frozen 'class_folders'.")
+    checkpoint_config = checkpoint["config"]
+    dataset = create_dataset_for_split(
+        checkpoint_config, split, class_folders=class_folders
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=1,
@@ -459,7 +475,7 @@ def generate_attention_heatmaps(
         num_workers=int(config.get("num_workers", 0)),
     )
     class_names = dataset.class_folders
-    coordinate_columns = get_coordinate_columns(config)
+    coordinate_columns = get_coordinate_columns(checkpoint_config)
     vis_config = config.get("visualization", {}) or {}
     tile_size = int(vis_config.get("tile_size", 448))
     thumbnail_size = int(vis_config.get("thumbnail_size", 512))
@@ -482,7 +498,15 @@ def generate_attention_heatmaps(
             coords = batch["coords"].to(device)
             masks = batch["masks"].to(device)
             labels = batch["labels"].to(device)
-            outputs = model(features, coords, masks)
+            tissue_indices = batch.get("tissue_indices")
+            if tissue_indices is not None:
+                tissue_indices = tissue_indices.to(device)
+            outputs = model(
+                features,
+                coords,
+                masks,
+                tissue_indices=tissue_indices,
+            )
             logits = outputs["logits"]
             probabilities = torch.softmax(logits, dim=1)
             predicted_label = int(torch.argmax(logits, dim=1).cpu().item())
@@ -490,6 +514,9 @@ def generate_attention_heatmaps(
             attention = outputs["attention_weights"][0].detach().cpu().numpy()
             valid_mask = masks[0].detach().cpu().numpy()
             attention = attention[valid_mask]
+            selected_tile_indices = (
+                batch["tile_indices"][0][batch["masks"][0]].detach().cpu().numpy()
+            )
 
             slide_name = batch["slide_names"][0]
             tissue_name = batch["tissue_names"][0]
@@ -498,9 +525,18 @@ def generate_attention_heatmaps(
             tile_coords = load_raw_coordinates(
                 tiles_path,
                 coordinate_columns,
-                bool(config.get("sort_tiles_spatially", True)),
+                False,
             )
-            attention, tile_coords = align_attention_and_coordinates(attention, tile_coords)
+            if np.any(selected_tile_indices < 0) or np.any(
+                selected_tile_indices >= len(tile_coords)
+            ):
+                raise ValueError(
+                    f"Invalid retained tile indices for {tiles_path}: "
+                    f"CSV has {len(tile_coords)} rows."
+                )
+            tile_coords = tile_coords[selected_tile_indices]
+            if len(attention) != len(tile_coords):
+                raise ValueError("Attention and retained coordinate counts differ.")
             top_indices = select_top_attention_indices(
                 attention,
                 int(top_k_tiles) if top_k_tiles is not None else None,
@@ -587,6 +623,9 @@ def main() -> None:
     if max_tissues is not None:
         max_tissues = int(max_tissues)
     checkpoint_path = args.checkpoint or config["paths"]["checkpoint"]
+    if args.checkpoint is None and not os.path.exists(checkpoint_path):
+        parent, filename = os.path.split(checkpoint_path)
+        checkpoint_path = os.path.join(parent, "repeat_00", filename)
     output_dir = args.output_dir or config["paths"]["attention_output"]
 
     print(f"Using feature model '{config['feature_model']}'")

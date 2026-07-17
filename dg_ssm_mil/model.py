@@ -1,16 +1,17 @@
 """
 DG-SSM-MIL model components for tissue-level WSI classification.
 """
-from math import sqrt
 from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATv2Conv, knn_graph
+from einops import rearrange
+from torch_geometric.nn import GATConv, knn_graph
 
 try:
     from mamba_ssm.modules.mamba_simple import Mamba
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 except ImportError as exc:  # pragma: no cover - exercised only when dependency is absent.
     raise ImportError(
         "DGSSMMILModel requires mamba-ssm. Install mamba-ssm before importing model.py."
@@ -43,7 +44,7 @@ class SpatialGATEncoder(nn.Module):
         """
         super().__init__()
         self.spatial_knn_k = spatial_knn_k
-        self.gat = GATv2Conv(
+        self.gat = GATConv(
             hidden_dim,
             hidden_dim,
             heads=gat_heads,
@@ -51,14 +52,13 @@ class SpatialGATEncoder(nn.Module):
             dropout=dropout,
             add_self_loops=True,
         )
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
         features: torch.Tensor,
         coords: torch.Tensor,
         mask: torch.Tensor,
+        tissue_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Apply spatial graph attention to each tissue in a padded batch.
@@ -67,6 +67,8 @@ class SpatialGATEncoder(nn.Module):
             features (torch.Tensor): Padded feature tensor `[B, N, D]`.
             coords (torch.Tensor): Padded coordinate tensor `[B, N, 2]`.
             mask (torch.Tensor): Boolean valid-tile mask `[B, N]`.
+            tissue_indices (Optional[torch.Tensor]): Tissue membership per tile
+                `[B, N]`. When supplied, k-NN edges never cross tissue boundaries.
 
         Returns:
             torch.Tensor: Graph-enhanced features with shape `[B, N, D]`.
@@ -81,15 +83,27 @@ class SpatialGATEncoder(nn.Module):
                 batch_outputs[batch_idx, :valid_count] = node_features
                 continue
             node_coords = coords[batch_idx, :valid_count]
-            k_neighbors = min(self.spatial_knn_k, valid_count - 1)
-            edge_index = knn_graph(
-                node_coords,
-                k=k_neighbors,
-                loop=False,
-                flow="source_to_target",
-            )
+            edge_parts = []
+            if tissue_indices is None:
+                groups = torch.zeros(valid_count, dtype=torch.long, device=features.device)
+            else:
+                groups = tissue_indices[batch_idx, :valid_count]
+            for tissue_id in torch.unique(groups):
+                group_nodes = torch.nonzero(groups == tissue_id, as_tuple=False).flatten()
+                if group_nodes.numel() <= 1:
+                    continue
+                local_edges = knn_graph(
+                    node_coords[group_nodes],
+                    k=min(self.spatial_knn_k, int(group_nodes.numel()) - 1),
+                    loop=False,
+                    flow="source_to_target",
+                )
+                edge_parts.append(group_nodes[local_edges])
+            if edge_parts:
+                edge_index = torch.cat(edge_parts, dim=1)
+            else:
+                edge_index = torch.empty((2, 0), dtype=torch.long, device=features.device)
             graph_features = self.gat(node_features, edge_index)
-            graph_features = self.norm(node_features + self.dropout(graph_features))
             batch_outputs[batch_idx, :valid_count] = graph_features
         return batch_outputs
 
@@ -104,6 +118,8 @@ class DynamicGraphFusion(nn.Module):
         hidden_dim: int,
         top_k: int = 6,
         chunk_size: int = 512,
+        lambda_weight: float = 0.5,
+        activation: str = "silu",
         dropout: float = 0.15,
     ) -> None:
         """
@@ -114,6 +130,8 @@ class DynamicGraphFusion(nn.Module):
             top_k (int): Number of dynamic cross-sequence neighbors per tile.
             chunk_size (int): Number of query tiles processed per dynamic graph
                 chunk to avoid materializing an `N x N` attention matrix.
+            lambda_weight (float): Blend coefficient lambda from Equation (10).
+            activation (str): Activation used for alpha and beta in Equation (12).
             dropout (float): Dropout probability in the fusion MLP.
 
         Returns:
@@ -122,19 +140,22 @@ class DynamicGraphFusion(nn.Module):
         super().__init__()
         self.top_k = top_k
         self.chunk_size = chunk_size
-        edge_dim = hidden_dim * 3
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(edge_dim, hidden_dim),
+        self.lambda_weight = lambda_weight
+        if not 0.0 <= lambda_weight <= 1.0:
+            raise ValueError("lambda_weight must be in [0, 1].")
+        activations = {"silu": nn.SiLU, "relu": nn.ReLU, "gelu": nn.GELU}
+        if activation not in activations:
+            raise ValueError(f"Unsupported dynamic graph activation: {activation}.")
+        self.edge_score_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, 1),
         )
-        self.gate = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.Sigmoid(),
-        )
-        self.output_norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
+        self.additive_transform = nn.Linear(hidden_dim, hidden_dim)
+        self.multiplicative_transform = nn.Linear(hidden_dim, hidden_dim)
+        self.alpha = activations[activation]()
+        self.beta = activations[activation]()
 
     def forward(
         self,
@@ -143,7 +164,7 @@ class DynamicGraphFusion(nn.Module):
         mask: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Fuse streams through top-k cross attention and gated residual updates.
+        Fuse streams using dynamic graph Equations (6) through (12).
 
         Args:
             projected_features (torch.Tensor): Projected features `[B, N, D]`.
@@ -153,47 +174,138 @@ class DynamicGraphFusion(nn.Module):
         Returns:
             torch.Tensor: Fused features of shape `[B, N, D]`.
         """
-        hidden_dim = projected_features.shape[-1]
-        aggregated = torch.zeros_like(projected_features)
+        batch_outputs = []
         for batch_idx in range(projected_features.shape[0]):
             valid_count = int(mask[batch_idx].sum().item())
             if valid_count <= 0:
+                batch_outputs.append(torch.zeros_like(projected_features[batch_idx]))
                 continue
             projected_valid = projected_features[batch_idx, :valid_count]
             graph_valid = graph_features[batch_idx, :valid_count]
-            top_k = min(self.top_k, valid_count)
+            top_k = min(self.top_k, max(1, valid_count - 1))
+            aggregated_chunks = []
             for start_idx in range(0, valid_count, self.chunk_size):
                 end_idx = min(start_idx + self.chunk_size, valid_count)
                 query_chunk = projected_valid[start_idx:end_idx]
-                scores = torch.matmul(
-                    query_chunk,
-                    graph_valid.transpose(0, 1),
-                ) / sqrt(hidden_dim)
-                top_scores, top_indices = torch.topk(scores, k=top_k, dim=-1)
-                top_weights = F.softmax(top_scores, dim=-1)
+                similarities = torch.matmul(query_chunk, graph_valid.transpose(0, 1))
+                omega = F.softmax(similarities, dim=-1)
+                if valid_count > 1:
+                    row_indices = torch.arange(
+                        start_idx, end_idx, device=projected_features.device
+                    )
+                    diagonal_mask = torch.zeros_like(omega, dtype=torch.bool)
+                    diagonal_mask[
+                        torch.arange(end_idx - start_idx, device=projected_features.device),
+                        row_indices,
+                    ] = True
+                    omega = omega.masked_fill(diagonal_mask, -1.0)
+                top_omega, top_indices = torch.topk(omega, k=top_k, dim=-1)
                 neighbor_features = graph_valid[top_indices]
                 query_features = query_chunk.unsqueeze(1).expand_as(neighbor_features)
-                edge_inputs = torch.cat(
-                    [
-                        query_features,
-                        neighbor_features,
-                        query_features * neighbor_features,
-                    ],
+                edge_features = (
+                    top_omega.unsqueeze(-1) * neighbor_features
+                    + (1.0 - top_omega.unsqueeze(-1)) * query_features
+                )
+                analytic_score = torch.sum(
+                    neighbor_features * torch.tanh(query_features + edge_features),
                     dim=-1,
                 )
-                edge_messages = self.edge_mlp(edge_inputs)
-                aggregated[batch_idx, start_idx:end_idx] = torch.sum(
-                    edge_messages * top_weights.unsqueeze(-1),
-                    dim=1,
+                learned_score = self.edge_score_mlp(
+                    torch.cat(
+                        [query_features, edge_features, neighbor_features],
+                        dim=-1,
+                    )
+                ).squeeze(-1)
+                epsilon = (
+                    (1.0 - self.lambda_weight) * analytic_score
+                    + self.lambda_weight * learned_score
                 )
-        gate_input = torch.cat(
-            [projected_features, aggregated, projected_features * aggregated],
-            dim=-1,
+                theta = F.softmax(epsilon, dim=-1)
+                aggregated_chunks.append(
+                    torch.sum(neighbor_features * theta.unsqueeze(-1), dim=1)
+                )
+            aggregated = torch.cat(aggregated_chunks, dim=0)
+            valid_output = self.alpha(
+                self.additive_transform(projected_valid + aggregated)
+            ) + self.beta(
+                self.multiplicative_transform(
+                    projected_valid * aggregated
+                )
+            )
+            batch_outputs.append(
+                F.pad(
+                    valid_output,
+                    (0, 0, 0, projected_features.shape[1] - valid_count),
+                )
+            )
+        output = torch.stack(batch_outputs, dim=0)
+        return output.masked_fill(~mask.unsqueeze(-1), 0.0)
+
+
+class NonCausalMamba(Mamba):
+    """
+    Mamba selective SSM with a same-length non-causal depthwise convolution.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Run a Mamba branch with symmetric convolution.
+
+        Args:
+            hidden_states (torch.Tensor): Input sequence `[B, N, D]`.
+
+        Returns:
+            torch.Tensor: Selective-SSM output `[B, N, D]`.
+        """
+        _, sequence_length, _ = hidden_states.shape
+        xz = self.in_proj(hidden_states).transpose(1, 2)
+        x, z = xz.chunk(2, dim=1)
+        left_padding = (self.d_conv - 1) // 2
+        right_padding = self.d_conv - 1 - left_padding
+        x = F.conv1d(
+            F.pad(x, (left_padding, right_padding)),
+            self.conv1d.weight,
+            self.conv1d.bias,
+            groups=self.d_inner,
         )
-        update_gate = self.gate(gate_input)
-        fused = projected_features + self.dropout(update_gate * aggregated)
-        fused = self.output_norm(fused)
-        return fused.masked_fill(~mask.unsqueeze(-1), 0.0)
+        x = self.act(x)
+        projected = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+        delta_rank, b_state, c_state = torch.split(
+            projected, [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
+        delta = self.dt_proj.weight @ delta_rank.transpose(0, 1)
+        delta = rearrange(delta, "d (b l) -> b d l", l=sequence_length)
+        b_state = rearrange(
+            b_state, "(b l) n -> b n l", l=sequence_length
+        ).contiguous()
+        c_state = rearrange(
+            c_state, "(b l) n -> b n l", l=sequence_length
+        ).contiguous()
+        state_matrix = -torch.exp(self.A_log.float())
+        if x.is_cuda:
+            y = selective_scan_fn(
+                x,
+                delta,
+                state_matrix,
+                b_state,
+                c_state,
+                self.D.float(),
+                z=z,
+                delta_bias=self.dt_proj.bias.float(),
+                delta_softplus=True,
+            )
+        else:
+            y = _selective_scan_reference(
+                x,
+                delta,
+                state_matrix,
+                b_state,
+                c_state,
+                self.D.float(),
+                z,
+                self.dt_proj.bias.float(),
+            )
+        return self.out_proj(y.transpose(1, 2))
 
 
 class BidirectionalMambaBlock(nn.Module):
@@ -210,6 +322,7 @@ class BidirectionalMambaBlock(nn.Module):
         use_conv_branch: bool = True,
         conv_kernel_size: int = 3,
         dropout: float = 0.15,
+        use_residual: bool = False,
     ) -> None:
         """
         Initialize the bidirectional Mamba block.
@@ -222,41 +335,39 @@ class BidirectionalMambaBlock(nn.Module):
             use_conv_branch (bool): Whether to include a non-causal Conv1d branch.
             conv_kernel_size (int): Kernel size for the local Conv1d branch.
             dropout (float): Dropout probability after stream fusion.
+            use_residual (bool): Whether to add a project-specific outer residual.
 
         Returns:
             None: This constructor initializes module layers in-place.
         """
         super().__init__()
         self.use_conv_branch = use_conv_branch
+        self.use_residual = use_residual
         self.input_norm = nn.LayerNorm(hidden_dim)
-        self.forward_mamba = Mamba(
+        self.input_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.forward_mamba = NonCausalMamba(
             d_model=hidden_dim,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand,
         )
-        self.backward_mamba = Mamba(
+        self.backward_mamba = NonCausalMamba(
             d_model=hidden_dim,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand,
         )
         if use_conv_branch:
-            padding = conv_kernel_size // 2
-            self.conv_branch = nn.Sequential(
-                nn.Conv1d(
-                    hidden_dim,
-                    hidden_dim,
-                    kernel_size=conv_kernel_size,
-                    padding=padding,
-                    groups=1,
-                ),
-                nn.SiLU(),
+            self.conv_branch = nn.Conv1d(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=conv_kernel_size,
+                padding="same",
+                groups=hidden_dim,
             )
         else:
             self.conv_branch = None
         self.fusion = nn.Linear(hidden_dim, hidden_dim)
-        self.output_norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -270,20 +381,21 @@ class BidirectionalMambaBlock(nn.Module):
         Returns:
             torch.Tensor: Sequence features after bidirectional SSM processing.
         """
-        normalized = self.input_norm(features).masked_fill(~mask.unsqueeze(-1), 0.0)
-        forward_out = self.forward_mamba(normalized)
-        reversed_input = _reverse_valid_prefix(normalized, mask)
+        normalized = self.input_norm(features)
+        projected = self.input_projection(normalized).masked_fill(~mask.unsqueeze(-1), 0.0)
+        forward_out = self.forward_mamba(projected)
+        reversed_input = _reverse_valid_prefix(projected, mask)
         backward_reversed = self.backward_mamba(reversed_input)
         backward_out = _reverse_valid_prefix(backward_reversed, mask)
 
         combined = forward_out + backward_out
         if self.conv_branch is not None:
-            conv_input = normalized.transpose(1, 2)
-            conv_out = self.conv_branch(conv_input).transpose(1, 2)
+            conv_out = F.silu(self.conv_branch(projected.transpose(1, 2))).transpose(1, 2)
             combined = combined + conv_out
 
-        combined = self.fusion(combined)
-        output = self.output_norm(features + self.dropout(combined))
+        output = self.dropout(self.fusion(combined))
+        if self.use_residual:
+            output = features + output
         return output.masked_fill(~mask.unsqueeze(-1), 0.0)
 
 
@@ -384,13 +496,17 @@ class DGSSMMILModel(nn.Module):
         gat_dropout: float = 0.15,
         dynamic_graph_top_k: int = 6,
         dynamic_graph_chunk_size: int = 512,
+        dynamic_graph_lambda: float = 0.5,
+        dynamic_graph_activation: str = "silu",
         dynamic_graph_dropout: float = 0.15,
+        use_mamba_block: bool = True,
         mamba_d_state: int = 16,
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
         use_conv_branch: bool = True,
         conv_kernel_size: int = 3,
         block_dropout: float = 0.15,
+        use_ssm_residual: bool = False,
         attention_hidden_dim: int = 256,
         classifier_dropout: float = 0.3,
         attention_type: str = "standard",
@@ -409,13 +525,18 @@ class DGSSMMILModel(nn.Module):
             dynamic_graph_top_k (int): Top-k value for dynamic graph fusion.
             dynamic_graph_chunk_size (int): Query chunk size for memory-efficient
                 dynamic graph top-k attention.
+            dynamic_graph_lambda (float): Lambda blend from dynamic graph Equation (10).
+            dynamic_graph_activation (str): Alpha/beta activation from Equation (12).
             dynamic_graph_dropout (float): Dropout in dynamic graph fusion.
+            use_mamba_block (bool): Whether to process fused features with the
+                bidirectional Mamba block before MIL pooling.
             mamba_d_state (int): Mamba state dimension.
             mamba_d_conv (int): Mamba internal convolution width.
             mamba_expand (int): Mamba expansion factor.
             use_conv_branch (bool): Whether to include a Conv1d branch in Bi-SSM.
             conv_kernel_size (int): Conv1d branch kernel size.
             block_dropout (float): Dropout after SSM branch fusion.
+            use_ssm_residual (bool): Enable a non-paper outer SSM residual.
             attention_hidden_dim (int): Hidden dimension for ABMIL attention.
             classifier_dropout (float): Dropout before final classifier.
             attention_type (str): Bag-level MIL attention scorer type.
@@ -426,8 +547,6 @@ class DGSSMMILModel(nn.Module):
         super().__init__()
         self.feature_projection = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
             nn.Dropout(projection_dropout),
         )
         self.spatial_encoder = SpatialGATEncoder(
@@ -440,17 +559,26 @@ class DGSSMMILModel(nn.Module):
             hidden_dim=hidden_dim,
             top_k=dynamic_graph_top_k,
             chunk_size=dynamic_graph_chunk_size,
+            lambda_weight=dynamic_graph_lambda,
+            activation=dynamic_graph_activation,
             dropout=dynamic_graph_dropout,
         )
-        self.sequence_block = BidirectionalMambaBlock(
-            hidden_dim=hidden_dim,
-            d_state=mamba_d_state,
-            d_conv=mamba_d_conv,
-            expand=mamba_expand,
-            use_conv_branch=use_conv_branch,
-            conv_kernel_size=conv_kernel_size,
-            dropout=block_dropout,
-        )
+        self.use_mamba_block = use_mamba_block
+        if use_mamba_block:
+            self.sequence_block: Optional[BidirectionalMambaBlock] = (
+                BidirectionalMambaBlock(
+                    hidden_dim=hidden_dim,
+                    d_state=mamba_d_state,
+                    d_conv=mamba_d_conv,
+                    expand=mamba_expand,
+                    use_conv_branch=use_conv_branch,
+                    conv_kernel_size=conv_kernel_size,
+                    dropout=block_dropout,
+                    use_residual=use_ssm_residual,
+                )
+            )
+        else:
+            self.sequence_block = None
         self.pooling = ABMILPooling(
             hidden_dim=hidden_dim,
             attention_hidden_dim=attention_hidden_dim,
@@ -464,6 +592,7 @@ class DGSSMMILModel(nn.Module):
         features: torch.Tensor,
         coords: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
+        tissue_indices: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Run DG-SSM-MIL inference on a padded tissue batch.
@@ -472,6 +601,8 @@ class DGSSMMILModel(nn.Module):
             features (torch.Tensor): Padded input features `[B, N, input_dim]`.
             coords (torch.Tensor): Padded coordinates `[B, N, 2]`.
             mask (Optional[torch.Tensor]): Boolean valid-tile mask `[B, N]`.
+            tissue_indices (Optional[torch.Tensor]): Optional tissue membership
+                indices `[B, N]` used to prevent cross-tissue spatial edges.
 
         Returns:
             Dict[str, torch.Tensor]: Outputs containing `logits`,
@@ -483,11 +614,17 @@ class DGSSMMILModel(nn.Module):
                 dtype=torch.bool,
                 device=features.device,
             )
+        _validate_model_inputs(features, coords, mask, tissue_indices)
         projected = self.feature_projection(features)
         projected = projected.masked_fill(~mask.unsqueeze(-1), 0.0)
-        graph_features = self.spatial_encoder(projected, coords, mask)
+        graph_features = self.spatial_encoder(
+            projected, coords, mask, tissue_indices=tissue_indices
+        )
         fused_features = self.dynamic_fusion(projected, graph_features, mask)
-        sequence_features = self.sequence_block(fused_features, mask)
+        if self.sequence_block is None:
+            sequence_features = fused_features
+        else:
+            sequence_features = self.sequence_block(fused_features, mask)
         logits, attention_weights, pooled_features = self.pooling(sequence_features, mask)
         return {
             "logits": logits,
@@ -520,37 +657,110 @@ class DGSSMMILModel(nn.Module):
             gat_dropout=float(config.get("gat_dropout", 0.15)),
             dynamic_graph_top_k=int(config.get("dynamic_graph_top_k", 6)),
             dynamic_graph_chunk_size=int(config.get("dynamic_graph_chunk_size", 512)),
+            dynamic_graph_lambda=float(config.get("dynamic_graph_lambda", 0.5)),
+            dynamic_graph_activation=str(
+                config.get("dynamic_graph_activation", "silu")
+            ),
             dynamic_graph_dropout=float(config.get("dynamic_graph_dropout", 0.15)),
+            use_mamba_block=bool(config.get("use_mamba_block", True)),
             mamba_d_state=int(config.get("mamba_d_state", 16)),
             mamba_d_conv=int(config.get("mamba_d_conv", 4)),
             mamba_expand=int(config.get("mamba_expand", 2)),
             use_conv_branch=bool(config.get("use_conv_branch", True)),
             conv_kernel_size=int(config.get("conv_kernel_size", 3)),
             block_dropout=float(config.get("block_dropout", 0.15)),
+            use_ssm_residual=bool(config.get("use_ssm_residual", False)),
             attention_hidden_dim=int(config.get("attention_hidden_dim", 256)),
             classifier_dropout=float(config.get("classifier_dropout", 0.3)),
             attention_type=str(config.get("attention_type", "standard")),
         )
 
 
-def _batched_gather_nodes(
-    nodes: torch.Tensor,
-    indices: torch.Tensor,
-) -> torch.Tensor:
+def _validate_model_inputs(
+    features: torch.Tensor,
+    coords: torch.Tensor,
+    mask: torch.Tensor,
+    tissue_indices: Optional[torch.Tensor],
+) -> None:
     """
-    Gather node features for batched top-k indices.
+    Validate padded DG-SSM-MIL model inputs.
 
     Args:
-        nodes (torch.Tensor): Node tensor of shape `[B, N, D]`.
-        indices (torch.Tensor): Index tensor of shape `[B, N, K]`.
+        features (torch.Tensor): Feature tensor `[B, N, D]`.
+        coords (torch.Tensor): Coordinate tensor `[B, N, 2]`.
+        mask (torch.Tensor): Boolean validity mask `[B, N]`.
+        tissue_indices (Optional[torch.Tensor]): Optional tissue IDs `[B, N]`.
 
     Returns:
-        torch.Tensor: Gathered tensor of shape `[B, N, K, D]`.
+        None: Raises a descriptive exception for invalid inputs.
     """
-    feature_dim = nodes.shape[-1]
-    expanded_nodes = nodes.unsqueeze(1).expand(-1, indices.shape[1], -1, -1)
-    expanded_indices = indices.unsqueeze(-1).expand(-1, -1, -1, feature_dim)
-    return torch.gather(expanded_nodes, dim=2, index=expanded_indices)
+    if features.ndim != 3:
+        raise ValueError("features must have shape [B, N, D].")
+    if coords.shape != (*features.shape[:2], 2):
+        raise ValueError("coords must have shape [B, N, 2].")
+    if mask.shape != features.shape[:2] or mask.dtype != torch.bool:
+        raise ValueError("mask must be boolean with shape [B, N].")
+    if torch.any(mask.sum(dim=1) == 0):
+        raise ValueError("All-empty bags are not supported.")
+    if tissue_indices is not None and tissue_indices.shape != mask.shape:
+        raise ValueError("tissue_indices must have shape [B, N].")
+    if not torch.isfinite(features).all():
+        raise ValueError("features contain non-finite values.")
+    if not torch.isfinite(coords.masked_select(mask.unsqueeze(-1))).all():
+        raise ValueError("valid coordinates contain non-finite values.")
+
+
+def _selective_scan_reference(
+    x: torch.Tensor,
+    delta: torch.Tensor,
+    state_matrix: torch.Tensor,
+    b_state: torch.Tensor,
+    c_state: torch.Tensor,
+    skip: torch.Tensor,
+    gate: torch.Tensor,
+    delta_bias: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Run a differentiable PyTorch selective scan for CPU portability.
+
+    Args:
+        x (torch.Tensor): SSM input `[B, D, N]`.
+        delta (torch.Tensor): Input-dependent step sizes `[B, D, N]`.
+        state_matrix (torch.Tensor): Continuous state matrix `[D, S]`.
+        b_state (torch.Tensor): Input-dependent B values `[B, S, N]`.
+        c_state (torch.Tensor): Input-dependent C values `[B, S, N]`.
+        skip (torch.Tensor): Skip parameter `[D]`.
+        gate (torch.Tensor): Mamba gate values `[B, D, N]`.
+        delta_bias (torch.Tensor): Learned delta bias `[D]`.
+
+    Returns:
+        torch.Tensor: Selective scan output `[B, D, N]`.
+    """
+    step = F.softplus(delta + delta_bias.view(1, -1, 1))
+    state = torch.zeros(
+        x.shape[0],
+        x.shape[1],
+        state_matrix.shape[1],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    outputs = []
+    state_matrix = state_matrix.to(dtype=x.dtype)
+    for token_idx in range(x.shape[-1]):
+        token_step = step[:, :, token_idx]
+        transition = torch.exp(token_step.unsqueeze(-1) * state_matrix)
+        input_update = (
+            token_step.unsqueeze(-1)
+            * b_state[:, :, token_idx].unsqueeze(1)
+            * x[:, :, token_idx].unsqueeze(-1)
+        )
+        state = transition * state + input_update
+        token_output = torch.sum(
+            state * c_state[:, :, token_idx].unsqueeze(1), dim=-1
+        )
+        token_output = token_output + skip * x[:, :, token_idx]
+        outputs.append(token_output * F.silu(gate[:, :, token_idx]))
+    return torch.stack(outputs, dim=-1)
 
 
 def _reverse_valid_prefix(features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
