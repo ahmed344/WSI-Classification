@@ -25,10 +25,12 @@ try:
     from .clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
     from .clam_model import CLAM_MB, CLAM_SB
     from .config_loader import load_config
+    from .losses import GeneralizedCrossEntropyLoss
 except ImportError:
     from clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
     from clam_model import CLAM_MB, CLAM_SB
     from config_loader import load_config
+    from losses import GeneralizedCrossEntropyLoss
 
 
 MODEL_SCHEMA = "canonical_clam_v1"
@@ -169,6 +171,34 @@ def compute_sample_weights(
     ]
 
 
+def create_classification_criterion(
+    config: Mapping[str, Any],
+    class_weights: Optional[torch.Tensor] = None,
+) -> GeneralizedCrossEntropyLoss:
+    """Create the configured bag-level classification criterion.
+
+    Args:
+        config (Mapping[str, Any]): Configuration containing ``q``, ``epsilon``,
+            and the class-weighting switch.
+        class_weights (Optional[torch.Tensor]): Optional class weights shaped
+            ``[C]``.
+
+    Returns:
+        GeneralizedCrossEntropyLoss: Configured loss module. A ``q`` value of
+            zero recovers cross entropy.
+    """
+    weight = (
+        class_weights
+        if bool(config.get("use_class_weighted_loss", False))
+        else None
+    )
+    return GeneralizedCrossEntropyLoss(
+        q=float(config.get("q", 0.0)),
+        epsilon=float(config.get("epsilon", 0.0)),
+        weight=weight,
+    )
+
+
 def resolve_best_checkpoint_metric(metric_name: str) -> Tuple[str, bool, str]:
     """Resolve a configured checkpoint metric and optimization direction.
 
@@ -307,7 +337,7 @@ def _run_epoch(
     Args:
         model (nn.Module): Canonical CLAM model.
         dataloader (DataLoader): Bag DataLoader.
-        criterion (nn.Module): Bag-level cross-entropy criterion.
+        criterion (nn.Module): Bag-level classification criterion.
         device (torch.device): Compute device.
         bag_weight (float): Classification-loss mixture weight.
         optimizer (Optional[optim.Optimizer]): Optimizer, or ``None`` for validation.
@@ -387,7 +417,7 @@ def train_epoch(
     Args:
         model (nn.Module): Canonical CLAM model.
         dataloader (DataLoader): Training bag DataLoader.
-        criterion (nn.Module): Bag-level cross-entropy criterion.
+        criterion (nn.Module): Bag-level classification criterion.
         optimizer (optim.Optimizer): Single Adam optimizer.
         device (torch.device): Compute device.
         bag_weight (float): Classification-loss mixture weight.
@@ -419,7 +449,7 @@ def validate(
     Args:
         model (nn.Module): Canonical CLAM model.
         dataloader (DataLoader): Validation bag DataLoader.
-        criterion (nn.Module): Bag-level cross-entropy criterion.
+        criterion (nn.Module): Bag-level classification criterion.
         device (torch.device): Compute device.
         bag_weight (float): Classification-loss mixture weight.
 
@@ -529,11 +559,10 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
     train_loader = _make_loader(train_dataset, config, True, class_weights)
     val_loader = _make_loader(val_dataset, config, False)
     model = create_model(config).to(device)
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights.to(device)
-        if bool(config.get("use_class_weighted_loss", False))
-        else None
-    )
+    criterion = create_classification_criterion(
+        config,
+        class_weights.to(device),
+    ).to(device)
     optimizer = optim.Adam(
         model.parameters(),
         lr=float(config["lr_cls"]),

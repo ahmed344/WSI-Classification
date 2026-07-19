@@ -28,7 +28,7 @@ dropout: 0.25  # Dropout in the shared embedding and attention projections
 num_classes: 5  # Number of slide-level target classes
 k_sample: 8  # Number of positive/negative instances sampled per bag
 subtyping: true  # Apply out-of-class instance supervision
-bag_weight: 0.7  # Weight of bag loss; instance loss receives 1 - bag_weight
+bag_weight: 0.5  # Weight of bag loss; instance loss receives 1 - bag_weight
 
 # Training parameters
 batch_size: 128  # Physical number of variable-length bags per micro-batch
@@ -40,14 +40,16 @@ max_tiles_per_bag:  # Applied after constructing a complete tissue or slide bag
   val: null
   test: null
 tile_sampling: "random"  # Options: random, uniform, first
-epochs: 1000  # Maximum number of training epochs
+epochs: 100  # Maximum number of training epochs
 lr_cls: 0.0001  # Initial learning rate for classification-related parameters
 lr_scheduler_factor_cls: 0.5  # ReduceLROnPlateau factor for classification branch
-lr_scheduler_patience_cls: 3  # ReduceLROnPlateau patience for classification branch
+lr_scheduler_patience_cls: 5  # ReduceLROnPlateau patience for classification branch
 use_weighted_sampler: true  # If true, train DataLoader uses WeightedRandomSampler
-use_class_weighted_loss: false  # If true, CrossEntropyLoss uses inverse-frequency class weights
+use_class_weighted_loss: false  # Apply inverse-frequency class weights to the bag-level loss
+q: 0.9  # Generalized cross-entropy exponent; 0 recovers standard cross entropy
+epsilon: 0.1  # Label-smoothing strength in [0, 1); 0 disables smoothing
 best_checkpoint_metric: "balanced_accuracy"  # Options: balanced_accuracy, accuracy, loss, classification_loss, instance_loss
-weight_decay_cls: 0.01  # Weight decay for feature projection, attention branches, and classifier
+weight_decay_cls: 0.0001  # Weight decay for feature projection, attention branches, and classifier
 train_ratio: 0.8  # Fraction of slides used for training split
 val_ratio: 0.1  # Fraction of slides used for validation split
 test_ratio: 0.1  # Fraction of slides used for test split

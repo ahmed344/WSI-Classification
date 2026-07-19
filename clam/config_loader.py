@@ -38,6 +38,8 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         raise ValueError(f"Configuration '{path}' must contain a YAML mapping.")
 
     config: Dict[str, Any] = dict(loaded)
+    config.setdefault("q", 0.0)
+    config.setdefault("epsilon", 0.0)
     _validate_config(config)
     config["input_dim"] = resolve_input_dim(config)
     config["feature_file_suffix"] = resolve_feature_file_suffix(config)
@@ -153,6 +155,12 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     bag_weight = _require_number(config, "bag_weight")
     if not 0.0 <= bag_weight <= 1.0:
         raise ValueError("Config key 'bag_weight' must be between 0 and 1.")
+    q = _require_number(config, "q")
+    if not 0.0 <= q <= 1.0:
+        raise ValueError("Config key 'q' must be between 0 and 1.")
+    epsilon = _require_number(config, "epsilon")
+    if not 0.0 <= epsilon < 1.0:
+        raise ValueError("Config key 'epsilon' must be in [0, 1).")
     for key in (
         "lr_cls",
         "lr_scheduler_factor_cls",
