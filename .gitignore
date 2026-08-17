@@ -2,6 +2,11 @@
 data/
 qp-projects/
 
+# Articles and presentations
+notebooks
+presentation
+reports
+
 # Images
 *.png
 *.jpg

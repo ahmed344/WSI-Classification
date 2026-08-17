@@ -107,6 +107,32 @@ python clam/evaluate_clam.py
 python clam/visualize_attention.py
 ```
 
+### DG-SSM-MIL
+
+The `dg_ssm_mil/` workflow implements the dynamic graph equations and
+Bi-SSM-vision block from Ding et al. (2025) for the five-class tissue task. It
+uses the same feature tensors and coordinate CSV files as CLAM and supports
+H-Optimus, UNI2-H, and GenBio through `dg_ssm_mil/config.yml`.
+
+```bash
+# One Monte Carlo repeat (useful for development)
+python -m dg_ssm_mil.train --repeat-index 0
+
+# All configured repeats (paper protocol defaults to 10)
+python -m dg_ssm_mil.train
+
+python -m dg_ssm_mil.evaluate
+python -m dg_ssm_mil.visualize_attention --split test
+python -m dg_ssm_mil.test_integration
+```
+
+The paper-faithful defaults use an 8-neighbor spatial graph, six dynamic
+neighbors, raw Euclidean coordinates, Adam with learning rate `2e-4` and weight
+decay `1e-5`, and slide-grouped 8:1:1 train/validation/test splits. Memory-saving
+tile caps and weighted sampling remain optional project extensions. The
+devcontainer supplies the required CUDA-compatible PyTorch Geometric,
+`torch-cluster`, and `mamba-ssm` packages.
+
 Optional utility to add/update OME magnification metadata:
 
 ```bash
