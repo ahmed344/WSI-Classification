@@ -451,6 +451,13 @@ def evaluate_checkpoint(
     runtime_config = load_config(config_path)
     checkpoint_path = Path(runtime_config["paths"]["checkpoint"])
     output_dir = str(runtime_config["paths"]["evaluation_output"])
+    print(f"Using checkpoint: {checkpoint_path}")
+    print(f"Evaluation output: {output_dir}")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}. "
+            "Train CLAM first or set paths.checkpoint explicitly."
+        )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if checkpoint.get("model_schema") != MODEL_SCHEMA:

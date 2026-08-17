@@ -1,7 +1,11 @@
 """Load, validate, and resolve CLAM configuration values."""
 
+from __future__ import annotations
+
+import re
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence
 
 import yaml
 
@@ -13,6 +17,185 @@ _OPTIONS: Dict[str, Sequence[str]] = {
     "tile_sampling": ("random", "uniform", "first"),
 }
 _SPLITS = ("train", "val", "test")
+_RUN_ID_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}(?:_\d{2})?$")
+_EXPLICIT_PATH_KEYS = ("checkpoint", "evaluation_output", "attention_output")
+
+
+def clam_results_root(output_dir: str | Path) -> Path:
+    """Return the CLAM results root under an output directory.
+
+    Args:
+        output_dir (str | Path): Base results directory from configuration.
+
+    Returns:
+        Path: ``{output_dir}/clam`` path.
+    """
+    return Path(output_dir) / "clam"
+
+
+def make_run_id(moment: Optional[datetime] = None) -> str:
+    """Build a sortable timestamp run identifier.
+
+    Args:
+        moment (Optional[datetime]): Instant to format, or ``None`` for now.
+
+    Returns:
+        str: Run id shaped ``YYYY-MM-DD_HHMMSS``.
+    """
+    value = moment if moment is not None else datetime.now()
+    return value.strftime("%Y-%m-%d_%H%M%S")
+
+
+def apply_run_artifact_paths(config: Dict[str, Any], run_dir: str | Path) -> None:
+    """Point checkpoint and artifact paths at one dated training run.
+
+    Args:
+        config (Dict[str, Any]): Configuration dictionary to mutate.
+        run_dir (str | Path): Absolute or relative run directory.
+
+    Returns:
+        None: ``checkpoint_dir`` and ``paths`` entries are updated in place.
+    """
+    destination = Path(run_dir).expanduser().resolve()
+    config["checkpoint_dir"] = str(destination)
+    paths = dict(config.get("paths", {}) or {})
+    paths["checkpoint"] = str(destination / "best_model.pth")
+    paths["evaluation_output"] = str(destination / "evaluation_results")
+    paths["attention_output"] = str(destination / "attention_heatmaps")
+    config["paths"] = paths
+
+
+def list_training_run_dirs(clam_root: str | Path) -> List[Path]:
+    """List dated or checkpoint-bearing CLAM training run directories.
+
+    Args:
+        clam_root (str | Path): ``{output_dir}/clam`` directory.
+
+    Returns:
+        List[Path]: Candidate run directories, newest first.
+    """
+    root = Path(clam_root)
+    if not root.is_dir():
+        return []
+
+    timestamped: List[Path] = []
+    checkpoint_dirs: List[Path] = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        if _RUN_ID_PATTERN.match(child.name):
+            timestamped.append(child)
+        elif (child / "best_model.pth").is_file():
+            checkpoint_dirs.append(child)
+
+    timestamped.sort(key=lambda path: path.name, reverse=True)
+    checkpoint_dirs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    seen = {path.resolve() for path in timestamped}
+    ordered = list(timestamped)
+    for path in checkpoint_dirs:
+        resolved = path.resolve()
+        if resolved not in seen:
+            ordered.append(path)
+            seen.add(resolved)
+    return ordered
+
+
+def resolve_latest_training_run(clam_root: str | Path) -> Optional[Path]:
+    """Select the newest CLAM training run directory.
+
+    Args:
+        clam_root (str | Path): ``{output_dir}/clam`` directory.
+
+    Returns:
+        Optional[Path]: Newest run directory, or ``None`` when none exist.
+    """
+    runs = list_training_run_dirs(clam_root)
+    return runs[0] if runs else None
+
+
+def should_allocate_dated_training_run(config: Mapping[str, Any]) -> bool:
+    """Return whether training should create a new dated results directory.
+
+    Args:
+        config (Mapping[str, Any]): Configuration that may carry path flags from
+            ``load_config``. Programmatic configs without ``_explicit_paths``
+            skip dated allocation.
+
+    Returns:
+        bool: ``True`` when null YAML path defaults should receive a new run.
+    """
+    explicit = config.get("_explicit_paths")
+    if not isinstance(explicit, Mapping):
+        return False
+    return not bool(explicit.get("checkpoint", False))
+
+
+def allocate_training_run(config: Dict[str, Any]) -> Path:
+    """Create a new dated run directory when path defaults are in use.
+
+    When ``paths.checkpoint`` was explicitly set in YAML, or when the config
+    was not produced by ``load_config``, the existing checkpoint directory is
+    reused and no new dated folder is created.
+
+    Args:
+        config (Dict[str, Any]): Resolved configuration to mutate for a run.
+
+    Returns:
+        Path: Directory that should receive checkpoints and related artifacts.
+    """
+    if not should_allocate_dated_training_run(config):
+        destination = Path(str(config.get("checkpoint_dir", ".")))
+        destination.mkdir(parents=True, exist_ok=True)
+        return destination.resolve()
+
+    root = clam_results_root(config["output_dir"])
+    root.mkdir(parents=True, exist_ok=True)
+    base_id = make_run_id()
+    run_dir = root / base_id
+    suffix = 1
+    while run_dir.exists():
+        run_dir = root / f"{base_id}_{suffix:02d}"
+        suffix += 1
+    run_dir.mkdir(parents=True, exist_ok=False)
+    apply_run_artifact_paths(config, run_dir)
+    return run_dir
+
+
+def uses_explicit_checkpoint_path(config: Mapping[str, Any]) -> bool:
+    """Return whether the checkpoint path was supplied explicitly in YAML.
+
+    Args:
+        config (Mapping[str, Any]): Configuration that may carry path flags.
+
+    Returns:
+        bool: ``True`` when ``paths.checkpoint`` was non-null in the YAML.
+    """
+    explicit = config.get("_explicit_paths")
+    if isinstance(explicit, Mapping):
+        return bool(explicit.get("checkpoint", False))
+    return True
+
+
+def resolve_inference_run_paths(config: Dict[str, Any]) -> Optional[Path]:
+    """Bind null-derived artifact paths to the newest dated training run.
+
+    Args:
+        config (Dict[str, Any]): Configuration whose default paths may be updated.
+
+    Returns:
+        Optional[Path]: Latest run directory when applied, otherwise ``None``.
+    """
+    explicit = config.get("_explicit_paths", {})
+    if not isinstance(explicit, Mapping):
+        explicit = {}
+    if any(bool(explicit.get(key, False)) for key in _EXPLICIT_PATH_KEYS):
+        return None
+
+    latest = resolve_latest_training_run(clam_results_root(config["output_dir"]))
+    if latest is None:
+        return None
+    apply_run_artifact_paths(config, latest)
+    return latest
 
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
@@ -271,6 +454,10 @@ def _require_positive_int(config: Mapping[str, Any], key: str) -> int:
 def _resolve_paths(config: Dict[str, Any], config_dir: Path) -> None:
     """Resolve data, output, checkpoint, and artifact paths in place.
 
+    When ``paths.*`` entries are null, bind them to the newest dated run under
+    ``{output_dir}/clam/`` when one exists; otherwise fall back to the legacy
+    flat layout (``checkpoint_dir/best_model.pth`` and flat clam artifact dirs).
+
     Args:
         config (Dict[str, Any]): Configuration dictionary to mutate.
         config_dir (Path): Base directory for relative paths.
@@ -288,24 +475,64 @@ def _resolve_paths(config: Dict[str, Any], config_dir: Path) -> None:
     config["data_root"] = str(data_root)
     config["checkpoint_dir"] = str(checkpoint_dir)
     config["output_dir"] = str(output_dir)
+    config["clam_results_root"] = str(clam_results_root(output_dir))
 
     raw_paths = config.get("paths", {})
     if not isinstance(raw_paths, Mapping):
         raise ValueError("Config key 'paths' must be a mapping.")
     paths = dict(raw_paths)
-    paths["checkpoint"] = str(
-        _optional_path(paths.get("checkpoint"), config_dir)
-        or checkpoint_dir / "best_model.pth"
-    )
-    paths["evaluation_output"] = str(
-        _optional_path(paths.get("evaluation_output"), config_dir)
-        or output_dir / "clam" / "evaluation_results"
-    )
-    paths["attention_output"] = str(
-        _optional_path(paths.get("attention_output"), config_dir)
-        or output_dir / "clam" / "attention_heatmaps"
-    )
+    explicit_checkpoint = _optional_path(paths.get("checkpoint"), config_dir)
+    explicit_evaluation = _optional_path(paths.get("evaluation_output"), config_dir)
+    explicit_attention = _optional_path(paths.get("attention_output"), config_dir)
+    config["_explicit_paths"] = {
+        "checkpoint": explicit_checkpoint is not None,
+        "evaluation_output": explicit_evaluation is not None,
+        "attention_output": explicit_attention is not None,
+    }
+
+    if explicit_checkpoint is not None:
+        paths["checkpoint"] = str(explicit_checkpoint)
+    if explicit_evaluation is not None:
+        paths["evaluation_output"] = str(explicit_evaluation)
+    if explicit_attention is not None:
+        paths["attention_output"] = str(explicit_attention)
     config["paths"] = paths
+
+    auto_keys_missing = [
+        key
+        for key in _EXPLICIT_PATH_KEYS
+        if not bool(config["_explicit_paths"][key])
+    ]
+    if not auto_keys_missing:
+        return
+
+    latest = resolve_latest_training_run(clam_results_root(output_dir))
+    if latest is not None and len(auto_keys_missing) == len(_EXPLICIT_PATH_KEYS):
+        apply_run_artifact_paths(config, latest)
+        return
+
+    if latest is not None:
+        for key, relative in (
+            ("checkpoint", "best_model.pth"),
+            ("evaluation_output", "evaluation_results"),
+            ("attention_output", "attention_heatmaps"),
+        ):
+            if not bool(config["_explicit_paths"][key]):
+                config["paths"][key] = str(latest / relative)
+        if not bool(config["_explicit_paths"]["checkpoint"]):
+            config["checkpoint_dir"] = str(latest)
+        return
+
+    if not bool(config["_explicit_paths"]["checkpoint"]):
+        config["paths"]["checkpoint"] = str(checkpoint_dir / "best_model.pth")
+    if not bool(config["_explicit_paths"]["evaluation_output"]):
+        config["paths"]["evaluation_output"] = str(
+            output_dir / "clam" / "evaluation_results"
+        )
+    if not bool(config["_explicit_paths"]["attention_output"]):
+        config["paths"]["attention_output"] = str(
+            output_dir / "clam" / "attention_heatmaps"
+        )
 
 
 def _absolute_path(value: Any, base_dir: Path, key: str) -> Path:

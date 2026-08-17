@@ -24,12 +24,12 @@ from tqdm import tqdm
 try:
     from .clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
     from .clam_model import CLAM_MB, CLAM_SB
-    from .config_loader import load_config
+    from .config_loader import allocate_training_run, load_config
     from .losses import GeneralizedCrossEntropyLoss
 except ImportError:
     from clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
     from clam_model import CLAM_MB, CLAM_SB
-    from config_loader import load_config
+    from config_loader import allocate_training_run, load_config
     from losses import GeneralizedCrossEntropyLoss
 
 
@@ -118,6 +118,84 @@ def get_class_sample_counts(dataset: WSIBagDataset) -> Dict[str, int]:
     for bag_index in dataset.indices:
         counts[dataset._bags[bag_index]["class_name"]] += 1
     return counts
+
+
+def print_class_counts(
+    train_dataset: WSIBagDataset,
+    val_dataset: WSIBagDataset,
+) -> None:
+    """Print per-class bag counts for train and validation splits.
+
+    Args:
+        train_dataset (WSIBagDataset): Training split dataset.
+        val_dataset (WSIBagDataset): Validation split dataset.
+
+    Returns:
+        None: Counts are written to stdout.
+    """
+    train_counts = get_class_sample_counts(train_dataset)
+    val_counts = get_class_sample_counts(val_dataset)
+    print("Training samples per class:")
+    for class_name in train_dataset.class_folders:
+        print(f"  {class_name}: {train_counts[class_name]}")
+    print("Validation samples per class:")
+    for class_name in train_dataset.class_folders:
+        print(f"  {class_name}: {val_counts[class_name]}")
+
+
+def print_training_banner(
+    config: Mapping[str, Any],
+    device: torch.device,
+    train_dataset: WSIBagDataset,
+    val_dataset: WSIBagDataset,
+    test_dataset: WSIBagDataset,
+    model: nn.Module,
+    run_dir: Path,
+    metric_name: str,
+) -> None:
+    """Print data and model summary information at training start.
+
+    Args:
+        config (Mapping[str, Any]): Resolved training configuration.
+        device (torch.device): Torch device used for training.
+        train_dataset (WSIBagDataset): Training split dataset.
+        val_dataset (WSIBagDataset): Validation split dataset.
+        test_dataset (WSIBagDataset): Test split dataset.
+        model (nn.Module): Instantiated CLAM model.
+        run_dir (Path): Directory receiving checkpoints and artifacts.
+        metric_name (str): Name of the best-checkpoint selection metric.
+
+    Returns:
+        None: Summary lines are written to stdout.
+    """
+    batch_size = int(config["batch_size"])
+    gradient_accumulation_steps = int(config.get("gradient_accumulation_steps", 1))
+    effective_batch_size = batch_size * gradient_accumulation_steps
+    tile_caps = config.get("max_tiles_per_bag", {})
+    if not isinstance(tile_caps, Mapping):
+        tile_caps = {}
+
+    print(f"Using device: {device}")
+    print(
+        f"Using feature model '{config.get('feature_model', 'default')}' "
+        f"with suffix '{config.get('feature_file_suffix', '')}'"
+    )
+    print(f"Model type: {config['model_type']} | bag level: {config['bag_level']}")
+    print(f"Input dim: {config['input_dim']}")
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    print(f"Test samples: {len(test_dataset)}")
+    print(f"Classes: {list(train_dataset.class_folders)}")
+    print(f"Physical batch size: {batch_size}")
+    print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+    print(f"Effective batch size: {effective_batch_size}")
+    print(f"Max train tiles per bag: {tile_caps.get('train')}")
+    print(f"Max val tiles per bag: {tile_caps.get('val')}")
+    print(f"Max test tiles per bag: {tile_caps.get('test')}")
+    print_class_counts(train_dataset, val_dataset)
+    print(f"Model parameters: {sum(param.numel() for param in model.parameters()):,}")
+    print(f"Best checkpoint metric: {metric_name}")
+    print(f"Run directory: {run_dir}")
 
 
 def compute_class_weights(dataset: WSIBagDataset) -> torch.Tensor:
@@ -493,7 +571,11 @@ def _checkpoint_payload(
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
-        "config": copy.deepcopy(dict(config)),
+        "config": {
+            key: copy.deepcopy(value)
+            for key, value in dict(config).items()
+            if not str(key).startswith("_")
+        },
         "class_folders": list(class_folders),
         "bag_level": str(config["bag_level"]),
         "history": copy.deepcopy(dict(history)),
@@ -541,6 +623,7 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
     """
     config = load_config(config_path)
     _validate_training_config(config)
+    run_dir = allocate_training_run(config)
     seed_everything(int(config["random_seed"]))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -552,6 +635,7 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
             f"dataset classes={train_dataset.num_classes}: {class_folders}."
         )
     val_dataset = create_bag_dataset(config, "val", class_folders=class_folders)
+    test_dataset = create_bag_dataset(config, "test", class_folders=class_folders)
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise ValueError("Training and validation splits must both contain bags.")
 
@@ -577,6 +661,16 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
 
     metric_key, maximize, metric_name = resolve_best_checkpoint_metric(
         str(config.get("best_checkpoint_metric", "balanced_accuracy"))
+    )
+    print_training_banner(
+        config,
+        device,
+        train_dataset,
+        val_dataset,
+        test_dataset,
+        model,
+        run_dir,
+        metric_name,
     )
     best_value = -float("inf") if maximize else float("inf")
     best_epoch = 0

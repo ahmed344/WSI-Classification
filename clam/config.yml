@@ -24,7 +24,7 @@ model_type: "clam_mb"  # Options: clam_mb, clam_sb
 gated_attention: true  # Use the canonical gated attention network
 hidden_dim: 512  # Shared tile embedding dimension
 attention_dim: 256  # Hidden dimension of the gated attention network
-dropout: 0.25  # Dropout in the shared embedding and attention projections
+dropout: 0.5  # Dropout in the shared embedding and attention projections
 num_classes: 5  # Number of slide-level target classes
 k_sample: 8  # Number of positive/negative instances sampled per bag
 subtyping: true  # Apply out-of-class instance supervision
@@ -41,12 +41,12 @@ max_tiles_per_bag:  # Applied after constructing a complete tissue or slide bag
   test: null
 tile_sampling: "random"  # Options: random, uniform, first
 epochs: 100  # Maximum number of training epochs
-lr_cls: 0.0001  # Initial learning rate for classification-related parameters
+lr_cls: 0.001  # Initial learning rate for classification-related parameters
 lr_scheduler_factor_cls: 0.5  # ReduceLROnPlateau factor for classification branch
 lr_scheduler_patience_cls: 5  # ReduceLROnPlateau patience for classification branch
 use_weighted_sampler: true  # If true, train DataLoader uses WeightedRandomSampler
 use_class_weighted_loss: false  # Apply inverse-frequency class weights to the bag-level loss
-q: 0.9  # Generalized cross-entropy exponent; 0 recovers standard cross entropy
+q: 0.7  # Generalized cross-entropy exponent; 0 recovers standard cross entropy
 epsilon: 0.1  # Label-smoothing strength in [0, 1); 0 disables smoothing
 best_checkpoint_metric: "balanced_accuracy"  # Options: balanced_accuracy, accuracy, loss, classification_loss, instance_loss
 weight_decay_cls: 0.0001  # Weight decay for feature projection, attention branches, and classifier

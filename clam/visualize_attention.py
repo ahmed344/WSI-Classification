@@ -572,6 +572,11 @@ def main() -> None:
     args = parse_args()
     launcher_config = load_config(args.config)
     checkpoint_path = args.checkpoint or launcher_config["paths"]["checkpoint"]
+    if args.checkpoint is None and not Path(checkpoint_path).is_file():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}. "
+            "Train CLAM first or pass --checkpoint."
+        )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, checkpoint_config, class_folders, bag_level = load_checkpoint_model(
         str(checkpoint_path), device
@@ -588,9 +593,11 @@ def main() -> None:
     max_bags = int(max_bags_value) if max_bags_value is not None else None
     output_dir = (
         args.output_dir
-        or checkpoint_config.get("paths", {}).get("attention_output")
         or launcher_config["paths"]["attention_output"]
+        or checkpoint_config.get("paths", {}).get("attention_output")
     )
+    print(f"Using checkpoint: {checkpoint_path}")
+    print(f"Attention output: {output_dir}")
     dataset = create_visualization_dataset(
         checkpoint_config,
         split,
