@@ -70,6 +70,8 @@ visualization:  # Settings controlling attention/diagnostic visualization output
   split: "val"  # Options: train, val, test
   max_slides: null  # null for all slides, or specify a number
   tile_size: 448  # Pixel size used when rendering visualization tiles
+  dpi: 150  # Positive output DPI; use 300 for publication-scale heatmaps
+  render_workers: 8  # Parallel figure processes; raise toward CPU count if memory permits
 
 # Paths (can be overridden)
 paths:  # Optional explicit output/checkpoint paths overriding default derivations

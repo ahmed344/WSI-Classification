@@ -8,9 +8,12 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Type
 
+import matplotlib.pyplot as plt
+import numpy as np
 import pytest
 import torch
 import yaml
+from matplotlib.figure import Figure
 from torch import nn
 from torch.utils.data import DataLoader
 
@@ -20,6 +23,7 @@ if str(CLAM_DIRECTORY) not in sys.path:
 
 import evaluate_clam
 import train_clam
+import visualize_attention
 from clam_dataset import collate_fn, create_bag_dataset
 from clam_model import CLAM_MB, CLAM_SB
 from config_loader import (
@@ -177,6 +181,56 @@ def test_config_validation_rejects_invalid_values(
     with invalid_path.open("w", encoding="utf-8") as config_file:
         yaml.safe_dump(config, config_file)
     with pytest.raises(ValueError, match=message):
+        load_config(str(invalid_path))
+
+
+@pytest.mark.parametrize("dpi", [0, -1, 1.5, True])
+def test_config_validation_rejects_invalid_visualization_dpi(
+    tmp_path: Path,
+    dpi: object,
+) -> None:
+    """Verify visualization DPI must be a positive integer.
+
+    Args:
+        tmp_path (Path): Pytest temporary directory.
+        dpi (object): Invalid visualization DPI replacement.
+
+    Returns:
+        None: Assertions verify eager visualization-DPI validation.
+    """
+    canonical_path = CLAM_DIRECTORY / "config.yml"
+    with canonical_path.open("r", encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file)
+    config["visualization"]["dpi"] = dpi
+    invalid_path = tmp_path / "invalid_visualization.yml"
+    with invalid_path.open("w", encoding="utf-8") as config_file:
+        yaml.safe_dump(config, config_file)
+    with pytest.raises(ValueError, match="visualization.dpi"):
+        load_config(str(invalid_path))
+
+
+@pytest.mark.parametrize("render_workers", [0, -1, 1.5, True])
+def test_config_validation_rejects_invalid_render_workers(
+    tmp_path: Path,
+    render_workers: object,
+) -> None:
+    """Verify render worker count must be a positive integer.
+
+    Args:
+        tmp_path (Path): Pytest temporary directory.
+        render_workers (object): Invalid render worker replacement.
+
+    Returns:
+        None: Assertions verify eager render-worker validation.
+    """
+    canonical_path = CLAM_DIRECTORY / "config.yml"
+    with canonical_path.open("r", encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file)
+    config["visualization"]["render_workers"] = render_workers
+    invalid_path = tmp_path / "invalid_render_workers.yml"
+    with invalid_path.open("w", encoding="utf-8") as config_file:
+        yaml.safe_dump(config, config_file)
+    with pytest.raises(ValueError, match="visualization.render_workers"):
         load_config(str(invalid_path))
 
 
@@ -938,3 +992,274 @@ def test_apply_run_artifact_paths_updates_all_keys(tmp_path: Path) -> None:
     assert config["paths"]["checkpoint"].endswith("best_model.pth")
     assert config["paths"]["evaluation_output"].endswith("evaluation_results")
     assert config["paths"]["attention_output"].endswith("attention_heatmaps")
+
+
+@pytest.mark.parametrize("model_class", [CLAM_SB, CLAM_MB])
+def test_tile_evidence_exactly_reconstructs_logits(
+    model_class: Type[nn.Module],
+) -> None:
+    """Verify SB and MB tile evidence reconstruct logits and ignores padding.
+
+    Args:
+        model_class (Type[nn.Module]): Canonical CLAM variant under test.
+
+    Returns:
+        None: Evidence shape, masking, and reconstruction are asserted.
+    """
+    model = model_class(
+        input_dim=4,
+        hidden_dim=8,
+        attention_dim=4,
+        num_classes=3,
+        dropout=0.0,
+    )
+    model.eval()
+    features = torch.randn(2, 6, 4)
+    masks = torch.tensor(
+        [
+            [True, True, True, True, False, False],
+            [True, True, True, True, True, True],
+        ]
+    )
+    with torch.no_grad():
+        outputs = model(features, mask=masks, instance_eval=False)
+        evidence, errors = visualize_attention.compute_tile_evidence(
+            model=model,
+            features=features,
+            masks=masks,
+            attention_weights=outputs["attention_weights"],
+            logits=outputs["logits"],
+        )
+
+    biases = torch.stack(
+        [classifier.bias.squeeze(0) for classifier in model.classifiers]
+    )
+    assert evidence.shape == (2, 3, 6)
+    assert torch.count_nonzero(evidence[0, :, 4:]) == 0
+    assert torch.allclose(
+        evidence.sum(dim=-1) + biases.unsqueeze(0),
+        outputs["logits"],
+        atol=1e-4,
+        rtol=0.0,
+    )
+    assert float(errors.max()) <= 1e-4
+
+
+def test_sb_evidence_is_class_specific_with_shared_attention() -> None:
+    """Verify SB applies one attention branch to distinct class projections.
+
+    Args:
+        None.
+
+    Returns:
+        None: Shared attention and class-specific evidence are asserted.
+    """
+    model = CLAM_SB(
+        input_dim=2,
+        hidden_dim=2,
+        attention_dim=2,
+        num_classes=2,
+        dropout=0.0,
+    )
+    model.eval()
+    with torch.no_grad():
+        model.classifiers[0].weight.fill_(1.0)
+        model.classifiers[1].weight.fill_(-1.0)
+        model.classifiers[0].bias.zero_()
+        model.classifiers[1].bias.zero_()
+    features = torch.ones(1, 3, 2)
+    masks = torch.ones(1, 3, dtype=torch.bool)
+    with torch.no_grad():
+        outputs = model(features, mask=masks, instance_eval=False)
+        evidence, _ = visualize_attention.compute_tile_evidence(
+            model=model,
+            features=features,
+            masks=masks,
+            attention_weights=outputs["attention_weights"],
+            logits=outputs["logits"],
+        )
+
+    assert outputs["attention_weights"].shape == (1, 1, 3)
+    assert torch.allclose(evidence[:, 0], -evidence[:, 1])
+
+
+def test_evidence_color_limit_uses_absolute_quantile() -> None:
+    """Verify evidence colors use a robust positive symmetric limit.
+
+    Args:
+        None.
+
+    Returns:
+        None: The absolute 99th-percentile color limit is asserted.
+    """
+    evidence = np.asarray([-4.0, -1.0, 0.0, 2.0], dtype=np.float64)
+    expected = float(np.quantile(np.abs(evidence), 0.99))
+    assert visualize_attention.evidence_color_limit(evidence) == pytest.approx(
+        expected
+    )
+    assert visualize_attention.evidence_color_limit(
+        np.zeros(3, dtype=np.float64)
+    ) > 0.0
+
+
+def test_attention_and_evidence_are_saved_in_one_figure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify aligned attention and evidence are rendered into one PNG.
+
+    Args:
+        tmp_path (Path): Temporary destination for rendered PNG files.
+        monkeypatch (pytest.MonkeyPatch): Fixture used to observe output DPI.
+
+    Returns:
+        None: The combined heatmap artifact is asserted.
+    """
+    coordinates = np.asarray(
+        [[0.0, 0.0], [448.0, 0.0], [0.0, 448.0]], dtype=np.float64
+    )
+    attention = np.asarray([[0.2, 0.3, 0.5]], dtype=np.float64)
+    evidence = np.asarray(
+        [[0.2, -0.1, 0.4], [-0.3, 0.2, 0.1]], dtype=np.float64
+    )
+    combined_path = tmp_path / "slide_tissue_attention.png"
+    saved_dpi: Dict[str, Any] = {}
+    original_savefig = Figure.savefig
+
+    def _capture_savefig(
+        figure: Figure,
+        output_path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Capture render DPI while delegating to Matplotlib.
+
+        Args:
+            figure (Figure): Figure being saved.
+            output_path (Path): Destination image path.
+            *args (Any): Additional positional save arguments.
+            **kwargs (Any): Additional keyword save arguments.
+
+        Returns:
+            None: The original save operation is completed.
+        """
+        saved_dpi["value"] = kwargs.get("dpi")
+        original_savefig(figure, output_path, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", _capture_savefig)
+
+    visualize_attention.save_attention_evidence_figure(
+        branch_attention=attention,
+        class_evidence=evidence,
+        coordinates=coordinates,
+        branch_names=["Shared attention"],
+        class_names=["Class0", "Class1"],
+        bag_evidence_sums=evidence.sum(axis=1),
+        predicted_index=1,
+        slide_name="slide",
+        tissue_name="tissue",
+        true_class="Class0",
+        predicted_class="Class1",
+        predicted_probability=0.7,
+        image_path=None,
+        output_path=combined_path,
+        tile_size=448,
+        thumbnail_size=128,
+        render_dpi=72,
+    )
+
+    assert combined_path.is_file()
+    assert saved_dpi["value"] == 72
+
+
+def test_heatmap_tiles_use_one_vectorized_collection_per_axis() -> None:
+    """Verify attention and evidence avoid one artist per tile.
+
+    Args:
+        None.
+
+    Returns:
+        None: Each heatmap axis contains one collection and no rectangle patches.
+    """
+    coordinates = np.asarray(
+        [[0.0, 0.0], [448.0, 0.0], [0.0, 448.0]], dtype=np.float64
+    )
+    values = np.asarray([0.2, 0.3, 0.5], dtype=np.float64)
+    figure, axes = plt.subplots(1, 2)
+    try:
+        visualize_attention.draw_attention(
+            axes[0], coordinates, values, tile_size=448
+        )
+        visualize_attention.draw_evidence(
+            axes[1], coordinates, values - 0.3, tile_size=448, color_limit=0.3
+        )
+
+        for axis in axes:
+            assert len(axis.collections) == 1
+            assert len(axis.patches) == 0
+            assert len(axis.collections[0].get_paths()) == coordinates.shape[0]
+    finally:
+        plt.close(figure)
+
+
+@pytest.mark.parametrize("render_workers", [1, 2])
+def test_visualization_summary_includes_evidence_diagnostics(
+    tmp_path: Path,
+    render_workers: int,
+) -> None:
+    """Verify end-to-end visualization preserves attention and adds evidence.
+
+    Args:
+        tmp_path (Path): Temporary synthetic dataset and output root.
+        render_workers (int): Number of figure-rendering processes.
+
+    Returns:
+        None: Paired artifacts and per-class evidence diagnostics are asserted.
+    """
+    data_root = tmp_path / "data"
+    _write_fixture_dataset(data_root)
+    config = _pipeline_config(data_root, "tissue", model_type="clam_sb")
+    dataset = create_bag_dataset(config, "train")
+    dataset.indices = dataset.indices[:1]
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collate_fn,
+    )
+    model = CLAM_SB(
+        input_dim=4,
+        hidden_dim=8,
+        attention_dim=4,
+        num_classes=2,
+        dropout=0.0,
+    )
+    output_dir = tmp_path / "heatmaps"
+
+    results = visualize_attention.evaluate_with_attention(
+        model=model,
+        dataloader=dataloader,
+        device=torch.device("cpu"),
+        class_names=["Class0", "Class1"],
+        data_root=str(data_root),
+        output_dir=str(output_dir),
+        bag_level="tissue",
+        tile_size=448,
+        thumbnail_size=128,
+        render_workers=render_workers,
+    )
+
+    assert len(results) == 1
+    result = results[0]
+    assert Path(result["heatmap_path"]).is_file()
+    assert Path(result["evidence_heatmap_path"]).is_file()
+    assert result["evidence_heatmap_path"] == result["heatmap_path"]
+    assert set(result["evidence_by_class"]) == {"Class0", "Class1"}
+    for class_index, class_name in enumerate(("Class0", "Class1")):
+        diagnostics = result["evidence_by_class"][class_name]
+        assert diagnostics["logit_reconstruction_error"] <= 1e-4
+        assert diagnostics["reconstructed_logit"] == pytest.approx(
+            diagnostics["bag_tile_evidence_sum"]
+            + float(model.classifiers[class_index].bias.item()),
+            abs=1e-6,
+        )

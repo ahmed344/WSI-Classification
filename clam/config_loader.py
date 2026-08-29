@@ -445,6 +445,22 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     visualization_split = visualization.get("split", "val")
     if visualization_split not in _SPLITS:
         raise ValueError("visualization.split must be train, val, or test.")
+    visualization_dpi = visualization.get("dpi", 150)
+    if (
+        isinstance(visualization_dpi, bool)
+        or not isinstance(visualization_dpi, int)
+        or visualization_dpi <= 0
+    ):
+        raise ValueError("visualization.dpi must be a positive integer.")
+    render_workers = visualization.get("render_workers", 4)
+    if (
+        isinstance(render_workers, bool)
+        or not isinstance(render_workers, int)
+        or render_workers <= 0
+    ):
+        raise ValueError(
+            "visualization.render_workers must be a positive integer."
+        )
 
 
 def _require_number(config: Mapping[str, Any], key: str) -> float:

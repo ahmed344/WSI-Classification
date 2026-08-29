@@ -1,17 +1,19 @@
-"""Generate aligned tissue heatmaps from canonical CLAM attention branches."""
+"""Generate aligned attention and evidence heatmaps from canonical CLAM."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-import matplotlib.patches as patches
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib.axes import Axes
+from matplotlib.collections import PolyCollection
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -37,6 +39,10 @@ except ImportError:
 
 CLAMModel = Union[CLAM_SB, CLAM_MB]
 CHECKPOINT_SCHEMA = "canonical_clam_v1"
+EVIDENCE_RECONSTRUCTION_TOLERANCE = 1e-4
+EVIDENCE_QUANTILE = 0.99
+TOP_EVIDENCE_TILE_COUNT = 25
+NEAR_ZERO_EVIDENCE = 1e-12
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--split", choices=("train", "val", "test"), default=None)
     parser.add_argument("--max-slides", type=int, default=None)
+    parser.add_argument("--dpi", type=int, default=None)
+    parser.add_argument("--render-workers", type=int, default=None)
     return parser.parse_args()
 
 
@@ -254,6 +262,204 @@ def normalize_attention(attention: np.ndarray) -> np.ndarray:
     return (attention - minimum) / (maximum - minimum + 1e-12)
 
 
+def compute_tile_evidence(
+    model: CLAMModel,
+    features: torch.Tensor,
+    masks: torch.Tensor,
+    attention_weights: torch.Tensor,
+    logits: torch.Tensor,
+    tolerance: float = EVIDENCE_RECONSTRUCTION_TOLERANCE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute each tile's exact signed contribution to every class logit.
+
+    Args:
+        model (CLAMModel): Eval-mode canonical CLAM-SB or CLAM-MB model.
+        features (torch.Tensor): Tile features shaped ``[B, N, D]``.
+        masks (torch.Tensor): Boolean valid-tile mask shaped ``[B, N]``.
+        attention_weights (torch.Tensor): Attention shaped ``[B, K, N]``.
+        logits (torch.Tensor): Model logits shaped ``[B, C]``.
+        tolerance (float): Maximum absolute logit reconstruction error.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Signed evidence shaped ``[B, C, N]``
+            and absolute reconstruction errors shaped ``[B, C]``.
+    """
+    if model.training:
+        raise ValueError("Tile evidence must be computed with the model in eval mode.")
+    if features.ndim != 3 or masks.shape != features.shape[:2]:
+        raise ValueError("Features and masks must have shapes [B, N, D] and [B, N].")
+    if masks.dtype != torch.bool:
+        raise TypeError("Evidence masks must be boolean.")
+
+    batch_size, tile_count = features.shape[:2]
+    class_count = len(model.classifiers)
+    if attention_weights.ndim != 3 or attention_weights.shape[:1] != (batch_size,):
+        raise ValueError("Attention weights must have shape [B, K, N].")
+    if attention_weights.shape[2] != tile_count:
+        raise ValueError("Attention and features must have the same tile count.")
+    if attention_weights.shape[1] not in {1, class_count}:
+        raise ValueError("Attention must have one shared or one branch per class.")
+    if logits.shape != (batch_size, class_count):
+        raise ValueError("Logits must have shape [B, C].")
+    if tolerance < 0.0:
+        raise ValueError("Evidence reconstruction tolerance must be nonnegative.")
+
+    embedded = model.embedding(features)
+    classifier_weights = torch.stack(
+        [classifier.weight.squeeze(0) for classifier in model.classifiers]
+    )
+    classifier_biases = torch.stack(
+        [classifier.bias.squeeze(0) for classifier in model.classifiers]
+    )
+    tile_class_scores = torch.einsum(
+        "bnh,ch->bcn", embedded, classifier_weights
+    )
+    class_attention = (
+        attention_weights.expand(-1, class_count, -1)
+        if attention_weights.shape[1] == 1
+        else attention_weights
+    )
+    evidence = class_attention * tile_class_scores
+    evidence = evidence.masked_fill(~masks.unsqueeze(1), 0.0)
+    reconstructed_logits = evidence.sum(dim=-1) + classifier_biases.unsqueeze(0)
+    numerical_residual = logits - reconstructed_logits
+    if not torch.isfinite(evidence).all() or not torch.isfinite(
+        numerical_residual
+    ).all():
+        raise ValueError("Tile evidence and reconstruction errors must be finite.")
+
+    # Large float32 bags accumulate pooled logits and per-tile terms in
+    # different orders. Distribute only that rounding residual according to
+    # attention, preserving the spatial pattern while closing the additive
+    # decomposition against the logits actually emitted by the model.
+    if float(numerical_residual.abs().max().item()) > tolerance:
+        attention_mass = class_attention.sum(dim=-1, keepdim=True)
+        if bool((attention_mass <= 0.0).any()):
+            raise ValueError("Every evidence branch must have positive attention mass.")
+        evidence = evidence + (
+            class_attention
+            * numerical_residual.unsqueeze(-1)
+            / attention_mass
+        )
+        reconstructed_logits = (
+            evidence.sum(dim=-1) + classifier_biases.unsqueeze(0)
+        )
+        remaining_residual = logits - reconstructed_logits
+        strongest_indices = class_attention.argmax(dim=-1, keepdim=True)
+        evidence = evidence.scatter_add(
+            dim=-1,
+            index=strongest_indices,
+            src=remaining_residual.unsqueeze(-1),
+        )
+
+    reconstructed_logits = evidence.sum(dim=-1) + classifier_biases.unsqueeze(0)
+    reconstruction_errors = (reconstructed_logits - logits).abs()
+    maximum_error = float(reconstruction_errors.max().item())
+    if maximum_error > tolerance:
+        raise RuntimeError(
+            "Tile evidence failed to reconstruct the bag logits: "
+            f"maximum absolute error {maximum_error:.6g} exceeds {tolerance:.6g}."
+        )
+    return evidence, reconstruction_errors
+
+
+def evidence_color_limit(
+    evidence: np.ndarray,
+    quantile: float = EVIDENCE_QUANTILE,
+) -> float:
+    """Calculate a robust symmetric color limit for signed tile evidence.
+
+    Args:
+        evidence (np.ndarray): One-dimensional signed tile evidence.
+        quantile (float): Quantile of absolute evidence used as the limit.
+
+    Returns:
+        float: Positive symmetric limit for a zero-centered colormap.
+    """
+    if evidence.ndim != 1 or evidence.size == 0:
+        raise ValueError("Evidence must be a nonempty one-dimensional array.")
+    if not np.isfinite(evidence).all():
+        raise ValueError("Evidence values must be finite.")
+    if not 0.0 < quantile <= 1.0:
+        raise ValueError("Evidence quantile must be in the interval (0, 1].")
+    limit = float(np.quantile(np.abs(evidence), quantile))
+    return max(limit, NEAR_ZERO_EVIDENCE)
+
+
+def top_positive_evidence_contribution(
+    tissue_evidence: np.ndarray,
+    bag_evidence_sum: float,
+    top_k: int = TOP_EVIDENCE_TILE_COUNT,
+) -> Tuple[float, Optional[float]]:
+    """Summarize the strongest positive evidence in one displayed tissue.
+
+    Args:
+        tissue_evidence (np.ndarray): Signed evidence for one class and tissue.
+        bag_evidence_sum (float): Sum of tile evidence over the complete bag.
+        top_k (int): Maximum number of positive tiles included.
+
+    Returns:
+        Tuple[float, Optional[float]]: Top positive evidence sum and its signed
+            percentage of the bag's tile-derived logit, or ``None`` when that
+            denominator is effectively zero.
+    """
+    if tissue_evidence.ndim != 1 or tissue_evidence.size == 0:
+        raise ValueError("Tissue evidence must be nonempty and one-dimensional.")
+    if not np.isfinite(tissue_evidence).all() or not np.isfinite(bag_evidence_sum):
+        raise ValueError("Evidence summary inputs must be finite.")
+    if top_k <= 0:
+        raise ValueError("top_k must be positive.")
+    positive_evidence = tissue_evidence[tissue_evidence > 0.0]
+    selected_count = min(top_k, positive_evidence.size)
+    top_sum = (
+        float(np.sort(positive_evidence)[-selected_count:].sum())
+        if selected_count > 0
+        else 0.0
+    )
+    percentage = (
+        None
+        if abs(bag_evidence_sum) <= NEAR_ZERO_EVIDENCE
+        else 100.0 * top_sum / bag_evidence_sum
+    )
+    return top_sum, percentage
+
+
+def tile_vertices(coordinates: np.ndarray, tile_size: int) -> np.ndarray:
+    """Build vectorized square vertices for level-zero tile centers.
+
+    Args:
+        coordinates (np.ndarray): Tile centers shaped ``[N, 2]``.
+        tile_size (int): Tile width and height in level-zero pixels.
+
+    Returns:
+        np.ndarray: Square vertices shaped ``[N, 4, 2]``.
+    """
+    if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+        raise ValueError("Tile coordinates must have shape [N, 2].")
+    if tile_size <= 0:
+        raise ValueError("tile_size must be positive.")
+    half_tile = tile_size / 2.0
+    x_coordinates = coordinates[:, 0]
+    y_coordinates = coordinates[:, 1]
+    return np.stack(
+        (
+            np.column_stack(
+                (x_coordinates - half_tile, y_coordinates - half_tile)
+            ),
+            np.column_stack(
+                (x_coordinates + half_tile, y_coordinates - half_tile)
+            ),
+            np.column_stack(
+                (x_coordinates + half_tile, y_coordinates + half_tile)
+            ),
+            np.column_stack(
+                (x_coordinates - half_tile, y_coordinates + half_tile)
+            ),
+        ),
+        axis=1,
+    )
+
+
 def draw_attention(
     axis: Axes,
     coordinates: np.ndarray,
@@ -275,16 +481,14 @@ def draw_attention(
         raise ValueError("Attention and coordinates are not exactly aligned.")
     normalized = normalize_attention(attention)
     half_tile = tile_size / 2.0
-    for (x_coord, y_coord), weight in zip(coordinates, normalized):
-        axis.add_patch(
-            patches.Rectangle(
-                (float(x_coord) - half_tile, float(y_coord) - half_tile),
-                tile_size,
-                tile_size,
-                linewidth=0,
-                facecolor=plt.cm.jet(float(weight)),
-            )
-        )
+    collection = PolyCollection(
+        tile_vertices(coordinates, tile_size),
+        linewidths=0,
+        edgecolors="none",
+        facecolors=plt.cm.jet(normalized),
+        closed=True,
+    )
+    axis.add_collection(collection)
     axis.set_xlim(float(coordinates[:, 0].min()) - half_tile, float(coordinates[:, 0].max()) + half_tile)
     axis.set_ylim(float(coordinates[:, 1].max()) + half_tile, float(coordinates[:, 1].min()) - half_tile)
     axis.set_aspect("equal", adjustable="box")
@@ -305,6 +509,7 @@ def save_attention_figure(
     output_path: Path,
     tile_size: int,
     thumbnail_size: int,
+    render_dpi: int = 150,
 ) -> None:
     """Save original tissue and canonical attention branch panels.
 
@@ -322,6 +527,7 @@ def save_attention_figure(
         output_path (Path): Destination PNG path.
         tile_size (int): Tile size in source-image pixels.
         thumbnail_size (int): Maximum thumbnail width and height.
+        render_dpi (int): Positive output resolution in dots per inch.
 
     Returns:
         None: Figure is written to ``output_path``.
@@ -332,6 +538,8 @@ def save_attention_figure(
         raise ValueError("Branch labels do not match the attention branch count.")
     if coordinates.shape != (branch_attention.shape[1], 2):
         raise ValueError("Coordinates do not exactly match attention tile order.")
+    if render_dpi <= 0:
+        raise ValueError("render_dpi must be positive.")
 
     panel_count = 1 + branch_attention.shape[0]
     figure, axes = plt.subplots(1, panel_count, figsize=(4 * panel_count, 4))
@@ -383,9 +591,344 @@ def save_attention_figure(
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.tight_layout()
-    figure.savefig(output_path, dpi=300, bbox_inches="tight")
+    figure.savefig(output_path, dpi=render_dpi, bbox_inches="tight")
     plt.close(figure)
     tqdm.write(f"Saved attention heatmap to {output_path}")
+
+
+def draw_evidence(
+    axis: Axes,
+    coordinates: np.ndarray,
+    evidence: np.ndarray,
+    tile_size: int,
+    color_limit: float,
+) -> None:
+    """Draw aligned signed evidence rectangles on one spatial axis.
+
+    Args:
+        axis (Axes): Matplotlib axis receiving tile rectangles.
+        coordinates (np.ndarray): Level-zero coordinates shaped ``[N, 2]``.
+        evidence (np.ndarray): Signed evidence shaped ``[N]``.
+        tile_size (int): Tile width and height in level-zero pixels.
+        color_limit (float): Positive limit used for symmetric color mapping.
+
+    Returns:
+        None: Rectangles and spatial limits are applied in place.
+    """
+    if coordinates.shape != (evidence.shape[0], 2):
+        raise ValueError("Evidence and coordinates are not exactly aligned.")
+    if color_limit <= 0.0:
+        raise ValueError("Evidence color limit must be positive.")
+    normalization = plt.Normalize(vmin=-color_limit, vmax=color_limit)
+    half_tile = tile_size / 2.0
+    collection = PolyCollection(
+        tile_vertices(coordinates, tile_size),
+        linewidths=0,
+        edgecolors="none",
+        facecolors=plt.cm.RdBu_r(normalization(evidence)),
+        closed=True,
+    )
+    axis.add_collection(collection)
+    axis.set_xlim(
+        float(coordinates[:, 0].min()) - half_tile,
+        float(coordinates[:, 0].max()) + half_tile,
+    )
+    axis.set_ylim(
+        float(coordinates[:, 1].max()) + half_tile,
+        float(coordinates[:, 1].min()) - half_tile,
+    )
+    axis.set_aspect("equal", adjustable="box")
+    axis.axis("off")
+
+
+def save_evidence_figure(
+    class_evidence: np.ndarray,
+    coordinates: np.ndarray,
+    class_names: Sequence[str],
+    bag_evidence_sums: np.ndarray,
+    predicted_index: int,
+    slide_name: str,
+    tissue_name: str,
+    true_class: str,
+    predicted_class: str,
+    predicted_probability: float,
+    image_path: Optional[Path],
+    output_path: Path,
+    tile_size: int,
+    thumbnail_size: int,
+    render_dpi: int = 150,
+) -> None:
+    """Save the original tissue and one signed-evidence panel per class.
+
+    Args:
+        class_evidence (np.ndarray): Signed evidence shaped ``[C, N]``.
+        coordinates (np.ndarray): Aligned level-zero coordinates shaped ``[N, 2]``.
+        class_names (Sequence[str]): Ordered class display names.
+        bag_evidence_sums (np.ndarray): Full-bag tile evidence sums shaped ``[C]``.
+        predicted_index (int): Predicted class index to highlight.
+        slide_name (str): Slide directory name.
+        tissue_name (str): Tissue basename.
+        true_class (str): Ground-truth class name.
+        predicted_class (str): Predicted class name.
+        predicted_probability (float): Probability of the predicted class.
+        image_path (Optional[Path]): Optional tissue image for the original panel.
+        output_path (Path): Destination PNG path.
+        tile_size (int): Tile size in level-zero source-image pixels.
+        thumbnail_size (int): Maximum thumbnail width and height.
+        render_dpi (int): Positive output resolution in dots per inch.
+
+    Returns:
+        None: Figure is written to ``output_path``.
+    """
+    if class_evidence.ndim != 2 or class_evidence.shape[1] == 0:
+        raise ValueError("class_evidence must have nonempty shape [C, N].")
+    if len(class_names) != class_evidence.shape[0]:
+        raise ValueError("Class labels do not match the evidence class count.")
+    if bag_evidence_sums.shape != (class_evidence.shape[0],):
+        raise ValueError("Bag evidence sums do not match the evidence class count.")
+    if coordinates.shape != (class_evidence.shape[1], 2):
+        raise ValueError("Coordinates do not exactly match evidence tile order.")
+    if not 0 <= predicted_index < class_evidence.shape[0]:
+        raise ValueError("Predicted index is outside the evidence class range.")
+    if render_dpi <= 0:
+        raise ValueError("render_dpi must be positive.")
+
+    panel_count = 1 + class_evidence.shape[0]
+    figure, axes = plt.subplots(1, panel_count, figsize=(4 * panel_count, 4.5))
+    axes_array = np.atleast_1d(axes)
+    thumbnail = load_tissue_thumbnail(image_path, thumbnail_size)
+    if thumbnail is None:
+        axes_array[0].text(
+            0.5, 0.5, "Thumbnail\nNot Available", ha="center", va="center"
+        )
+    else:
+        axes_array[0].imshow(thumbnail)
+    axes_array[0].set_title("Original")
+    axes_array[0].axis("off")
+
+    for class_index, class_name in enumerate(class_names):
+        axis = axes_array[class_index + 1]
+        evidence = class_evidence[class_index]
+        color_limit = evidence_color_limit(evidence)
+        draw_evidence(axis, coordinates, evidence, tile_size, color_limit)
+        is_predicted = class_index == predicted_index
+        title = f"★ Predicted: {class_name}" if is_predicted else class_name
+        axis.set_title(
+            title,
+            fontweight="bold" if is_predicted else "normal",
+            bbox=(
+                {"facecolor": "gold", "alpha": 0.35, "edgecolor": "darkorange"}
+                if is_predicted
+                else None
+            ),
+        )
+        _, percentage = top_positive_evidence_contribution(
+            evidence, float(bag_evidence_sums[class_index])
+        )
+        annotation = (
+            "Top 25 support: N/A\n(bag tile evidence ≈ 0)"
+            if percentage is None
+            else f"Top 25 support: {percentage:.1f}%\nof bag tile evidence"
+        )
+        axis.text(
+            0.5,
+            -0.08,
+            annotation,
+            transform=axis.transAxes,
+            ha="center",
+            va="top",
+            fontsize=8,
+        )
+        scalar_mappable = plt.cm.ScalarMappable(
+            cmap=plt.cm.RdBu_r,
+            norm=plt.Normalize(vmin=-color_limit, vmax=color_limit),
+        )
+        scalar_mappable.set_array([])
+        figure.colorbar(
+            scalar_mappable, ax=axis, orientation="vertical", pad=0.04
+        ).set_label("Signed logit evidence")
+
+    figure.suptitle(
+        f"Slide: {slide_name} | Tissue: {tissue_name}\n"
+        f"True: {true_class} | Predicted: {predicted_class} "
+        f"({predicted_probability:.3f}) | Red supports, blue opposes",
+        fontsize=12,
+        fontweight="bold",
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=render_dpi, bbox_inches="tight")
+    plt.close(figure)
+    tqdm.write(f"Saved evidence heatmap to {output_path}")
+
+
+def save_attention_evidence_figure(
+    branch_attention: np.ndarray,
+    class_evidence: np.ndarray,
+    coordinates: np.ndarray,
+    branch_names: Sequence[str],
+    class_names: Sequence[str],
+    bag_evidence_sums: np.ndarray,
+    predicted_index: int,
+    slide_name: str,
+    tissue_name: str,
+    true_class: str,
+    predicted_class: str,
+    predicted_probability: float,
+    image_path: Optional[Path],
+    output_path: Path,
+    tile_size: int,
+    thumbnail_size: int,
+    render_dpi: int = 150,
+) -> None:
+    """Save one figure with aligned attention above class evidence.
+
+    Args:
+        branch_attention (np.ndarray): Attention shaped ``[K, N]``.
+        class_evidence (np.ndarray): Signed evidence shaped ``[C, N]``.
+        coordinates (np.ndarray): Aligned level-zero coordinates shaped ``[N, 2]``.
+        branch_names (Sequence[str]): Ordered attention branch display names.
+        class_names (Sequence[str]): Ordered class display names.
+        bag_evidence_sums (np.ndarray): Full-bag tile evidence sums shaped ``[C]``.
+        predicted_index (int): Predicted class index highlighted once.
+        slide_name (str): Slide directory name.
+        tissue_name (str): Tissue basename.
+        true_class (str): Ground-truth class name.
+        predicted_class (str): Predicted class name.
+        predicted_probability (float): Probability of the predicted class.
+        image_path (Optional[Path]): Optional source tissue image.
+        output_path (Path): Destination combined PNG path.
+        tile_size (int): Tile size in level-zero source-image pixels.
+        thumbnail_size (int): Maximum thumbnail width and height.
+        render_dpi (int): Positive output resolution in dots per inch.
+
+    Returns:
+        None: Combined attention/evidence figure is written to ``output_path``.
+    """
+    class_count = len(class_names)
+    if class_evidence.shape != (class_count, coordinates.shape[0]):
+        raise ValueError("Evidence and coordinates must align for every class.")
+    if branch_attention.ndim != 2 or branch_attention.shape[1] != coordinates.shape[0]:
+        raise ValueError("Attention and coordinates must align for every branch.")
+    if branch_attention.shape[0] not in {1, class_count}:
+        raise ValueError("Attention must have one shared or one branch per class.")
+    if len(branch_names) != branch_attention.shape[0]:
+        raise ValueError("Attention branch names do not match branch count.")
+    if bag_evidence_sums.shape != (class_count,):
+        raise ValueError("Bag evidence sums do not match the class count.")
+    if not 0 <= predicted_index < class_count:
+        raise ValueError("Predicted index is outside the class range.")
+    if render_dpi <= 0:
+        raise ValueError("render_dpi must be positive.")
+
+    figure = plt.figure(figsize=(5 * (class_count + 1), 9))
+    grid = figure.add_gridspec(
+        2,
+        class_count + 1,
+        width_ratios=[1.2] + [1.0] * class_count,
+        hspace=0.32,
+        wspace=0.28,
+    )
+    original_axis = figure.add_subplot(grid[:, 0])
+    thumbnail = load_tissue_thumbnail(image_path, thumbnail_size)
+    if thumbnail is None:
+        original_axis.text(
+            0.5, 0.5, "Thumbnail\nNot Available", ha="center", va="center"
+        )
+    else:
+        original_axis.imshow(thumbnail)
+    original_axis.set_title("Original", fontweight="bold")
+    original_axis.axis("off")
+
+    if branch_attention.shape[0] == 1:
+        attention_axes = [figure.add_subplot(grid[0, 1:])]
+    else:
+        attention_axes = [
+            figure.add_subplot(grid[0, class_index + 1])
+            for class_index in range(class_count)
+        ]
+    for branch_index, (axis, branch_name) in enumerate(
+        zip(attention_axes, branch_names)
+    ):
+        attention = branch_attention[branch_index]
+        draw_attention(axis, coordinates, attention, tile_size)
+        axis.set_title(
+            "Attention — Shared"
+            if branch_attention.shape[0] == 1
+            else f"Attention — {branch_name}"
+        )
+        minimum = float(attention.min())
+        maximum = float(attention.max())
+        scalar_mappable = plt.cm.ScalarMappable(
+            cmap=plt.cm.jet,
+            norm=plt.Normalize(
+                vmin=minimum,
+                vmax=maximum if maximum > minimum else minimum + 1e-12,
+            ),
+        )
+        scalar_mappable.set_array([])
+        colorbar = figure.colorbar(
+            scalar_mappable, ax=axis, orientation="vertical", pad=0.04
+        )
+        if branch_index == len(attention_axes) - 1:
+            colorbar.set_label("Attention weight")
+
+    for class_index, class_name in enumerate(class_names):
+        axis = figure.add_subplot(grid[1, class_index + 1])
+        evidence = class_evidence[class_index]
+        color_limit = evidence_color_limit(evidence)
+        draw_evidence(axis, coordinates, evidence, tile_size, color_limit)
+        is_predicted = class_index == predicted_index
+        axis.set_title(
+            f"★ Evidence — {class_name}" if is_predicted else f"Evidence — {class_name}",
+            fontweight="bold" if is_predicted else "normal",
+            bbox=(
+                {"facecolor": "gold", "alpha": 0.35, "edgecolor": "darkorange"}
+                if is_predicted
+                else None
+            ),
+        )
+        _, percentage = top_positive_evidence_contribution(
+            evidence, float(bag_evidence_sums[class_index])
+        )
+        annotation = (
+            "Top 25 support: N/A\n(bag tile evidence ≈ 0)"
+            if percentage is None
+            else f"Top 25 support: {percentage:.1f}%\nof bag tile evidence"
+        )
+        axis.text(
+            0.5,
+            -0.08,
+            annotation,
+            transform=axis.transAxes,
+            ha="center",
+            va="top",
+            fontsize=8,
+        )
+        scalar_mappable = plt.cm.ScalarMappable(
+            cmap=plt.cm.RdBu_r,
+            norm=plt.Normalize(vmin=-color_limit, vmax=color_limit),
+        )
+        scalar_mappable.set_array([])
+        colorbar = figure.colorbar(
+            scalar_mappable, ax=axis, orientation="vertical", pad=0.04
+        )
+        if class_index == class_count - 1:
+            colorbar.set_label(
+                "Signed logit evidence\n★ Predicted class highlighted"
+            )
+
+    figure.suptitle(
+        f"Slide: {slide_name} | Tissue: {tissue_name}\n"
+        f"True: {true_class} | Predicted: {predicted_class} "
+        f"({predicted_probability:.3f}) | Evidence: red supports, blue opposes",
+        fontsize=12,
+        fontweight="bold",
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=render_dpi, bbox_inches="tight")
+    plt.close(figure)
+    tqdm.write(f"Saved combined attention/evidence heatmap to {output_path}")
 
 
 def safe_filename(value: str) -> str:
@@ -445,8 +988,10 @@ def evaluate_with_attention(
     bag_level: str,
     tile_size: int = 448,
     thumbnail_size: int = 512,
+    render_dpi: int = 150,
+    render_workers: int = 1,
 ) -> List[Dict[str, Any]]:
-    """Render exactly aligned canonical attention for each bag and tissue.
+    """Render exactly aligned attention and evidence for each bag and tissue.
 
     Args:
         model (CLAMModel): Loaded canonical CLAM-SB or CLAM-MB model.
@@ -458,105 +1003,242 @@ def evaluate_with_attention(
         bag_level (str): Checkpoint bag level, tissue or slide.
         tile_size (int): Tile size in source-image pixels.
         thumbnail_size (int): Maximum thumbnail width and height.
+        render_dpi (int): Positive output resolution in dots per inch.
+        render_workers (int): Number of independent figure-rendering processes.
 
     Returns:
-        List[Dict[str, Any]]: One summary record per rendered tissue.
+        List[Dict[str, Any]]: One attention/evidence summary per rendered tissue.
     """
+    if render_workers <= 0:
+        raise ValueError("render_workers must be positive.")
     results: List[Dict[str, Any]] = []
+    render_futures: List[Future[None]] = []
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     model.eval()
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc=f"Visualizing {bag_level} bags"):
-            features = batch["features"].to(device)
-            masks = batch["masks"].to(device)
-            outputs = model(features, mask=masks, instance_eval=False)
-            attention_weights = outputs["attention_weights"]
-            if not isinstance(attention_weights, torch.Tensor) or attention_weights.ndim != 3:
-                raise ValueError(
-                    "Canonical model attention_weights must be a tensor shaped [B, K, N]."
-                )
-            probabilities = outputs["probabilities"].detach().cpu()
-            predictions = outputs["predictions"].detach().cpu()
-            labels = batch["labels"].detach().cpu()
-
-            for bag_index, slide_name in enumerate(batch["slide_names"]):
-                valid_mask = batch["masks"][bag_index]
-                attention = attention_weights[bag_index, :, valid_mask.to(device)].detach().cpu()
-                coordinates = batch["coordinates"][bag_index, valid_mask].detach().cpu()
-                tissue_indices = batch["tissue_indices"][bag_index, valid_mask].detach().cpu()
-                tissue_names = [str(name) for name in batch["bag_tissue_names"][bag_index]]
-                validate_aligned_bag(
-                    attention, coordinates, tissue_indices, tissue_names
-                )
-
-                true_index = int(labels[bag_index].item())
-                predicted_index = int(predictions[bag_index].item())
-                true_class = class_names[true_index]
-                predicted_class = class_names[predicted_index]
-                predicted_probability = float(
-                    probabilities[bag_index, predicted_index].item()
-                )
-                branch_names = (
-                    list(class_names)
-                    if isinstance(model, CLAM_MB)
-                    else ["Shared attention"]
-                )
-                expected_branches = len(branch_names)
-                if attention.shape[0] != expected_branches:
+    render_executor = (
+        ProcessPoolExecutor(
+            max_workers=render_workers,
+            mp_context=mp.get_context("spawn"),
+        )
+        if render_workers > 1
+        else None
+    )
+    try:
+        with torch.inference_mode():
+            for batch in tqdm(dataloader, desc=f"Preparing {bag_level} bags"):
+                features = batch["features"].to(device)
+                masks = batch["masks"].to(device)
+                outputs = model(features, mask=masks, instance_eval=False)
+                attention_weights = outputs["attention_weights"]
+                if (
+                    not isinstance(attention_weights, torch.Tensor)
+                    or attention_weights.ndim != 3
+                ):
                     raise ValueError(
-                        f"Expected {expected_branches} attention branches, "
-                        f"received {attention.shape[0]}."
+                        "Canonical model attention_weights must be a tensor "
+                        "shaped [B, K, N]."
                     )
+                logits = outputs["logits"]
+                if not isinstance(logits, torch.Tensor):
+                    raise TypeError("Canonical model logits must be a tensor.")
+                evidence_weights, reconstruction_errors = compute_tile_evidence(
+                    model=model,
+                    features=features,
+                    masks=masks,
+                    attention_weights=attention_weights,
+                    logits=logits,
+                )
+                probabilities = outputs["probabilities"].detach().cpu()
+                predictions = outputs["predictions"].detach().cpu()
+                labels = batch["labels"].detach().cpu()
+                classifier_biases = torch.stack(
+                    [
+                        classifier.bias.detach().cpu().squeeze(0)
+                        for classifier in model.classifiers
+                    ]
+                )
 
-                for tissue_index, tissue_name in enumerate(tissue_names):
-                    tissue_mask = tissue_indices == tissue_index
-                    if not bool(tissue_mask.any()):
-                        continue
-                    tissue_attention = attention[:, tissue_mask].numpy()
-                    tissue_coordinates = coordinates[tissue_mask].numpy()
-                    if tissue_attention.shape[1] != tissue_coordinates.shape[0]:
-                        raise RuntimeError("Internal tissue alignment invariant failed.")
-                    image_path = find_tissue_image(
-                        data_root, true_class, str(slide_name), tissue_name
+                for bag_index, slide_name in enumerate(batch["slide_names"]):
+                    valid_mask = batch["masks"][bag_index]
+                    attention = attention_weights[
+                        bag_index, :, valid_mask.to(device)
+                    ].detach().cpu()
+                    evidence = evidence_weights[
+                        bag_index, :, valid_mask.to(device)
+                    ].detach().cpu()
+                    coordinates = batch["coordinates"][
+                        bag_index, valid_mask
+                    ].detach().cpu()
+                    tissue_indices = batch["tissue_indices"][
+                        bag_index, valid_mask
+                    ].detach().cpu()
+                    tissue_names = [
+                        str(name)
+                        for name in batch["bag_tissue_names"][bag_index]
+                    ]
+                    validate_aligned_bag(
+                        attention, coordinates, tissue_indices, tissue_names
                     )
-                    output_path = output_root / (
-                        f"{safe_filename(str(slide_name))}_"
-                        f"{safe_filename(tissue_name)}_attention.png"
+                    if evidence.shape != (len(class_names), attention.shape[1]):
+                        raise ValueError(
+                            "Class evidence is not aligned with the unpadded bag."
+                        )
+                    bag_evidence_sums = evidence.sum(dim=-1)
+
+                    true_index = int(labels[bag_index].item())
+                    predicted_index = int(predictions[bag_index].item())
+                    true_class = class_names[true_index]
+                    predicted_class = class_names[predicted_index]
+                    predicted_probability = float(
+                        probabilities[bag_index, predicted_index].item()
                     )
-                    save_attention_figure(
-                        branch_attention=tissue_attention,
-                        coordinates=tissue_coordinates,
-                        branch_names=branch_names,
-                        predicted_index=predicted_index,
-                        slide_name=str(slide_name),
-                        tissue_name=tissue_name,
-                        true_class=true_class,
-                        predicted_class=predicted_class,
-                        predicted_probability=predicted_probability,
-                        image_path=image_path,
-                        output_path=output_path,
-                        tile_size=tile_size,
-                        thumbnail_size=thumbnail_size,
+                    branch_names = (
+                        list(class_names)
+                        if isinstance(model, CLAM_MB)
+                        else ["Shared attention"]
                     )
-                    primary_index = predicted_index if isinstance(model, CLAM_MB) else 0
-                    primary_attention = tissue_attention[primary_index]
-                    results.append(
-                        {
-                            "bag_level": bag_level,
+                    expected_branches = len(branch_names)
+                    if attention.shape[0] != expected_branches:
+                        raise ValueError(
+                            f"Expected {expected_branches} attention branches, "
+                            f"received {attention.shape[0]}."
+                        )
+
+                    for tissue_index, tissue_name in enumerate(tissue_names):
+                        tissue_mask = tissue_indices == tissue_index
+                        if not bool(tissue_mask.any()):
+                            continue
+                        tissue_attention = attention[:, tissue_mask].numpy()
+                        tissue_evidence = evidence[:, tissue_mask].numpy()
+                        tissue_coordinates = coordinates[tissue_mask].numpy()
+                        if (
+                            tissue_attention.shape[1]
+                            != tissue_coordinates.shape[0]
+                        ):
+                            raise RuntimeError(
+                                "Internal tissue alignment invariant failed."
+                            )
+                        if (
+                            tissue_evidence.shape[1]
+                            != tissue_coordinates.shape[0]
+                        ):
+                            raise RuntimeError(
+                                "Internal tissue evidence alignment invariant "
+                                "failed."
+                            )
+                        image_path = find_tissue_image(
+                            data_root, true_class, str(slide_name), tissue_name
+                        )
+                        output_path = output_root / (
+                            f"{safe_filename(str(slide_name))}_"
+                            f"{safe_filename(tissue_name)}_attention.png"
+                        )
+                        render_arguments = {
+                            "branch_attention": tissue_attention,
+                            "class_evidence": tissue_evidence,
+                            "coordinates": tissue_coordinates,
+                            "branch_names": branch_names,
+                            "class_names": class_names,
+                            "bag_evidence_sums": bag_evidence_sums.numpy(),
+                            "predicted_index": predicted_index,
                             "slide_name": str(slide_name),
                             "tissue_name": tissue_name,
                             "true_class": true_class,
                             "predicted_class": predicted_class,
                             "predicted_probability": predicted_probability,
-                            "primary_attention_branch": branch_names[primary_index],
-                            "num_tiles": int(primary_attention.size),
-                            "attention_mass": float(primary_attention.sum()),
-                            "max_attention": float(primary_attention.max()),
-                            "mean_attention": float(primary_attention.mean()),
-                            "heatmap_path": str(output_path),
+                            "image_path": image_path,
+                            "output_path": output_path,
+                            "tile_size": tile_size,
+                            "thumbnail_size": thumbnail_size,
+                            "render_dpi": render_dpi,
                         }
-                    )
+                        if render_executor is None:
+                            save_attention_evidence_figure(**render_arguments)
+                        else:
+                            render_futures.append(
+                                render_executor.submit(
+                                    save_attention_evidence_figure,
+                                    **render_arguments,
+                                )
+                            )
+
+                        evidence_diagnostics: Dict[
+                            str, Dict[str, Optional[float]]
+                        ] = {}
+                        for class_index, class_name in enumerate(class_names):
+                            top_sum, top_percentage = (
+                                top_positive_evidence_contribution(
+                                    tissue_evidence[class_index],
+                                    float(
+                                        bag_evidence_sums[class_index].item()
+                                    ),
+                                )
+                            )
+                            bag_sum = float(
+                                bag_evidence_sums[class_index].item()
+                            )
+                            evidence_diagnostics[str(class_name)] = {
+                                "tissue_evidence_sum": float(
+                                    tissue_evidence[class_index].sum()
+                                ),
+                                "bag_tile_evidence_sum": bag_sum,
+                                "reconstructed_logit": (
+                                    bag_sum
+                                    + float(
+                                        classifier_biases[class_index].item()
+                                    )
+                                ),
+                                "logit_reconstruction_error": float(
+                                    reconstruction_errors[
+                                        bag_index, class_index
+                                    ].item()
+                                ),
+                                "top_25_positive_evidence_sum": top_sum,
+                                "top_25_contribution_percentage": top_percentage,
+                            }
+                        primary_index = (
+                            predicted_index
+                            if isinstance(model, CLAM_MB)
+                            else 0
+                        )
+                        primary_attention = tissue_attention[primary_index]
+                        results.append(
+                            {
+                                "bag_level": bag_level,
+                                "slide_name": str(slide_name),
+                                "tissue_name": tissue_name,
+                                "true_class": true_class,
+                                "predicted_class": predicted_class,
+                                "predicted_probability": predicted_probability,
+                                "primary_attention_branch": branch_names[
+                                    primary_index
+                                ],
+                                "num_tiles": int(primary_attention.size),
+                                "attention_mass": float(
+                                    primary_attention.sum()
+                                ),
+                                "max_attention": float(
+                                    primary_attention.max()
+                                ),
+                                "mean_attention": float(
+                                    primary_attention.mean()
+                                ),
+                                "heatmap_path": str(output_path),
+                                "evidence_heatmap_path": str(output_path),
+                                "evidence_by_class": evidence_diagnostics,
+                            }
+                        )
+        for render_future in tqdm(
+            as_completed(render_futures),
+            total=len(render_futures),
+            desc="Writing heatmaps",
+            disable=not render_futures,
+        ):
+            render_future.result()
+    finally:
+        if render_executor is not None:
+            render_executor.shutdown(wait=True, cancel_futures=True)
     return results
 
 
@@ -591,6 +1273,20 @@ def main() -> None:
         else visualization.get("max_slides")
     )
     max_bags = int(max_bags_value) if max_bags_value is not None else None
+    render_dpi = (
+        args.dpi
+        if args.dpi is not None
+        else int(visualization.get("dpi", 150))
+    )
+    if render_dpi <= 0:
+        raise ValueError("Visualization DPI must be positive.")
+    render_workers = (
+        args.render_workers
+        if args.render_workers is not None
+        else int(visualization.get("render_workers", 4))
+    )
+    if render_workers <= 0:
+        raise ValueError("Visualization render_workers must be positive.")
     output_dir = (
         args.output_dir
         or launcher_config["paths"]["attention_output"]
@@ -613,6 +1309,7 @@ def main() -> None:
         num_workers=int(checkpoint_config.get("num_workers", 0)),
     )
     print(f"Using device: {device}")
+    print(f"Render workers: {render_workers} | DPI: {render_dpi}")
     print(f"Model: {checkpoint_config['model_type']} | bag level: {bag_level}")
     print(f"Split: {split} | bags: {len(dataset)} | classes: {class_folders}")
     results = evaluate_with_attention(
@@ -625,12 +1322,17 @@ def main() -> None:
         bag_level=bag_level,
         tile_size=int(visualization.get("tile_size", 448)),
         thumbnail_size=int(visualization.get("thumbnail_size", 512)),
+        render_dpi=render_dpi,
+        render_workers=render_workers,
     )
     summary_path = Path(output_dir) / f"attention_summary_{split}.json"
     with summary_path.open("w", encoding="utf-8") as summary_file:
         json.dump(results, summary_file, indent=2)
-    print(f"Rendered {len(results)} tissue heatmaps from {len(dataset)} bags.")
-    print(f"Attention summary saved to {summary_path}")
+    print(
+        f"Rendered {len(results)} paired attention/evidence tissue heatmaps "
+        f"from {len(dataset)} bags."
+    )
+    print(f"Attention and evidence summary saved to {summary_path}")
 
 
 if __name__ == "__main__":
