@@ -234,20 +234,30 @@ class _CLAMBase(nn.Module):
         logits_parts: List[torch.Tensor] = []
         loss_parts: List[torch.Tensor] = []
         target_parts: List[torch.Tensor] = []
+        label_indices = labels.detach().cpu().tolist()
 
         for bag_index in range(embedded.shape[0]):
-            valid_features = embedded[bag_index, mask[bag_index]]
+            valid_mask = mask[bag_index]
+            valid_features = embedded[bag_index, valid_mask]
             valid_count = valid_features.shape[0]
-            label = int(labels[bag_index].item())
+            label = int(label_indices[bag_index])
+            shared_order = (
+                torch.argsort(attention_scores[bag_index, 0, valid_mask])
+                if self.num_attention_branches == 1
+                else None
+            )
 
             for class_index, classifier in enumerate(self.instance_classifiers):
                 branch_index = (
                     class_index if self.num_attention_branches > 1 else 0
                 )
-                valid_scores = attention_scores[
-                    bag_index, branch_index, mask[bag_index]
-                ]
-                order = torch.argsort(valid_scores)
+                order = (
+                    shared_order
+                    if shared_order is not None
+                    else torch.argsort(
+                        attention_scores[bag_index, branch_index, valid_mask]
+                    )
+                )
 
                 if class_index == label:
                     k = min(self.k_sample, valid_count // 2)

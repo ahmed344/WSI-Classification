@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Type
@@ -179,6 +180,95 @@ def test_config_validation_rejects_invalid_values(
         load_config(str(invalid_path))
 
 
+@pytest.mark.parametrize(
+    ("evaluation", "message"),
+    [
+        ("slide", "evaluation.*mapping"),
+        ({"supplementary_bag_level": "patient"}, "supplementary_bag_level"),
+        ({"include_train": "yes"}, "include_train"),
+    ],
+)
+def test_config_validation_rejects_invalid_evaluation_controls(
+    tmp_path: Path,
+    evaluation: object,
+    message: str,
+) -> None:
+    """Verify malformed dual-level evaluation controls fail during loading.
+
+    Args:
+        tmp_path (Path): Pytest temporary directory.
+        evaluation (object): Invalid evaluation section replacement.
+        message (str): Expected error-message expression.
+
+    Returns:
+        None: Assertions verify eager evaluation-control validation.
+    """
+    canonical_path = CLAM_DIRECTORY / "config.yml"
+    with canonical_path.open("r", encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file)
+    config["evaluation"] = evaluation
+    invalid_path = tmp_path / "invalid_evaluation.yml"
+    with invalid_path.open("w", encoding="utf-8") as config_file:
+        yaml.safe_dump(config, config_file)
+    with pytest.raises(ValueError, match=message):
+        load_config(str(invalid_path))
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("num_workers", -1, "num_workers"),
+        ("num_workers", True, "num_workers"),
+        ("prefetch_factor", 0, "prefetch_factor"),
+        ("prefetch_factor", 1.5, "prefetch_factor"),
+    ],
+)
+def test_training_config_rejects_invalid_loader_values(
+    tmp_path: Path,
+    key: str,
+    value: object,
+    message: str,
+) -> None:
+    """Verify invalid DataLoader controls fail before training starts.
+
+    Args:
+        tmp_path (Path): Pytest temporary directory.
+        key (str): Loader configuration key to invalidate.
+        value (object): Invalid replacement value.
+        message (str): Expected error-message fragment.
+
+    Returns:
+        None: Assertions verify eager training configuration validation.
+    """
+    config = _pipeline_config(tmp_path, "tissue")
+    config[key] = value
+    with pytest.raises(ValueError, match=message):
+        train_clam._validate_training_config(config)
+
+
+def test_make_loader_uses_workers_and_prefetch_factor(tmp_path: Path) -> None:
+    """Verify the production loader applies parallel loading controls.
+
+    Args:
+        tmp_path (Path): Pytest temporary directory.
+
+    Returns:
+        None: Assertions verify worker, prefetch, and lifecycle settings.
+    """
+    _write_fixture_dataset(tmp_path)
+    config = _pipeline_config(tmp_path, "tissue")
+    config.update({"batch_size": 2, "num_workers": 2, "prefetch_factor": 3})
+    dataset = create_bag_dataset(config, "train")
+
+    loader = train_clam._make_loader(dataset, config, training=False)
+    batch = next(iter(loader))
+
+    assert loader.num_workers == 2
+    assert loader.prefetch_factor == 3
+    assert loader.persistent_workers is False
+    assert batch["features"].shape[0] == 2
+
+
 def test_generalized_cross_entropy_q_zero_matches_cross_entropy() -> None:
     """Verify that ``q=0`` recovers ordinary cross entropy.
 
@@ -333,6 +423,71 @@ def test_one_batch_train_validate_and_evaluate(
     assert sample["num_tissues"] == (1 if bag_level == "tissue" else 2)
 
 
+def test_validate_defers_metric_reduction_without_changing_values(
+    tmp_path: Path,
+) -> None:
+    """Verify deferred device reductions preserve unequal-batch epoch metrics.
+
+    Args:
+        tmp_path (Path): Pytest temporary directory.
+
+    Returns:
+        None: Assertions compare validation metrics with manual batch reductions.
+    """
+    _write_fixture_dataset(tmp_path)
+    config = _pipeline_config(tmp_path, "tissue")
+    dataset = create_bag_dataset(config, "train")
+    loader = DataLoader(
+        dataset,
+        batch_size=3,
+        shuffle=False,
+        collate_fn=collate_fn,
+    )
+    model = train_clam.create_model(config)
+    criterion = nn.CrossEntropyLoss()
+    bag_weight = 0.7
+    expected_totals = {
+        "loss": 0.0,
+        "classification_loss": 0.0,
+        "instance_loss": 0.0,
+    }
+
+    model.eval()
+    with torch.inference_mode():
+        for batch in loader:
+            outputs = model(
+                batch["features"],
+                mask=batch["masks"],
+                labels=batch["labels"],
+                instance_eval=True,
+            )
+            classification_loss = criterion(outputs["logits"], batch["labels"])
+            instance_loss = outputs["instance_loss"]
+            loss = (
+                bag_weight * classification_loss
+                + (1.0 - bag_weight) * instance_loss
+            )
+            batch_size = int(batch["labels"].shape[0])
+            expected_totals["loss"] += float(loss.item()) * batch_size
+            expected_totals["classification_loss"] += (
+                float(classification_loss.item()) * batch_size
+            )
+            expected_totals["instance_loss"] += (
+                float(instance_loss.item()) * batch_size
+            )
+
+    metrics = train_clam.validate(
+        model,
+        loader,
+        criterion,
+        torch.device("cpu"),
+        bag_weight,
+    )
+
+    for key, expected_total in expected_totals.items():
+        assert metrics[key] == pytest.approx(expected_total / len(dataset))
+
+
 def test_fixed_metrics_retain_absent_classes() -> None:
     """Verify metric tensors retain every configured class.
 
@@ -354,6 +509,178 @@ def test_fixed_metrics_retain_absent_classes() -> None:
         probabilities=[[0.8, 0.1, 0.1], [0.4, 0.5, 0.1], [0.1, 0.8, 0.1]],
         num_classes=3,
     ) is None
+
+
+def test_slide_checkpoint_metric_and_patience_warmup() -> None:
+    """Verify slide checkpoint resolution and post-warm-up patience counting.
+
+    Args:
+        None: This test exercises deterministic metric-policy helpers.
+
+    Returns:
+        None: Assertions verify metric routing and early-stopping semantics.
+    """
+    metric_key, maximize, metric_name = (
+        train_clam.resolve_best_checkpoint_metric("slide_balanced_accuracy")
+    )
+    assert metric_key == "balanced_accuracy"
+    assert maximize is True
+    assert metric_name == "slide_balanced_accuracy"
+
+    counter = 0
+    for epoch in range(1, 11):
+        counter = train_clam.update_patience_counter(
+            counter,
+            improved=False,
+            epoch=epoch,
+            minimum_epochs=10,
+        )
+    assert counter == 0
+    counter = train_clam.update_patience_counter(
+        counter,
+        improved=False,
+        epoch=11,
+        minimum_epochs=10,
+    )
+    assert counter == 1
+    assert train_clam.update_patience_counter(
+        counter,
+        improved=True,
+        epoch=12,
+        minimum_epochs=10,
+    ) == 0
+
+
+def test_default_evaluation_controls_include_tissue_and_slide() -> None:
+    """Verify configured standalone evaluation runs both CLAM bag levels.
+
+    Args:
+        None: This test uses an in-memory runtime configuration.
+
+    Returns:
+        None: Assertions verify ordered levels and the train-split switch.
+    """
+    levels, include_train = evaluate_clam._evaluation_controls(
+        {
+            "evaluation": {
+                "supplementary_bag_level": "slide",
+                "include_train": False,
+            }
+        },
+        primary_level="tissue",
+        supplementary_level=None,
+        include_train=None,
+    )
+    assert levels == ["tissue", "slide"]
+    assert include_train is False
+
+
+def test_slide_level_evaluation_writes_all_artifacts(tmp_path: Path) -> None:
+    """Verify concatenated-slide evaluation emits summary and matrix files.
+
+    Args:
+        tmp_path (Path): Temporary dataset and artifact root.
+
+    Returns:
+        None: Assertions verify slide bag composition and persisted artifacts.
+    """
+    data_root = tmp_path / "data"
+    _write_fixture_dataset(data_root)
+    config = _pipeline_config(data_root, "tissue")
+    config["slide_evaluation_batch_size"] = 1
+    model = train_clam.create_model(config)
+    output_dir = tmp_path / "evaluation"
+
+    result = evaluate_clam.run_level_split_evaluation(
+        model=model,
+        config=config,
+        class_folders=["Class0", "Class1"],
+        device=torch.device("cpu"),
+        output_dir=str(output_dir),
+        level="slide",
+        split="val",
+    )
+
+    assert result["num_bags"] == 2
+    assert Path(result["artifacts"]["summary"]).name == "slide_val_evaluation.json"
+    assert (
+        Path(result["artifacts"]["confusion_matrix"]).name
+        == "slide_val_confusion_matrix.png"
+    )
+    assert all(Path(path).is_file() for path in result["artifacts"].values())
+
+
+def test_training_records_slide_history_and_checkpoint_metric(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify one training epoch records and selects slide validation metrics.
+
+    Args:
+        tmp_path (Path): Temporary dataset and checkpoint root.
+        monkeypatch (pytest.MonkeyPatch): Fixture used to supply synthetic config.
+        capsys (pytest.CaptureFixture[str]): Fixture capturing grouped epoch output.
+
+    Returns:
+        None: Assertions verify history, metadata, and printed metric grouping.
+    """
+    data_root = tmp_path / "data"
+    _write_fixture_dataset(data_root)
+    checkpoint_dir = tmp_path / "checkpoints"
+    config = _pipeline_config(data_root, "tissue")
+    config.update(
+        {
+            "output_dir": str(tmp_path / "results"),
+            "checkpoint_dir": str(checkpoint_dir),
+            "paths": {
+                "checkpoint": str(checkpoint_dir / "best_model.pth"),
+                "evaluation_output": str(tmp_path / "evaluation"),
+                "attention_output": str(tmp_path / "attention"),
+            },
+            "_explicit_paths": {
+                "checkpoint": True,
+                "evaluation_output": True,
+                "attention_output": True,
+            },
+            "best_checkpoint_metric": "slide_balanced_accuracy",
+            "min_epochs_before_early_stopping": 0,
+            "patience": 2,
+            "slide_evaluation_batch_size": 1,
+        }
+    )
+
+    def _load_test_config(config_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return the synthetic dual-level training configuration.
+
+        Args:
+            config_path (Optional[str]): Ignored configuration path.
+
+        Returns:
+            Dict[str, Any]: Mutable configuration used by the training entry point.
+        """
+        del config_path
+        return config
+
+    monkeypatch.setattr(train_clam, "load_config", _load_test_config)
+    artifacts = train_clam.train("synthetic.yml")
+
+    with Path(artifacts["history"]).open("r", encoding="utf-8") as history_file:
+        history = json.load(history_file)
+    checkpoint = torch.load(
+        artifacts["best_checkpoint"],
+        map_location="cpu",
+        weights_only=False,
+    )
+    output = capsys.readouterr().out
+
+    assert len(history["train"]["loss"]) == 1
+    assert len(history["val"]["loss"]) == 1
+    assert len(history["val_slide"]["loss"]) == 1
+    assert checkpoint["best_metric"]["name"] == "slide_balanced_accuracy"
+    assert checkpoint["best_metric"]["level"] == "slide"
+    assert "Epoch metric order: train_tissue, val_tissue, val_slide" in output
+    assert "epoch=1 | loss=" in output
 
 
 @pytest.mark.parametrize("model_class", [CLAM_SB, CLAM_MB])

@@ -148,6 +148,7 @@ def print_training_banner(
     device: torch.device,
     train_dataset: WSIBagDataset,
     val_dataset: WSIBagDataset,
+    val_slide_dataset: WSIBagDataset,
     test_dataset: WSIBagDataset,
     model: nn.Module,
     run_dir: Path,
@@ -159,7 +160,8 @@ def print_training_banner(
         config (Mapping[str, Any]): Resolved training configuration.
         device (torch.device): Torch device used for training.
         train_dataset (WSIBagDataset): Training split dataset.
-        val_dataset (WSIBagDataset): Validation split dataset.
+        val_dataset (WSIBagDataset): Tissue-level validation split dataset.
+        val_slide_dataset (WSIBagDataset): Slide-level validation split dataset.
         test_dataset (WSIBagDataset): Test split dataset.
         model (nn.Module): Instantiated CLAM model.
         run_dir (Path): Directory receiving checkpoints and artifacts.
@@ -183,7 +185,8 @@ def print_training_banner(
     print(f"Model type: {config['model_type']} | bag level: {config['bag_level']}")
     print(f"Input dim: {config['input_dim']}")
     print(f"Training samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(val_dataset)}")
+    print(f"Validation tissue samples: {len(val_dataset)}")
+    print(f"Validation slide samples: {len(val_slide_dataset)}")
     print(f"Test samples: {len(test_dataset)}")
     print(f"Classes: {list(train_dataset.class_folders)}")
     print(f"Physical batch size: {batch_size}")
@@ -195,6 +198,7 @@ def print_training_banner(
     print_class_counts(train_dataset, val_dataset)
     print(f"Model parameters: {sum(param.numel() for param in model.parameters()):,}")
     print(f"Best checkpoint metric: {metric_name}")
+    print("Epoch metric order: train_tissue, val_tissue, val_slide")
     print(f"Run directory: {run_dir}")
 
 
@@ -287,19 +291,45 @@ def resolve_best_checkpoint_metric(metric_name: str) -> Tuple[str, bool, str]:
         Tuple[str, bool, str]: Metric key, maximize flag, and normalized name.
     """
     normalized = str(metric_name).strip().lower()
-    directions = {
-        "balanced_accuracy": True,
-        "accuracy": True,
-        "loss": False,
-        "classification_loss": False,
-        "instance_loss": False,
+    options = {
+        "balanced_accuracy": ("balanced_accuracy", True),
+        "slide_balanced_accuracy": ("balanced_accuracy", True),
+        "accuracy": ("accuracy", True),
+        "loss": ("loss", False),
+        "classification_loss": ("classification_loss", False),
+        "instance_loss": ("instance_loss", False),
     }
-    if normalized not in directions:
+    if normalized not in options:
         raise ValueError(
             f"Invalid best_checkpoint_metric '{metric_name}'. Valid options: "
-            + ", ".join(directions)
+            + ", ".join(options)
         )
-    return normalized, directions[normalized], normalized
+    metric_key, maximize = options[normalized]
+    return metric_key, maximize, normalized
+
+
+def update_patience_counter(
+    patience_counter: int,
+    improved: bool,
+    epoch: int,
+    minimum_epochs: int,
+) -> int:
+    """Update early-stopping patience after the warm-up period.
+
+    Args:
+        patience_counter (int): Current consecutive non-improvement count.
+        improved (bool): Whether the selected validation metric improved.
+        epoch (int): Current one-based epoch number.
+        minimum_epochs (int): Completed warm-up epochs that cannot consume patience.
+
+    Returns:
+        int: Reset, unchanged, or incremented patience count.
+    """
+    if improved:
+        return 0
+    if epoch <= minimum_epochs:
+        return patience_counter
+    return patience_counter + 1
 
 
 def _validate_training_config(config: Mapping[str, Any]) -> None:
@@ -315,6 +345,16 @@ def _validate_training_config(config: Mapping[str, Any]) -> None:
         value = config.get(key, 1 if key == "gradient_accumulation_steps" else None)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{key} must be a positive integer.")
+    num_workers = config.get("num_workers", 0)
+    if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 0:
+        raise ValueError("num_workers must be a nonnegative integer.")
+    prefetch_factor = config.get("prefetch_factor", 2)
+    if (
+        isinstance(prefetch_factor, bool)
+        or not isinstance(prefetch_factor, int)
+        or prefetch_factor <= 0
+    ):
+        raise ValueError("prefetch_factor must be a positive integer.")
     for key in ("lr_cls", "weight_decay_cls"):
         value = float(config[key])
         if not np.isfinite(value) or value < 0.0 or (key == "lr_cls" and value == 0.0):
@@ -328,6 +368,7 @@ def _make_loader(
     config: Mapping[str, Any],
     training: bool,
     class_weights: Optional[torch.Tensor] = None,
+    batch_size: Optional[int] = None,
 ) -> DataLoader:
     """Build a deterministic loader, optionally with weighted sampling.
 
@@ -336,6 +377,8 @@ def _make_loader(
         config (Mapping[str, Any]): Training configuration.
         training (bool): Whether to enable training order and sampling.
         class_weights (Optional[torch.Tensor]): Training class weights.
+        batch_size (Optional[int]): Explicit physical batch size, or ``None``
+            to use the configured training batch size.
 
     Returns:
         DataLoader: Configured bag DataLoader.
@@ -354,17 +397,23 @@ def _make_loader(
             generator=generator,
         )
         shuffle = False
-    return DataLoader(
-        dataset,
-        batch_size=int(config["batch_size"]),
-        shuffle=shuffle,
-        sampler=sampler,
-        collate_fn=collate_fn,
-        num_workers=int(config.get("num_workers", 0)),
-        worker_init_fn=seed_worker,
-        generator=generator,
-        pin_memory=torch.cuda.is_available(),
-    )
+    num_workers = int(config.get("num_workers", 0))
+    loader_arguments: Dict[str, Any] = {
+        "batch_size": (
+            int(config["batch_size"]) if batch_size is None else int(batch_size)
+        ),
+        "shuffle": shuffle,
+        "sampler": sampler,
+        "collate_fn": collate_fn,
+        "num_workers": num_workers,
+        "worker_init_fn": seed_worker,
+        "generator": generator,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": False,
+    }
+    if num_workers > 0:
+        loader_arguments["prefetch_factor"] = int(config.get("prefetch_factor", 2))
+    return DataLoader(dataset, **loader_arguments)
 
 
 def _classification_metrics(
@@ -432,12 +481,16 @@ def _run_epoch(
     if optimizer is not None:
         optimizer.zero_grad(set_to_none=True)
 
-    totals = {"loss": 0.0, "classification_loss": 0.0, "instance_loss": 0.0}
-    labels_all: List[int] = []
-    predictions_all: List[int] = []
+    total_chunks: Dict[str, List[torch.Tensor]] = {
+        "loss": [],
+        "classification_loss": [],
+        "instance_loss": [],
+    }
+    label_chunks: List[torch.Tensor] = []
+    prediction_chunks: List[torch.Tensor] = []
     sample_count = 0
 
-    context = torch.enable_grad() if training else torch.no_grad()
+    context = torch.enable_grad() if training else torch.inference_mode()
     with context:
         for batch_index, batch in enumerate(dataloader):
             features = batch["features"].to(device, non_blocking=True)
@@ -462,14 +515,24 @@ def _run_epoch(
 
             batch_size = int(labels.shape[0])
             sample_count += batch_size
-            totals["loss"] += float(loss.detach().item()) * batch_size
-            totals["classification_loss"] += (
-                float(classification_loss.detach().item()) * batch_size
+            total_chunks["loss"].append(
+                loss.detach().to(dtype=torch.float64) * batch_size
             )
-            totals["instance_loss"] += float(instance_loss.detach().item()) * batch_size
-            labels_all.extend(labels.detach().cpu().tolist())
-            predictions_all.extend(outputs["predictions"].detach().cpu().tolist())
+            total_chunks["classification_loss"].append(
+                classification_loss.detach().to(dtype=torch.float64) * batch_size
+            )
+            total_chunks["instance_loss"].append(
+                instance_loss.detach().to(dtype=torch.float64) * batch_size
+            )
+            label_chunks.append(labels.detach())
+            prediction_chunks.append(outputs["predictions"].detach())
 
+    totals = {
+        key: float(torch.stack(chunks).sum().cpu().item())
+        for key, chunks in total_chunks.items()
+    }
+    labels_all = torch.cat(label_chunks).cpu().tolist()
+    predictions_all = torch.cat(prediction_chunks).cpu().tolist()
     metrics: Dict[str, Any] = {
         key: value / sample_count for key, value in totals.items()
     }
@@ -588,7 +651,7 @@ def plot_history(
     save_path: str,
     best_epoch: int,
 ) -> None:
-    """Plot canonical train and validation history.
+    """Plot tissue training and tissue/slide validation history.
 
     Args:
         history (Mapping[str, Mapping[str, Sequence[float]]]): Metric history.
@@ -600,8 +663,9 @@ def plot_history(
     """
     figure, axes = plt.subplots(len(METRIC_KEYS), 1, figsize=(10, 20))
     for axis, key in zip(axes, METRIC_KEYS):
-        axis.plot(history["train"][key], label="train")
-        axis.plot(history["val"][key], label="val")
+        axis.plot(history["train"][key], label="train_tissue")
+        axis.plot(history["val"][key], label="val_tissue")
+        axis.plot(history["val_slide"][key], label="val_slide")
         axis.axvline(best_epoch - 1, color="red", linestyle="--", label="best")
         axis.set_ylabel(key)
         axis.grid(True, alpha=0.3)
@@ -634,14 +698,37 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
             f"Configured num_classes={config['num_classes']} does not equal "
             f"dataset classes={train_dataset.num_classes}: {class_folders}."
         )
-    val_dataset = create_bag_dataset(config, "val", class_folders=class_folders)
+    val_dataset = create_bag_dataset(
+        config,
+        "val",
+        class_folders=class_folders,
+        bag_level="tissue",
+    )
+    val_slide_dataset = create_bag_dataset(
+        config,
+        "val",
+        class_folders=class_folders,
+        bag_level="slide",
+    )
     test_dataset = create_bag_dataset(config, "test", class_folders=class_folders)
-    if len(train_dataset) == 0 or len(val_dataset) == 0:
-        raise ValueError("Training and validation splits must both contain bags.")
+    if (
+        len(train_dataset) == 0
+        or len(val_dataset) == 0
+        or len(val_slide_dataset) == 0
+    ):
+        raise ValueError(
+            "Training and tissue/slide validation splits must contain bags."
+        )
 
     class_weights = compute_class_weights(train_dataset)
     train_loader = _make_loader(train_dataset, config, True, class_weights)
     val_loader = _make_loader(val_dataset, config, False)
+    val_slide_loader = _make_loader(
+        val_slide_dataset,
+        config,
+        False,
+        batch_size=int(config.get("slide_evaluation_batch_size", 1)),
+    )
     model = create_model(config).to(device)
     criterion = create_classification_criterion(
         config,
@@ -667,6 +754,7 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
         device,
         train_dataset,
         val_dataset,
+        val_slide_dataset,
         test_dataset,
         model,
         run_dir,
@@ -675,8 +763,10 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
     best_value = -float("inf") if maximize else float("inf")
     best_epoch = 0
     patience_counter = 0
+    minimum_epochs = int(config.get("min_epochs_before_early_stopping", 0))
     history: Dict[str, Dict[str, List[float]]] = {
-        split: {key: [] for key in METRIC_KEYS} for split in ("train", "val")
+        split: {key: [] for key in METRIC_KEYS}
+        for split in ("train", "val", "val_slide")
     }
     checkpoint_dir = Path(config["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -699,12 +789,26 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
             int(config.get("gradient_accumulation_steps", 1)),
         )
         val_metrics = validate(model, val_loader, criterion, device, bag_weight)
+        val_slide_metrics = validate(
+            model,
+            val_slide_loader,
+            criterion,
+            device,
+            bag_weight,
+        )
         scheduler.step(float(val_metrics["loss"]))
-        for split, metrics in (("train", train_metrics), ("val", val_metrics)):
+        for split, metrics in (
+            ("train", train_metrics),
+            ("val", val_metrics),
+            ("val_slide", val_slide_metrics),
+        ):
             for key in METRIC_KEYS:
                 history[split][key].append(float(metrics[key]))
 
-        current = float(val_metrics[metric_key])
+        selection_metrics = (
+            val_slide_metrics if metric_name.startswith("slide_") else val_metrics
+        )
+        current = float(selection_metrics[metric_key])
         improved = current > best_value if maximize else current < best_value
         if improved:
             best_value = current
@@ -712,6 +816,9 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
             patience_counter = 0
             best_metadata = {
                 "name": metric_name,
+                "level": (
+                    "slide" if metric_name.startswith("slide_") else "tissue"
+                ),
                 "mode": "max" if maximize else "min",
                 "value": best_value,
                 "epoch": best_epoch,
@@ -730,28 +837,33 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
                 ),
                 best_path,
             )
-        else:
-            patience_counter += 1
+        patience_counter = update_patience_counter(
+            patience_counter,
+            improved,
+            epoch,
+            minimum_epochs,
+        )
 
         tqdm.write(
-            f"epoch={epoch} "
-            f"train_loss={train_metrics['loss']:.5f} "
-            f"val_loss={val_metrics['loss']:.5f} "
-            f"train_acc={train_metrics['accuracy']:.4f} "
-            f"val_acc={val_metrics['accuracy']:.4f} "
-            f"train_bal_acc={train_metrics['balanced_accuracy']:.4f} "
-            f"val_bal_acc={val_metrics['balanced_accuracy']:.4f} "
-            f"train_f1={train_metrics['macro_f1']:.4f} "
-            f"val_f1={val_metrics['macro_f1']:.4f}"
+            f"epoch={epoch} | "
+            f"loss={train_metrics['loss']:.5f}, {val_metrics['loss']:.5f}, "
+            f"{val_slide_metrics['loss']:.5f} | "
+            f"acc={train_metrics['accuracy']:.4f}, "
+            f"{val_metrics['accuracy']:.4f}, "
+            f"{val_slide_metrics['accuracy']:.4f} | "
+            f"bal_acc={train_metrics['balanced_accuracy']:.4f}, "
+            f"{val_metrics['balanced_accuracy']:.4f}, "
+            f"{val_slide_metrics['balanced_accuracy']:.4f} | "
+            f"f1={train_metrics['macro_f1']:.4f}, "
+            f"{val_metrics['macro_f1']:.4f}, "
+            f"{val_slide_metrics['macro_f1']:.4f}"
         )
-        if (
-            epoch >= int(config.get("min_epochs_before_early_stopping", 0))
-            and patience_counter >= int(config["patience"])
-        ):
+        if epoch > minimum_epochs and patience_counter >= int(config["patience"]):
             break
 
     best_metadata = {
         "name": metric_name,
+        "level": "slide" if metric_name.startswith("slide_") else "tissue",
         "mode": "max" if maximize else "min",
         "value": best_value,
         "epoch": best_epoch,

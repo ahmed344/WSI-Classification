@@ -373,16 +373,24 @@ def run_level_split_evaluation(
             f"dataset classes={dataset.num_classes}."
         )
     generator = torch.Generator().manual_seed(int(config["random_seed"]))
-    dataloader = DataLoader(
-        dataset,
-        batch_size=int(config["batch_size"]),
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=int(config.get("num_workers", 0)),
-        worker_init_fn=seed_worker,
-        generator=generator,
-        pin_memory=torch.cuda.is_available(),
-    )
+    num_workers = int(config.get("num_workers", 0))
+    loader_arguments: Dict[str, Any] = {
+        "batch_size": (
+            int(config.get("slide_evaluation_batch_size", 1))
+            if level == "slide"
+            else int(config["batch_size"])
+        ),
+        "shuffle": False,
+        "collate_fn": collate_fn,
+        "num_workers": num_workers,
+        "worker_init_fn": seed_worker,
+        "generator": generator,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": False,
+    }
+    if num_workers > 0:
+        loader_arguments["prefetch_factor"] = int(config.get("prefetch_factor", 2))
+    dataloader = DataLoader(dataset, **loader_arguments)
     metrics = evaluate(model, dataloader, device, class_folders)
     print(f"{level}/{split} bags={len(dataset)} counts={get_class_sample_counts(dataset)}")
     print_metrics(metrics, class_folders)

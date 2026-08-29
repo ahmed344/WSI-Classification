@@ -32,7 +32,10 @@ bag_weight: 0.5  # Weight of bag loss; instance loss receives 1 - bag_weight
 
 # Training parameters
 batch_size: 128  # Physical number of variable-length bags per micro-batch
+slide_evaluation_batch_size: 1  # Physical batch size for memory-intensive concatenated-slide validation/evaluation
 gradient_accumulation_steps: 1  # Effective batch size is batch_size * this value
+num_workers: 8  # Parallel DataLoader workers; limited by the container's 8 GB shared memory
+prefetch_factor: 2  # Complete batches prefetched per worker; requires num_workers greater than 0
 bag_level: "tissue"  # Options: tissue, slide
 feature_normalization: "none"  # Options: none, l2, layer_norm
 max_tiles_per_bag:  # Applied after constructing a complete tissue or slide bag
@@ -48,7 +51,7 @@ use_weighted_sampler: true  # If true, train DataLoader uses WeightedRandomSampl
 use_class_weighted_loss: false  # Apply inverse-frequency class weights to the bag-level loss
 q: 0.7  # Generalized cross-entropy exponent; 0 recovers standard cross entropy
 epsilon: 0.1  # Label-smoothing strength in [0, 1); 0 disables smoothing
-best_checkpoint_metric: "balanced_accuracy"  # Options: balanced_accuracy, accuracy, loss, classification_loss, instance_loss
+best_checkpoint_metric: "slide_balanced_accuracy"  # Options: slide_balanced_accuracy, balanced_accuracy, accuracy, loss, classification_loss, instance_loss
 weight_decay_cls: 0.0001  # Weight decay for feature projection, attention branches, and classifier
 train_ratio: 0.8  # Fraction of slides used for training split
 val_ratio: 0.1  # Fraction of slides used for validation split
@@ -56,6 +59,11 @@ test_ratio: 0.1  # Fraction of slides used for test split
 min_epochs_before_early_stopping: 10  # Minimum epochs before early stopping checks begin
 patience: 10  # Early stopping patience based on the selected checkpoint metric
 random_seed: 42  # Random seed for deterministic data splitting and training behavior
+
+# Evaluation parameters
+evaluation:  # Controls additional bag levels and optional splits during standalone evaluation
+  supplementary_bag_level: "slide"  # Add concatenated-slide evaluation alongside the checkpoint's tissue bag level
+  include_train: false  # If true, evaluate the train split at both configured bag levels
 
 # Visualization parameters
 visualization:  # Settings controlling attention/diagnostic visualization outputs

@@ -6,6 +6,7 @@ qp-projects/
 notebooks
 presentation
 reports
+markdowns
 
 # Images
 *.png
@@ -238,6 +239,10 @@ cython_debug/
 .cursor
 .cursorignore
 .cursorindexingignore
+
+# Claude
+CLAUDE.md
+.claude
 
 # Marimo
 marimo/_static/

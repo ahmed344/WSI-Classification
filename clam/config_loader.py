@@ -329,6 +329,15 @@ def _validate_config(config: Mapping[str, Any]) -> None:
         "patience",
     ):
         _require_positive_int(config, key)
+    slide_batch_size = config.get("slide_evaluation_batch_size", 1)
+    if (
+        isinstance(slide_batch_size, bool)
+        or not isinstance(slide_batch_size, int)
+        or slide_batch_size <= 0
+    ):
+        raise ValueError(
+            "Config key 'slide_evaluation_batch_size' must be a positive integer."
+        )
     if int(config["num_classes"]) < 2:
         raise ValueError("Config key 'num_classes' must be at least 2.")
     _require_positive_int(config, "k_sample")
@@ -371,6 +380,7 @@ def _validate_config(config: Mapping[str, Any]) -> None:
             "Config key 'min_epochs_before_early_stopping' must be nonnegative."
         )
     valid_checkpoint_metrics = {
+        "slide_balanced_accuracy",
         "balanced_accuracy",
         "accuracy",
         "loss",
@@ -383,6 +393,27 @@ def _validate_config(config: Mapping[str, Any]) -> None:
             + ", ".join(sorted(valid_checkpoint_metrics))
             + "."
         )
+
+    evaluation = config.get("evaluation", {})
+    if not isinstance(evaluation, Mapping):
+        raise ValueError("Config key 'evaluation' must be a mapping.")
+    unknown_evaluation_keys = set(evaluation) - {
+        "supplementary_bag_level",
+        "include_train",
+    }
+    if unknown_evaluation_keys:
+        raise ValueError(
+            "Unknown evaluation key(s): "
+            + ", ".join(sorted(str(key) for key in unknown_evaluation_keys))
+        )
+    supplementary_level = evaluation.get("supplementary_bag_level")
+    if supplementary_level not in (None, "tissue", "slide"):
+        raise ValueError(
+            "Config key 'evaluation.supplementary_bag_level' must be "
+            "null, 'tissue', or 'slide'."
+        )
+    if not isinstance(evaluation.get("include_train", False), bool):
+        raise ValueError("Config key 'evaluation.include_train' must be a boolean.")
 
     ratios = [_require_number(config, f"{split}_ratio") for split in _SPLITS]
     if any(ratio < 0.0 or ratio > 1.0 for ratio in ratios):

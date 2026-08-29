@@ -4,7 +4,7 @@
         "dockerfile": "Dockerfile"
     },
 
-    "runArgs": ["--gpus", "all", "--shm-size=8g"],
+    "runArgs": ["--gpus", "all", "--shm-size=64g"],
 
 	// Configure tool-specific properties.
 	"customizations": {
@@ -16,7 +16,8 @@
                 "ms-python.vscode-pylance",
                 "ms-python.debugpy",
                 "ms-toolsai.jupyter",
-                "njpwerner.autodocstring"
+                "shd101wyy.markdown-preview-enhanced",
+                "mechatroner.rainbow-csv"
             ]
         }
         

@@ -6,6 +6,7 @@ from typing import Dict
 import pandas as pd
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 from clam.clam_dataset import collate_fn, create_bag_dataset
 from clam.clam_model import CLAM_MB, CLAM_SB
@@ -163,9 +164,51 @@ def test_training_sampling_changes_only_after_epoch_update(tmp_path: Path) -> No
     """
     _write_fixture_dataset(tmp_path)
     dataset = create_bag_dataset(_dataset_config(tmp_path, "slide"), "train")
-    first = dataset[0]["tissue_indices"].clone()
-    assert torch.equal(first, dataset[0]["tissue_indices"])
+    first = dataset[0]["tile_indices"].clone()
+    assert torch.equal(first, dataset[0]["tile_indices"])
     dataset.set_epoch(1)
-    second = dataset[0]["tissue_indices"]
+    second = dataset[0]["tile_indices"]
     assert first.shape == second.shape
+    assert not torch.equal(first, second)
+
+
+def test_multiprocess_loader_observes_epoch_updates(tmp_path: Path) -> None:
+    """Verify nonpersistent workers receive deterministic epoch changes.
+
+    Args:
+        tmp_path (Path): Pytest temporary directory.
+
+    Returns:
+        None: Assertions compare worker-produced sampling seeds and tile indices.
+    """
+    _write_fixture_dataset(tmp_path)
+    dataset = create_bag_dataset(_dataset_config(tmp_path, "slide"), "train")
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=2,
+        prefetch_factor=2,
+        persistent_workers=False,
+    )
+
+    first_epoch = list(loader)
+    repeated_epoch = list(loader)
+    dataset.set_epoch(1)
+    second_epoch = list(loader)
+
+    first_seed = first_epoch[0]["provenance"][0]["sampling_seed"]
+    repeated_seed = repeated_epoch[0]["provenance"][0]["sampling_seed"]
+    second_seed = second_epoch[0]["provenance"][0]["sampling_seed"]
+    assert first_seed == repeated_seed
+    assert first_seed != second_seed
+    assert torch.equal(
+        first_epoch[0]["tile_indices"],
+        repeated_epoch[0]["tile_indices"],
+    )
+    assert not torch.equal(
+        first_epoch[0]["tile_indices"],
+        second_epoch[0]["tile_indices"],
+    )
 
