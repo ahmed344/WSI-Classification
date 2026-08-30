@@ -78,6 +78,9 @@ class _CLAMBase(nn.Module):
         attention_branches: int,
         attention_normalization: str,
         pooling_layernorm: bool,
+        pooling_mode: str,
+        pooling_use_variance: bool,
+        pooling_num_prototypes: int,
     ) -> None:
         """Initialize common CLAM modules.
 
@@ -94,6 +97,12 @@ class _CLAMBase(nn.Module):
             attention_normalization (str): Required ``sigmoid_mean`` pooling mode.
             pooling_layernorm (bool): Whether pooled vectors are normalized before
                 classification; required for sigmoid-over-T attention.
+            pooling_mode (str): ``attention`` for attention pooling alone or
+                ``distributional`` to append uniform population statistics.
+            pooling_use_variance (bool): Whether distributional pooling appends
+                the per-channel standard deviation after the mean.
+            pooling_num_prototypes (int): Prototype histogram width. Only zero is
+                currently supported because prototype pooling is deferred.
 
         Returns:
             None: The initialized model.
@@ -113,6 +122,21 @@ class _CLAMBase(nn.Module):
             raise ValueError(
                 "pooling_layernorm must be true for sigmoid-over-T attention."
             )
+        if pooling_mode not in {"attention", "distributional"}:
+            raise ValueError("pooling_mode must be 'attention' or 'distributional'.")
+        if not isinstance(pooling_use_variance, bool):
+            raise TypeError("pooling_use_variance must be a boolean.")
+        if (
+            isinstance(pooling_num_prototypes, bool)
+            or not isinstance(pooling_num_prototypes, int)
+            or pooling_num_prototypes < 0
+        ):
+            raise ValueError("pooling_num_prototypes must be a nonnegative integer.")
+        if pooling_num_prototypes != 0:
+            raise ValueError(
+                "Prototype histogram pooling is deferred; "
+                "pooling_num_prototypes must be 0."
+            )
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -121,6 +145,14 @@ class _CLAMBase(nn.Module):
         self.subtyping = subtyping
         self.num_attention_branches = attention_branches
         self.attention_normalization = attention_normalization
+        self.pooling_mode = pooling_mode
+        self.pooling_use_variance = pooling_use_variance
+        self.pooling_num_prototypes = pooling_num_prototypes
+        self.statistics_pooling_epsilon = 1e-5
+        statistics_blocks = (
+            1 + int(pooling_use_variance) if pooling_mode == "distributional" else 0
+        )
+        self.bag_feature_dim = hidden_dim * (1 + statistics_blocks)
 
         self.embedding = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -134,7 +166,7 @@ class _CLAMBase(nn.Module):
             gated=gated,
             dropout=dropout,
         )
-        self.pooling_layernorm = nn.LayerNorm(hidden_dim)
+        self.pooling_layernorm = nn.LayerNorm(self.bag_feature_dim)
         self.instance_classifiers = nn.ModuleList(
             nn.Linear(hidden_dim, 2) for _ in range(num_classes)
         )
@@ -210,7 +242,9 @@ class _CLAMBase(nn.Module):
                 raise TypeError("labels must have an integer dtype.")
             labels = labels.to(dtype=torch.long)
             if bool(((labels < 0) | (labels >= self.num_classes)).any()):
-                raise ValueError("labels contain a class index outside the valid range.")
+                raise ValueError(
+                    "labels contain a class index outside the valid range."
+                )
 
         return validated_mask, labels
 
@@ -218,7 +252,8 @@ class _CLAMBase(nn.Module):
         """Classify pooled bag representations.
 
         Args:
-            pooled_features (torch.Tensor): Pooled features shaped ``[B, K, H]``.
+            pooled_features (torch.Tensor): Pooled features shaped
+                ``[B, K, bag_feature_dim]``.
 
         Returns:
             torch.Tensor: Bag logits shaped ``[B, C]``.
@@ -261,9 +296,7 @@ class _CLAMBase(nn.Module):
             )
 
             for class_index, classifier in enumerate(self.instance_classifiers):
-                branch_index = (
-                    class_index if self.num_attention_branches > 1 else 0
-                )
+                branch_index = class_index if self.num_attention_branches > 1 else 0
                 order = (
                     shared_order
                     if shared_order is not None
@@ -286,9 +319,7 @@ class _CLAMBase(nn.Module):
                 elif self.subtyping:
                     k = min(self.k_sample, valid_count)
                     selected = order[-k:]
-                    targets = torch.zeros(
-                        k, dtype=torch.long, device=embedded.device
-                    )
+                    targets = torch.zeros(k, dtype=torch.long, device=embedded.device)
                 else:
                     continue
 
@@ -339,7 +370,38 @@ class _CLAMBase(nn.Module):
             dtype=embedded.dtype
         )
         attention_weights = attention_weights.masked_fill(~mask.unsqueeze(1), 0.0)
-        raw_pooled_features = torch.bmm(attention_weights, embedded)
+        attention_pooled_features = torch.bmm(attention_weights, embedded)
+
+        if self.pooling_mode == "distributional":
+            valid_mask = mask.unsqueeze(-1).to(dtype=embedded.dtype)
+            population_counts = valid_mask.sum(dim=1, keepdim=True)
+            valid_embedded = embedded.masked_fill(~mask.unsqueeze(-1), 0.0)
+            distribution_mean = (
+                valid_embedded.sum(dim=1, keepdim=True) / population_counts
+            )
+            centered = (embedded - distribution_mean).masked_fill(
+                ~mask.unsqueeze(-1), 0.0
+            )
+            distribution_variance = (centered.square()).sum(
+                dim=1, keepdim=True
+            ) / population_counts
+            distribution_std = torch.sqrt(
+                distribution_variance + self.statistics_pooling_epsilon
+            )
+            distribution_parts = [
+                distribution_mean.expand(-1, self.num_attention_branches, -1)
+            ]
+            if self.pooling_use_variance:
+                distribution_parts.append(
+                    distribution_std.expand(-1, self.num_attention_branches, -1)
+                )
+            raw_pooled_features = torch.cat(
+                [attention_pooled_features, *distribution_parts], dim=-1
+            )
+        else:
+            distribution_mean = embedded.new_empty((embedded.shape[0], 1, 0))
+            distribution_std = embedded.new_empty((embedded.shape[0], 1, 0))
+            raw_pooled_features = attention_pooled_features
         pooled_features = self.pooling_layernorm(raw_pooled_features)
         logits = self._classify_bags(pooled_features)
         probabilities = F.softmax(logits, dim=1)
@@ -347,18 +409,14 @@ class _CLAMBase(nn.Module):
 
         if labels is not None and instance_eval:
             instance_loss, instance_predictions, instance_targets = (
-                self._instance_supervision(
-                    embedded, attention_scores, mask, labels
-                )
+                self._instance_supervision(embedded, attention_scores, mask, labels)
             )
         else:
             instance_loss = embedded.sum() * 0.0
             instance_predictions = torch.empty(
                 0, dtype=torch.long, device=features.device
             )
-            instance_targets = torch.empty(
-                0, dtype=torch.long, device=features.device
-            )
+            instance_targets = torch.empty(0, dtype=torch.long, device=features.device)
 
         return {
             "logits": logits,
@@ -366,6 +424,9 @@ class _CLAMBase(nn.Module):
             "predictions": predictions,
             "attention_scores": attention_scores,
             "attention_weights": attention_weights,
+            "attention_pooled_features": attention_pooled_features,
+            "distribution_mean": distribution_mean,
+            "distribution_std": distribution_std,
             "raw_pooled_features": raw_pooled_features,
             "pooled_features": pooled_features,
             "instance_loss": instance_loss,
@@ -389,6 +450,9 @@ class CLAM_SB(_CLAMBase):
         subtyping: bool = False,
         attention_normalization: str = "sigmoid_mean",
         pooling_layernorm: bool = True,
+        pooling_mode: str = "attention",
+        pooling_use_variance: bool = False,
+        pooling_num_prototypes: int = 0,
     ) -> None:
         """Initialize CLAM-SB.
 
@@ -404,6 +468,10 @@ class CLAM_SB(_CLAMBase):
             attention_normalization (str): Required ``sigmoid_mean`` pooling mode.
             pooling_layernorm (bool): Whether to normalize pooled vectors before
                 classification; must be ``True``.
+            pooling_mode (str): ``attention`` or ``distributional`` pooling.
+            pooling_use_variance (bool): Whether distributional pooling appends
+                per-channel standard deviation.
+            pooling_num_prototypes (int): Prototype histogram width; must be zero.
 
         Returns:
             None: The initialized CLAM-SB model.
@@ -420,9 +488,12 @@ class CLAM_SB(_CLAMBase):
             attention_branches=1,
             attention_normalization=attention_normalization,
             pooling_layernorm=pooling_layernorm,
+            pooling_mode=pooling_mode,
+            pooling_use_variance=pooling_use_variance,
+            pooling_num_prototypes=pooling_num_prototypes,
         )
         self.classifiers = nn.ModuleList(
-            nn.Linear(hidden_dim, 1) for _ in range(num_classes)
+            nn.Linear(self.bag_feature_dim, 1) for _ in range(num_classes)
         )
         self._initialize_weights()
 
@@ -430,7 +501,8 @@ class CLAM_SB(_CLAMBase):
         """Classify one shared pooled representation.
 
         Args:
-            pooled_features (torch.Tensor): Features shaped ``[B, 1, H]``.
+            pooled_features (torch.Tensor): Features shaped
+                ``[B, 1, bag_feature_dim]``.
 
         Returns:
             torch.Tensor: Bag logits shaped ``[B, C]``.
@@ -456,6 +528,9 @@ class CLAM_MB(_CLAMBase):
         subtyping: bool = False,
         attention_normalization: str = "sigmoid_mean",
         pooling_layernorm: bool = True,
+        pooling_mode: str = "attention",
+        pooling_use_variance: bool = False,
+        pooling_num_prototypes: int = 0,
     ) -> None:
         """Initialize CLAM-MB.
 
@@ -471,6 +546,10 @@ class CLAM_MB(_CLAMBase):
             attention_normalization (str): Required ``sigmoid_mean`` pooling mode.
             pooling_layernorm (bool): Whether to normalize pooled vectors before
                 classification; must be ``True``.
+            pooling_mode (str): ``attention`` or ``distributional`` pooling.
+            pooling_use_variance (bool): Whether distributional pooling appends
+                per-channel standard deviation.
+            pooling_num_prototypes (int): Prototype histogram width; must be zero.
 
         Returns:
             None: The initialized CLAM-MB model.
@@ -487,9 +566,12 @@ class CLAM_MB(_CLAMBase):
             attention_branches=num_classes,
             attention_normalization=attention_normalization,
             pooling_layernorm=pooling_layernorm,
+            pooling_mode=pooling_mode,
+            pooling_use_variance=pooling_use_variance,
+            pooling_num_prototypes=pooling_num_prototypes,
         )
         self.classifiers = nn.ModuleList(
-            nn.Linear(hidden_dim, 1) for _ in range(num_classes)
+            nn.Linear(self.bag_feature_dim, 1) for _ in range(num_classes)
         )
         self._initialize_weights()
 
@@ -497,7 +579,8 @@ class CLAM_MB(_CLAMBase):
         """Classify each class-specific pooled representation directly.
 
         Args:
-            pooled_features (torch.Tensor): Features shaped ``[B, C, H]``.
+            pooled_features (torch.Tensor): Features shaped
+                ``[B, C, bag_feature_dim]``.
 
         Returns:
             torch.Tensor: Direct class logits shaped ``[B, C]``.

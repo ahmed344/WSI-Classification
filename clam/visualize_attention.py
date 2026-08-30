@@ -38,7 +38,7 @@ except ImportError:
 
 
 CLAMModel = Union[CLAM_SB, CLAM_MB]
-CHECKPOINT_SCHEMA = "canonical_clam_v2_sigmoid_attn"
+CHECKPOINT_SCHEMA = "canonical_clam_v3_distpool"
 EVIDENCE_RECONSTRUCTION_TOLERANCE = 1e-4
 EVIDENCE_QUANTILE = 0.99
 TOP_EVIDENCE_TILE_COUNT = 25
@@ -91,6 +91,9 @@ def create_model(config: Mapping[str, Any]) -> CLAMModel:
         subtyping=bool(config["subtyping"]),
         attention_normalization=str(config["attention_normalization"]),
         pooling_layernorm=bool(config["pooling_layernorm"]),
+        pooling_mode=str(config.get("pooling_mode", "attention")),
+        pooling_use_variance=bool(config.get("pooling_use_variance", False)),
+        pooling_num_prototypes=int(config.get("pooling_num_prototypes", 0)),
     )
 
 
@@ -214,7 +217,11 @@ def find_tissue_image(
         and path.name.lower().startswith(tissue_lower)
         and any(path.name.lower().endswith(suffix) for suffix in suffixes)
     ]
-    return sorted(candidates, key=lambda path: (len(path.name), path.name))[0] if candidates else None
+    return (
+        sorted(candidates, key=lambda path: (len(path.name), path.name))[0]
+        if candidates
+        else None
+    )
 
 
 def load_tissue_thumbnail(
@@ -319,35 +326,84 @@ def compute_tile_evidence(
         if attention_weights.shape[1] == 1
         else attention_weights
     )
-    raw_pooled_features = torch.bmm(class_attention, embedded)
+    raw_pooled_parts = [torch.bmm(class_attention, embedded)]
+    uniform_weights: Optional[torch.Tensor] = None
+    valid_embedded: Optional[torch.Tensor] = None
+    centered_squared: Optional[torch.Tensor] = None
+    distribution_std: Optional[torch.Tensor] = None
+    if model.pooling_mode == "distributional":
+        valid_mask = masks.unsqueeze(-1).to(dtype=embedded.dtype)
+        valid_counts = valid_mask.sum(dim=1, keepdim=True)
+        uniform_weights = valid_mask / valid_counts
+        valid_embedded = embedded.masked_fill(~masks.unsqueeze(-1), 0.0)
+        distribution_mean = (valid_embedded * uniform_weights).sum(dim=1, keepdim=True)
+        raw_pooled_parts.append(distribution_mean.expand(-1, class_count, -1))
+        if model.pooling_use_variance:
+            centered_squared = (
+                (embedded - distribution_mean)
+                .masked_fill(~masks.unsqueeze(-1), 0.0)
+                .square()
+            )
+            distribution_variance = (centered_squared * uniform_weights).sum(
+                dim=1, keepdim=True
+            )
+            distribution_std = torch.sqrt(
+                distribution_variance + model.statistics_pooling_epsilon
+            )
+            raw_pooled_parts.append(distribution_std.expand(-1, class_count, -1))
+    raw_pooled_features = torch.cat(raw_pooled_parts, dim=-1)
     layernorm = model.pooling_layernorm
     if layernorm.weight is None or layernorm.bias is None:
         raise ValueError("Pooling LayerNorm must use learnable affine parameters.")
     scaled_classifier_weights = classifier_weights * layernorm.weight.unsqueeze(0)
     centered_classifier_weights = (
-        scaled_classifier_weights
-        - scaled_classifier_weights.mean(dim=-1, keepdim=True)
+        scaled_classifier_weights - scaled_classifier_weights.mean(dim=-1, keepdim=True)
     )
     pooled_scale = torch.sqrt(
-        raw_pooled_features.var(dim=-1, unbiased=False, keepdim=True)
-        + layernorm.eps
+        raw_pooled_features.var(dim=-1, unbiased=False, keepdim=True) + layernorm.eps
     )
     effective_classifier_weights = (
         centered_classifier_weights.unsqueeze(0) / pooled_scale
     )
-    tile_class_scores = torch.einsum(
-        "bnh,bch->bcn", embedded, effective_classifier_weights
+    hidden_dim = model.hidden_dim
+    attention_tile_scores = torch.einsum(
+        "bnh,bch->bcn",
+        embedded,
+        effective_classifier_weights[:, :, :hidden_dim],
     )
+    evidence = class_attention * attention_tile_scores
+    if model.pooling_mode == "distributional":
+        if uniform_weights is None or valid_embedded is None:
+            raise RuntimeError("Distributional evidence tensors were not initialized.")
+        population_weights = uniform_weights.squeeze(-1).unsqueeze(1)
+        mean_tile_scores = torch.einsum(
+            "bnh,bch->bcn",
+            valid_embedded,
+            effective_classifier_weights[:, :, hidden_dim : 2 * hidden_dim],
+        )
+        evidence = evidence + population_weights * mean_tile_scores
+        if model.pooling_use_variance:
+            if centered_squared is None or distribution_std is None:
+                raise RuntimeError("Variance evidence tensors were not initialized.")
+            std_classifier_weights = (
+                effective_classifier_weights[:, :, 2 * hidden_dim :] / distribution_std
+            )
+            std_tile_scores = torch.einsum(
+                "bnh,bch->bcn",
+                centered_squared + model.statistics_pooling_epsilon,
+                std_classifier_weights,
+            )
+            evidence = evidence + population_weights * std_tile_scores
     class_baselines = classifier_biases + torch.einsum(
         "ch,h->c", classifier_weights, layernorm.bias
     )
-    evidence = class_attention * tile_class_scores
     evidence = evidence.masked_fill(~masks.unsqueeze(1), 0.0)
     reconstructed_logits = evidence.sum(dim=-1) + class_baselines.unsqueeze(0)
     numerical_residual = logits - reconstructed_logits
-    if not torch.isfinite(evidence).all() or not torch.isfinite(
-        numerical_residual
-    ).all():
+    if (
+        not torch.isfinite(evidence).all()
+        or not torch.isfinite(numerical_residual).all()
+    ):
         raise ValueError("Tile evidence and reconstruction errors must be finite.")
 
     # Large float32 bags accumulate pooled logits and per-tile terms in
@@ -359,13 +415,9 @@ def compute_tile_evidence(
         if bool((attention_mass <= 0.0).any()):
             raise ValueError("Every evidence branch must have positive attention mass.")
         evidence = evidence + (
-            class_attention
-            * numerical_residual.unsqueeze(-1)
-            / attention_mass
+            class_attention * numerical_residual.unsqueeze(-1) / attention_mass
         )
-        reconstructed_logits = (
-            evidence.sum(dim=-1) + class_baselines.unsqueeze(0)
-        )
+        reconstructed_logits = evidence.sum(dim=-1) + class_baselines.unsqueeze(0)
         remaining_residual = logits - reconstructed_logits
         strongest_indices = class_attention.argmax(dim=-1, keepdim=True)
         evidence = evidence.scatter_add(
@@ -465,18 +517,10 @@ def tile_vertices(coordinates: np.ndarray, tile_size: int) -> np.ndarray:
     y_coordinates = coordinates[:, 1]
     return np.stack(
         (
-            np.column_stack(
-                (x_coordinates - half_tile, y_coordinates - half_tile)
-            ),
-            np.column_stack(
-                (x_coordinates + half_tile, y_coordinates - half_tile)
-            ),
-            np.column_stack(
-                (x_coordinates + half_tile, y_coordinates + half_tile)
-            ),
-            np.column_stack(
-                (x_coordinates - half_tile, y_coordinates + half_tile)
-            ),
+            np.column_stack((x_coordinates - half_tile, y_coordinates - half_tile)),
+            np.column_stack((x_coordinates + half_tile, y_coordinates - half_tile)),
+            np.column_stack((x_coordinates + half_tile, y_coordinates + half_tile)),
+            np.column_stack((x_coordinates - half_tile, y_coordinates + half_tile)),
         ),
         axis=1,
     )
@@ -511,8 +555,14 @@ def draw_attention(
         closed=True,
     )
     axis.add_collection(collection)
-    axis.set_xlim(float(coordinates[:, 0].min()) - half_tile, float(coordinates[:, 0].max()) + half_tile)
-    axis.set_ylim(float(coordinates[:, 1].max()) + half_tile, float(coordinates[:, 1].min()) - half_tile)
+    axis.set_xlim(
+        float(coordinates[:, 0].min()) - half_tile,
+        float(coordinates[:, 0].max()) + half_tile,
+    )
+    axis.set_ylim(
+        float(coordinates[:, 1].max()) + half_tile,
+        float(coordinates[:, 1].min()) - half_tile,
+    )
     axis.set_aspect("equal", adjustable="box")
     axis.axis("off")
 
@@ -919,9 +969,9 @@ def save_attention_evidence_figure(
             figure,
             axis,
             attention,
-            label="Attention weight"
-            if branch_index == len(attention_axes) - 1
-            else None,
+            label=(
+                "Attention weight" if branch_index == len(attention_axes) - 1 else None
+            ),
         )
 
     for class_index, class_name in enumerate(class_names):
@@ -931,7 +981,11 @@ def save_attention_evidence_figure(
         draw_evidence(axis, coordinates, evidence, tile_size, color_limit)
         is_predicted = class_index == predicted_index
         axis.set_title(
-            f"★ Evidence — {class_name}" if is_predicted else f"Evidence — {class_name}",
+            (
+                f"★ Evidence — {class_name}"
+                if is_predicted
+                else f"Evidence — {class_name}"
+            ),
             fontweight="bold" if is_predicted else "normal",
             bbox=(
                 {"facecolor": "gold", "alpha": 0.35, "edgecolor": "darkorange"}
@@ -965,9 +1019,7 @@ def save_attention_evidence_figure(
             scalar_mappable, ax=axis, orientation="vertical", pad=0.04
         )
         if class_index == class_count - 1:
-            colorbar.set_label(
-                "Signed logit evidence\n★ Predicted class highlighted"
-            )
+            colorbar.set_label("Signed logit evidence\n★ Predicted class highlighted")
 
     figure.suptitle(
         f"Slide: {slide_name} | Tissue: {tissue_name}\n"
@@ -1111,21 +1163,24 @@ def evaluate_with_attention(
                 for bag_index, slide_name in enumerate(batch["slide_names"]):
                     valid_mask = batch["masks"][bag_index]
                     bag_tile_count = int(valid_mask.sum().item())
-                    attention = attention_weights[
-                        bag_index, :, valid_mask.to(device)
-                    ].detach().cpu()
-                    evidence = evidence_weights[
-                        bag_index, :, valid_mask.to(device)
-                    ].detach().cpu()
-                    coordinates = batch["coordinates"][
-                        bag_index, valid_mask
-                    ].detach().cpu()
-                    tissue_indices = batch["tissue_indices"][
-                        bag_index, valid_mask
-                    ].detach().cpu()
+                    attention = (
+                        attention_weights[bag_index, :, valid_mask.to(device)]
+                        .detach()
+                        .cpu()
+                    )
+                    evidence = (
+                        evidence_weights[bag_index, :, valid_mask.to(device)]
+                        .detach()
+                        .cpu()
+                    )
+                    coordinates = (
+                        batch["coordinates"][bag_index, valid_mask].detach().cpu()
+                    )
+                    tissue_indices = (
+                        batch["tissue_indices"][bag_index, valid_mask].detach().cpu()
+                    )
                     tissue_names = [
-                        str(name)
-                        for name in batch["bag_tissue_names"][bag_index]
+                        str(name) for name in batch["bag_tissue_names"][bag_index]
                     ]
                     validate_aligned_bag(
                         attention, coordinates, tissue_indices, tissue_names
@@ -1162,17 +1217,11 @@ def evaluate_with_attention(
                         tissue_attention = attention[:, tissue_mask].numpy()
                         tissue_evidence = evidence[:, tissue_mask].numpy()
                         tissue_coordinates = coordinates[tissue_mask].numpy()
-                        if (
-                            tissue_attention.shape[1]
-                            != tissue_coordinates.shape[0]
-                        ):
+                        if tissue_attention.shape[1] != tissue_coordinates.shape[0]:
                             raise RuntimeError(
                                 "Internal tissue alignment invariant failed."
                             )
-                        if (
-                            tissue_evidence.shape[1]
-                            != tissue_coordinates.shape[0]
-                        ):
+                        if tissue_evidence.shape[1] != tissue_coordinates.shape[0]:
                             raise RuntimeError(
                                 "Internal tissue evidence alignment invariant "
                                 "failed."
@@ -1213,44 +1262,31 @@ def evaluate_with_attention(
                                 )
                             )
 
-                        evidence_diagnostics: Dict[
-                            str, Dict[str, Optional[float]]
-                        ] = {}
+                        evidence_diagnostics: Dict[str, Dict[str, Optional[float]]] = {}
                         for class_index, class_name in enumerate(class_names):
                             top_sum, top_percentage = (
                                 top_positive_evidence_contribution(
                                     tissue_evidence[class_index],
-                                    float(
-                                        bag_evidence_sums[class_index].item()
-                                    ),
+                                    float(bag_evidence_sums[class_index].item()),
                                 )
                             )
-                            bag_sum = float(
-                                bag_evidence_sums[class_index].item()
-                            )
+                            bag_sum = float(bag_evidence_sums[class_index].item())
                             evidence_diagnostics[str(class_name)] = {
                                 "tissue_evidence_sum": float(
                                     tissue_evidence[class_index].sum()
                                 ),
                                 "bag_tile_evidence_sum": bag_sum,
                                 "reconstructed_logit": (
-                                    bag_sum
-                                    + float(
-                                        class_baselines[class_index].item()
-                                    )
+                                    bag_sum + float(class_baselines[class_index].item())
                                 ),
                                 "logit_reconstruction_error": float(
-                                    reconstruction_errors[
-                                        bag_index, class_index
-                                    ].item()
+                                    reconstruction_errors[bag_index, class_index].item()
                                 ),
                                 "top_25_positive_evidence_sum": top_sum,
                                 "top_25_contribution_percentage": top_percentage,
                             }
                         primary_index = (
-                            predicted_index
-                            if isinstance(model, CLAM_MB)
-                            else 0
+                            predicted_index if isinstance(model, CLAM_MB) else 0
                         )
                         primary_attention = tissue_attention[primary_index]
                         primary_gates = primary_attention * bag_tile_count
@@ -1262,20 +1298,12 @@ def evaluate_with_attention(
                                 "true_class": true_class,
                                 "predicted_class": predicted_class,
                                 "predicted_probability": predicted_probability,
-                                "primary_attention_branch": branch_names[
-                                    primary_index
-                                ],
+                                "primary_attention_branch": branch_names[primary_index],
                                 "num_tiles": int(primary_attention.size),
                                 "bag_num_tiles": bag_tile_count,
-                                "attention_mass": float(
-                                    primary_attention.sum()
-                                ),
-                                "max_attention": float(
-                                    primary_attention.max()
-                                ),
-                                "mean_attention": float(
-                                    primary_attention.mean()
-                                ),
+                                "attention_mass": float(primary_attention.sum()),
+                                "max_attention": float(primary_attention.max()),
+                                "mean_attention": float(primary_attention.mean()),
                                 "max_gate": float(primary_gates.max()),
                                 "mean_gate": float(primary_gates.mean()),
                                 "heatmap_path": str(output_path),
@@ -1328,9 +1356,7 @@ def main() -> None:
     )
     max_bags = int(max_bags_value) if max_bags_value is not None else None
     render_dpi = (
-        args.dpi
-        if args.dpi is not None
-        else int(visualization.get("dpi", 150))
+        args.dpi if args.dpi is not None else int(visualization.get("dpi", 150))
     )
     if render_dpi <= 0:
         raise ValueError("Visualization DPI must be positive.")

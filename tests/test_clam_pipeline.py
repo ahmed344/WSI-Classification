@@ -77,9 +77,7 @@ def _write_fixture_dataset(
     """
     for class_index in range(class_count):
         for slide_index in range(slides_per_class):
-            slide_directory = (
-                root / f"Class{class_index}" / f"slide_{slide_index:02d}"
-            )
+            slide_directory = root / f"Class{class_index}" / f"slide_{slide_index:02d}"
             slide_directory.mkdir(parents=True)
             for tissue_index in range(tissues_per_slide):
                 tissue_name = f"tissue_{tissue_index}"
@@ -136,6 +134,9 @@ def _pipeline_config(
         "gated_attention": True,
         "attention_normalization": "sigmoid_mean",
         "pooling_layernorm": True,
+        "pooling_mode": "distributional",
+        "pooling_use_variance": True,
+        "pooling_num_prototypes": 0,
         "dropout": 0.0,
         "feature_projection_dropout": 0.0,
         "k_sample": 8,
@@ -159,6 +160,9 @@ def _pipeline_config(
         ("epsilon", 1.0, "epsilon"),
         ("attention_normalization", "softmax", "attention_normalization"),
         ("pooling_layernorm", False, "pooling_layernorm"),
+        ("pooling_mode", "histogram", "pooling_mode"),
+        ("pooling_use_variance", "yes", "pooling_use_variance"),
+        ("pooling_num_prototypes", 16, "pooling_num_prototypes"),
     ],
 )
 def test_config_validation_rejects_invalid_values(
@@ -472,11 +476,14 @@ def test_one_batch_train_validate_and_evaluate(
     assert len(validation["confusion_matrix"]) == 2
     assert evaluation["confusion_matrix"].shape == (2, 2)
     assert len(evaluation["slide_names"]) == len(dataset)
-    assert all(torch.isfinite(torch.tensor(training[key])) for key in (
-        "loss",
-        "classification_loss",
-        "instance_loss",
-    ))
+    assert all(
+        torch.isfinite(torch.tensor(training[key]))
+        for key in (
+            "loss",
+            "classification_loss",
+            "instance_loss",
+        )
+    )
     sample = dataset[0]
     assert sample["provenance"]["bag_level"] == bag_level
     assert sample["num_tissues"] == (1 if bag_level == "tissue" else 2)
@@ -522,18 +529,13 @@ def test_validate_defers_metric_reduction_without_changing_values(
             )
             classification_loss = criterion(outputs["logits"], batch["labels"])
             instance_loss = outputs["instance_loss"]
-            loss = (
-                bag_weight * classification_loss
-                + (1.0 - bag_weight) * instance_loss
-            )
+            loss = bag_weight * classification_loss + (1.0 - bag_weight) * instance_loss
             batch_size = int(batch["labels"].shape[0])
             expected_totals["loss"] += float(loss.item()) * batch_size
             expected_totals["classification_loss"] += (
                 float(classification_loss.item()) * batch_size
             )
-            expected_totals["instance_loss"] += (
-                float(instance_loss.item()) * batch_size
-            )
+            expected_totals["instance_loss"] += float(instance_loss.item()) * batch_size
 
     metrics = train_clam.validate(
         model,
@@ -563,11 +565,14 @@ def test_fixed_metrics_retain_absent_classes() -> None:
     )
     assert metrics["confusion_matrix"] == [[1, 1, 0], [0, 1, 0], [0, 0, 0]]
     assert metrics["macro_f1"] == pytest.approx((2 / 3 + 2 / 3 + 0) / 3)
-    assert evaluate_clam._multiclass_auc(
-        labels=[0, 0, 1],
-        probabilities=[[0.8, 0.1, 0.1], [0.4, 0.5, 0.1], [0.1, 0.8, 0.1]],
-        num_classes=3,
-    ) is None
+    assert (
+        evaluate_clam._multiclass_auc(
+            labels=[0, 0, 1],
+            probabilities=[[0.8, 0.1, 0.1], [0.4, 0.5, 0.1], [0.1, 0.8, 0.1]],
+            num_classes=3,
+        )
+        is None
+    )
 
 
 def test_slide_checkpoint_metric_and_patience_warmup() -> None:
@@ -579,8 +584,8 @@ def test_slide_checkpoint_metric_and_patience_warmup() -> None:
     Returns:
         None: Assertions verify metric routing and early-stopping semantics.
     """
-    metric_key, maximize, metric_name = (
-        train_clam.resolve_best_checkpoint_metric("slide_balanced_accuracy")
+    metric_key, maximize, metric_name = train_clam.resolve_best_checkpoint_metric(
+        "slide_balanced_accuracy"
     )
     assert metric_key == "balanced_accuracy"
     assert maximize is True
@@ -602,12 +607,15 @@ def test_slide_checkpoint_metric_and_patience_warmup() -> None:
         minimum_epochs=10,
     )
     assert counter == 1
-    assert train_clam.update_patience_counter(
-        counter,
-        improved=True,
-        epoch=12,
-        minimum_epochs=10,
-    ) == 0
+    assert (
+        train_clam.update_patience_counter(
+            counter,
+            improved=True,
+            epoch=12,
+            minimum_epochs=10,
+        )
+        == 0
+    )
 
 
 def test_default_evaluation_controls_include_tissue_and_slide() -> None:
@@ -1047,14 +1055,16 @@ def test_tile_evidence_exactly_reconstructs_logits(
         attention_dim=4,
         num_classes=3,
         dropout=0.0,
+        pooling_mode="distributional",
+        pooling_use_variance=True,
     )
     model.eval()
     with torch.no_grad():
         model.pooling_layernorm.weight.copy_(
-            torch.linspace(0.5, 1.5, model.hidden_dim)
+            torch.linspace(0.5, 1.5, model.bag_feature_dim)
         )
         model.pooling_layernorm.bias.copy_(
-            torch.linspace(-0.3, 0.3, model.hidden_dim)
+            torch.linspace(-0.3, 0.3, model.bag_feature_dim)
         )
     features = torch.randn(2, 6, 4)
     masks = torch.tensor(
@@ -1075,6 +1085,76 @@ def test_tile_evidence_exactly_reconstructs_logits(
 
     assert evidence.shape == (2, 3, 6)
     assert torch.count_nonzero(evidence[0, :, 4:]) == 0
+    assert torch.allclose(
+        evidence.sum(dim=-1) + class_baselines.unsqueeze(0),
+        outputs["logits"],
+        atol=1e-4,
+        rtol=0.0,
+    )
+    assert float(errors.max()) <= 1e-4
+
+
+def test_distributional_evidence_avoids_class_tile_feature_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify evidence pooling never concatenates a four-dimensional tensor.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): Fixture used to observe concatenations.
+
+    Returns:
+        None: Concatenated tensors remain bag-sized rather than tile-expanded.
+    """
+    model = CLAM_MB(
+        input_dim=4,
+        hidden_dim=8,
+        attention_dim=4,
+        num_classes=3,
+        dropout=0.0,
+        pooling_mode="distributional",
+        pooling_use_variance=True,
+    )
+    model.eval()
+    features = torch.randn(2, 16, 4)
+    masks = torch.ones(2, 16, dtype=torch.bool)
+    with torch.no_grad():
+        outputs = model(features, mask=masks, instance_eval=False)
+
+    original_cat = torch.cat
+    observed_input_ranks: list[int] = []
+
+    def recording_cat(
+        tensors: Any,
+        dim: int = 0,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Record tensor ranks before delegating to ``torch.cat``.
+
+        Args:
+            tensors (Any): Iterable of tensors to concatenate.
+            dim (int): Concatenation dimension.
+            out (Optional[torch.Tensor]): Optional output tensor.
+
+        Returns:
+            torch.Tensor: Concatenated tensor from the original operation.
+        """
+        materialized_tensors = tuple(tensors)
+        observed_input_ranks.extend(tensor.ndim for tensor in materialized_tensors)
+        return original_cat(materialized_tensors, dim=dim, out=out)
+
+    monkeypatch.setattr(torch, "cat", recording_cat)
+    with torch.no_grad():
+        evidence, errors, class_baselines = visualize_attention.compute_tile_evidence(
+            model=model,
+            features=features,
+            masks=masks,
+            attention_weights=outputs["attention_weights"],
+            logits=outputs["logits"],
+        )
+
+    assert observed_input_ranks
+    assert max(observed_input_ranks) <= 3
     assert torch.allclose(
         evidence.sum(dim=-1) + class_baselines.unsqueeze(0),
         outputs["logits"],
@@ -1133,12 +1213,8 @@ def test_evidence_color_limit_uses_absolute_quantile() -> None:
     """
     evidence = np.asarray([-4.0, -1.0, 0.0, 2.0], dtype=np.float64)
     expected = float(np.quantile(np.abs(evidence), 0.99))
-    assert visualize_attention.evidence_color_limit(evidence) == pytest.approx(
-        expected
-    )
-    assert visualize_attention.evidence_color_limit(
-        np.zeros(3, dtype=np.float64)
-    ) > 0.0
+    assert visualize_attention.evidence_color_limit(evidence) == pytest.approx(expected)
+    assert visualize_attention.evidence_color_limit(np.zeros(3, dtype=np.float64)) > 0.0
 
 
 def test_attention_and_evidence_are_saved_in_one_figure(
@@ -1154,13 +1230,9 @@ def test_attention_and_evidence_are_saved_in_one_figure(
     Returns:
         None: The combined heatmap artifact is asserted.
     """
-    coordinates = np.asarray(
-        [[0.0, 0.0], [448.0, 0.0], [0.0, 448.0]], dtype=np.float64
-    )
+    coordinates = np.asarray([[0.0, 0.0], [448.0, 0.0], [0.0, 448.0]], dtype=np.float64)
     attention = np.asarray([[0.2, 0.3, 0.5]], dtype=np.float64)
-    evidence = np.asarray(
-        [[0.2, -0.1, 0.4], [-0.3, 0.2, 0.1]], dtype=np.float64
-    )
+    evidence = np.asarray([[0.2, -0.1, 0.4], [-0.3, 0.2, 0.1]], dtype=np.float64)
     combined_path = tmp_path / "slide_tissue_attention.png"
     saved_dpi: Dict[str, Any] = {}
     original_savefig = Figure.savefig
@@ -1242,9 +1314,7 @@ def test_mean_attention_sits_above_original_in_five_class_figure(
     Returns:
         None: First-column layout and 2x6 GridSpec are asserted.
     """
-    coordinates = np.asarray(
-        [[0.0, 0.0], [448.0, 0.0], [0.0, 448.0]], dtype=np.float64
-    )
+    coordinates = np.asarray([[0.0, 0.0], [448.0, 0.0], [0.0, 448.0]], dtype=np.float64)
     attention = np.asarray(
         [
             [0.10, 0.20, 0.30],
@@ -1335,15 +1405,11 @@ def test_heatmap_tiles_use_one_vectorized_collection_per_axis() -> None:
     Returns:
         None: Each heatmap axis contains one collection and no rectangle patches.
     """
-    coordinates = np.asarray(
-        [[0.0, 0.0], [448.0, 0.0], [0.0, 448.0]], dtype=np.float64
-    )
+    coordinates = np.asarray([[0.0, 0.0], [448.0, 0.0], [0.0, 448.0]], dtype=np.float64)
     values = np.asarray([0.2, 0.3, 0.5], dtype=np.float64)
     figure, axes = plt.subplots(1, 2)
     try:
-        visualize_attention.draw_attention(
-            axes[0], coordinates, values, tile_size=448
-        )
+        visualize_attention.draw_attention(axes[0], coordinates, values, tile_size=448)
         visualize_attention.draw_evidence(
             axes[1], coordinates, values - 0.3, tile_size=448, color_limit=0.3
         )

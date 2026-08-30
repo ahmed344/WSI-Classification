@@ -24,6 +24,9 @@ model_type: "clam_mb"  # Options: clam_mb, clam_sb
 gated_attention: true  # Use the canonical gated attention network
 attention_normalization: "sigmoid_mean"  # Must be sigmoid_mean; applies independent sigmoid gates and divides their weighted sum by the valid tile count
 pooling_layernorm: true  # Must be true; normalize sigmoid-over-T pooled vectors before classification
+pooling_mode: "distributional"  # Options: attention, distributional; distributional appends uniformly pooled mean and optional standard deviation
+pooling_use_variance: true  # Append per-channel population standard deviation in distributional mode
+pooling_num_prototypes: 0  # Must remain 0 until prototype histogram pooling is implemented in a later stage
 hidden_dim: 512  # Shared tile embedding dimension
 attention_dim: 256  # Hidden dimension of the gated attention network
 dropout: 0.5  # Dropout in the shared embedding and attention projections
@@ -34,7 +37,7 @@ bag_weight: 0.5  # Weight of bag loss; instance loss receives 1 - bag_weight
 
 # Training parameters
 batch_size: 128  # Physical number of variable-length bags per micro-batch
-slide_evaluation_batch_size: 1  # Physical batch size for memory-intensive concatenated-slide validation/evaluation
+slide_evaluation_batch_size: 64  # Physical batch size for memory-intensive concatenated-slide validation/evaluation
 gradient_accumulation_steps: 1  # Effective batch size is batch_size * this value
 num_workers: 8  # Parallel DataLoader workers; limited by the container's 8 GB shared memory
 prefetch_factor: 2  # Complete batches prefetched per worker; requires num_workers greater than 0
@@ -73,7 +76,7 @@ visualization:  # Settings controlling attention/diagnostic visualization output
   max_slides: null  # null for all slides, or specify a number
   tile_size: 448  # Pixel size used when rendering visualization tiles
   dpi: 150  # Positive output DPI; use 300 for publication-scale heatmaps
-  render_workers: 8  # Parallel figure processes; raise toward CPU count if memory permits
+  render_workers: 1  # Parallel figure processes; raise toward CPU count if memory permits
 
 # Paths (can be overridden)
 paths:  # Optional explicit output/checkpoint paths overriding default derivations

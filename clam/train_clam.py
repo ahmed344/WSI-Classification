@@ -33,7 +33,7 @@ except ImportError:
     from losses import GeneralizedCrossEntropyLoss
 
 
-MODEL_SCHEMA = "canonical_clam_v2_sigmoid_attn"
+MODEL_SCHEMA = "canonical_clam_v3_distpool"
 METRIC_KEYS = (
     "loss",
     "classification_loss",
@@ -69,6 +69,9 @@ def create_model(config: Mapping[str, Any]) -> nn.Module:
         subtyping=bool(config["subtyping"]),
         attention_normalization=str(config["attention_normalization"]),
         pooling_layernorm=bool(config["pooling_layernorm"]),
+        pooling_mode=str(config.get("pooling_mode", "attention")),
+        pooling_use_variance=bool(config.get("pooling_use_variance", False)),
+        pooling_num_prototypes=int(config.get("pooling_num_prototypes", 0)),
     )
 
 
@@ -272,9 +275,7 @@ def create_classification_criterion(
             zero recovers cross entropy.
     """
     weight = (
-        class_weights
-        if bool(config.get("use_class_weighted_loss", False))
-        else None
+        class_weights if bool(config.get("use_class_weighted_loss", False)) else None
     )
     return GeneralizedCrossEntropyLoss(
         q=float(config.get("q", 0.0)),
@@ -348,7 +349,11 @@ def _validate_training_config(config: Mapping[str, Any]) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{key} must be a positive integer.")
     num_workers = config.get("num_workers", 0)
-    if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 0:
+    if (
+        isinstance(num_workers, bool)
+        or not isinstance(num_workers, int)
+        or num_workers < 0
+    ):
         raise ValueError("num_workers must be a nonnegative integer.")
     prefetch_factor = config.get("prefetch_factor", 2)
     if (
@@ -508,9 +513,8 @@ def _run_epoch(
                 group_size = min(accumulation_steps, len(dataloader) - group_start)
                 (loss / group_size).backward()
                 boundary = (
-                    (batch_index + 1) % accumulation_steps == 0
-                    or batch_index + 1 == len(dataloader)
-                )
+                    batch_index + 1
+                ) % accumulation_steps == 0 or batch_index + 1 == len(dataloader)
                 if boundary:
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
@@ -713,11 +717,7 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
         bag_level="slide",
     )
     test_dataset = create_bag_dataset(config, "test", class_folders=class_folders)
-    if (
-        len(train_dataset) == 0
-        or len(val_dataset) == 0
-        or len(val_slide_dataset) == 0
-    ):
+    if len(train_dataset) == 0 or len(val_dataset) == 0 or len(val_slide_dataset) == 0:
         raise ValueError(
             "Training and tissue/slide validation splits must contain bags."
         )
@@ -818,9 +818,7 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
             patience_counter = 0
             best_metadata = {
                 "name": metric_name,
-                "level": (
-                    "slide" if metric_name.startswith("slide_") else "tissue"
-                ),
+                "level": ("slide" if metric_name.startswith("slide_") else "tissue"),
                 "mode": "max" if maximize else "min",
                 "value": best_value,
                 "epoch": best_epoch,

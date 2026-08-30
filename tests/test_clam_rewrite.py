@@ -28,7 +28,9 @@ def _write_fixture_dataset(root: Path) -> None:
             for tissue_index in range(2):
                 tissue_name = f"tissue_{tissue_index}"
                 base = class_index * 1000 + slide_index * 100 + tissue_index * 10
-                features = torch.arange(base, base + 24, dtype=torch.float32).reshape(6, 4)
+                features = torch.arange(base, base + 24, dtype=torch.float32).reshape(
+                    6, 4
+                )
                 torch.save(features, slide_dir / f"{tissue_name}_features.pt")
                 pd.DataFrame(
                     {
@@ -64,7 +66,9 @@ def _dataset_config(root: Path, bag_level: str) -> Dict[str, object]:
 
 
 @pytest.mark.parametrize("model_class", [CLAM_SB, CLAM_MB])
-def test_canonical_clam_forward_and_backward(model_class: type[torch.nn.Module]) -> None:
+def test_canonical_clam_forward_and_backward(
+    model_class: type[torch.nn.Module],
+) -> None:
     """Verify canonical outputs, masks, instance targets, and gradients.
 
     Args:
@@ -82,17 +86,19 @@ def test_canonical_clam_forward_and_backward(model_class: type[torch.nn.Module])
         dropout=0.0,
         k_sample=2,
         subtyping=True,
+        pooling_mode="distributional",
+        pooling_use_variance=True,
     )
     features = torch.randn(2, 7, 4)
-    masks = torch.tensor(
-        [[True, True, True, True, True, False, False], [True] * 7]
-    )
+    masks = torch.tensor([[True, True, True, True, True, False, False], [True] * 7])
     labels = torch.tensor([0, 2])
     outputs = model(features, masks, labels, instance_eval=True)
 
     assert outputs["logits"].shape == (2, 3)
     assert outputs["attention_weights"].shape[0] == 2
-    assert torch.all(outputs["attention_weights"].masked_select(~masks.unsqueeze(1)) == 0)
+    assert torch.all(
+        outputs["attention_weights"].masked_select(~masks.unsqueeze(1)) == 0
+    )
     valid_counts = masks.sum(dim=1, keepdim=True).unsqueeze(1)
     expected_attention = torch.sigmoid(outputs["attention_scores"]) / valid_counts
     expected_attention = expected_attention.masked_fill(~masks.unsqueeze(1), 0.0)
@@ -101,6 +107,10 @@ def test_canonical_clam_forward_and_backward(model_class: type[torch.nn.Module])
         expected_attention,
     )
     assert torch.all(outputs["attention_weights"].sum(dim=-1) < 1.0)
+    expected_branches = 1 if model_class is CLAM_SB else 3
+    assert outputs["raw_pooled_features"].shape == (2, expected_branches, 24)
+    assert outputs["distribution_mean"].shape == (2, 1, 8)
+    assert outputs["distribution_std"].shape == (2, 1, 8)
     assert torch.allclose(
         outputs["pooled_features"],
         model.pooling_layernorm(outputs["raw_pooled_features"]),
@@ -131,6 +141,8 @@ def test_sigmoid_attention_is_invariant_to_right_padding(
         attention_dim=4,
         num_classes=3,
         dropout=0.0,
+        pooling_mode="distributional",
+        pooling_use_variance=True,
     )
     model.eval()
     features = torch.randn(1, 5, 4)
@@ -149,8 +161,122 @@ def test_sigmoid_attention_is_invariant_to_right_padding(
         unpadded["attention_weights"],
         padded["attention_weights"][:, :, :5],
     )
-    assert torch.allclose(unpadded["raw_pooled_features"], padded["raw_pooled_features"])
+    assert torch.allclose(
+        unpadded["raw_pooled_features"], padded["raw_pooled_features"]
+    )
+    assert torch.allclose(unpadded["distribution_mean"], padded["distribution_mean"])
+    assert torch.allclose(unpadded["distribution_std"], padded["distribution_std"])
     assert torch.allclose(unpadded["logits"], padded["logits"])
+
+
+@pytest.mark.parametrize("model_class", [CLAM_SB, CLAM_MB])
+def test_distributional_statistics_match_masked_population_moments(
+    model_class: type[torch.nn.Module],
+) -> None:
+    """Verify statistics pooling uses uniform valid-tile population moments.
+
+    Args:
+        model_class (type[torch.nn.Module]): CLAM variant under test.
+
+    Returns:
+        None: Masked means and standard deviations are checked analytically.
+    """
+    model = model_class(
+        input_dim=3,
+        hidden_dim=4,
+        attention_dim=2,
+        num_classes=2,
+        dropout=0.0,
+        pooling_mode="distributional",
+        pooling_use_variance=True,
+    )
+    model.eval()
+    features = torch.tensor(
+        [
+            [
+                [1.0, 2.0, 3.0],
+                [3.0, 4.0, 5.0],
+                [5.0, 6.0, 7.0],
+                [100.0, 100.0, 100.0],
+            ]
+        ]
+    )
+    masks = torch.tensor([[True, True, True, False]])
+
+    with torch.no_grad():
+        outputs = model(features, mask=masks, instance_eval=False)
+        embedded = model.embedding(features)[:, :3]
+        expected_mean = embedded.mean(dim=1, keepdim=True)
+        expected_std = torch.sqrt(
+            (embedded - expected_mean).square().mean(dim=1, keepdim=True)
+            + model.statistics_pooling_epsilon
+        )
+
+    assert torch.allclose(outputs["distribution_mean"], expected_mean)
+    assert torch.allclose(outputs["distribution_std"], expected_std)
+
+
+def test_distributional_standard_deviation_has_finite_constant_bag_gradients() -> None:
+    """Verify epsilon stabilizes standard deviation for constant embeddings.
+
+    Args:
+        None.
+
+    Returns:
+        None: Standard deviations and input gradients remain finite.
+    """
+    model = CLAM_SB(
+        input_dim=3,
+        hidden_dim=4,
+        attention_dim=2,
+        num_classes=2,
+        dropout=0.0,
+        pooling_mode="distributional",
+        pooling_use_variance=True,
+    )
+    features = torch.ones(1, 4, 3, requires_grad=True)
+    outputs = model(features, instance_eval=False)
+    outputs["logits"].sum().backward()
+
+    assert torch.isfinite(outputs["distribution_std"]).all()
+    assert torch.allclose(
+        outputs["distribution_std"],
+        torch.full_like(
+            outputs["distribution_std"],
+            model.statistics_pooling_epsilon**0.5,
+        ),
+    )
+    assert features.grad is not None
+    assert torch.isfinite(features.grad).all()
+
+
+def test_attention_pooling_mode_preserves_original_bag_width() -> None:
+    """Verify attention-only compatibility omits distributional statistics.
+
+    Args:
+        None.
+
+    Returns:
+        None: Original hidden width and attention pool are preserved.
+    """
+    model = CLAM_MB(
+        input_dim=4,
+        hidden_dim=8,
+        attention_dim=4,
+        num_classes=3,
+        dropout=0.0,
+        pooling_mode="attention",
+        pooling_use_variance=False,
+    )
+    outputs = model(torch.randn(2, 5, 4), instance_eval=False)
+
+    assert model.bag_feature_dim == model.hidden_dim
+    assert outputs["distribution_mean"].shape == (2, 1, 0)
+    assert outputs["distribution_std"].shape == (2, 1, 0)
+    assert torch.equal(
+        outputs["raw_pooled_features"],
+        outputs["attention_pooled_features"],
+    )
 
 
 def test_instance_supervision_keeps_raw_score_ranking() -> None:
@@ -214,12 +340,8 @@ def test_tissue_and_slide_bags_preserve_alignment(tmp_path: Path) -> None:
         None: Assertions verify bag construction and collation.
     """
     _write_fixture_dataset(tmp_path)
-    tissue_dataset = create_bag_dataset(
-        _dataset_config(tmp_path, "tissue"), "train"
-    )
-    slide_dataset = create_bag_dataset(
-        _dataset_config(tmp_path, "slide"), "train"
-    )
+    tissue_dataset = create_bag_dataset(_dataset_config(tmp_path, "tissue"), "train")
+    slide_dataset = create_bag_dataset(_dataset_config(tmp_path, "slide"), "train")
 
     tissue_sample = tissue_dataset[0]
     repeated_sample = tissue_dataset[0]
@@ -296,4 +418,3 @@ def test_multiprocess_loader_observes_epoch_updates(tmp_path: Path) -> None:
         first_epoch[0]["tile_indices"],
         second_epoch[0]["tile_indices"],
     )
-

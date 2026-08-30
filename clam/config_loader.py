@@ -16,6 +16,7 @@ _OPTIONS: Dict[str, Sequence[str]] = {
     "feature_normalization": ("none", "l2", "layer_norm"),
     "tile_sampling": ("random", "uniform", "first"),
     "attention_normalization": ("sigmoid_mean",),
+    "pooling_mode": ("attention", "distributional"),
 }
 _SPLITS = ("train", "val", "test")
 _RUN_ID_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}(?:_\d{2})?$")
@@ -241,8 +242,8 @@ def resolve_input_dim(config: Mapping[str, Any]) -> int:
     Returns:
         int: Positive feature dimensionality consumed by CLAM.
     """
-    selected_model = str(config.get('feature_model', 'default'))
-    input_dim_map = config.get('feature_model_input_dims', {})
+    selected_model = str(config.get("feature_model", "default"))
+    input_dim_map = config.get("feature_model_input_dims", {})
 
     if not isinstance(input_dim_map, Mapping):
         raise ValueError(
@@ -250,7 +251,7 @@ def resolve_input_dim(config: Mapping[str, Any]) -> int:
         )
 
     if selected_model not in input_dim_map:
-        available_models = ', '.join(sorted(str(k) for k in input_dim_map.keys()))
+        available_models = ", ".join(sorted(str(k) for k in input_dim_map.keys()))
         raise ValueError(
             f"Unknown feature_model '{selected_model}'. "
             f"Available input dimensions: {available_models}."
@@ -275,8 +276,8 @@ def resolve_feature_file_suffix(config: Mapping[str, Any]) -> str:
     Returns:
         str: Nonempty ``.pt`` suffix used for feature discovery.
     """
-    selected_model = str(config.get('feature_model', 'default'))
-    suffix_map = config.get('feature_model_suffixes', {})
+    selected_model = str(config.get("feature_model", "default"))
+    suffix_map = config.get("feature_model_suffixes", {})
 
     if not isinstance(suffix_map, Mapping):
         raise ValueError(
@@ -284,14 +285,14 @@ def resolve_feature_file_suffix(config: Mapping[str, Any]) -> str:
         )
 
     if selected_model not in suffix_map:
-        available_models = ', '.join(sorted(str(k) for k in suffix_map.keys()))
+        available_models = ", ".join(sorted(str(k) for k in suffix_map.keys()))
         raise ValueError(
             f"Unknown feature_model '{selected_model}'. "
             f"Available models: {available_models}."
         )
 
     suffix = str(suffix_map[selected_model])
-    if not suffix.endswith('.pt'):
+    if not suffix.endswith(".pt"):
         raise ValueError(
             f"Invalid suffix '{suffix}' for feature_model '{selected_model}'. "
             "Suffix must end with '.pt'."
@@ -315,13 +316,32 @@ def _validate_config(config: Mapping[str, Any]) -> None:
                 f"Invalid {key} '{value}'. Expected one of: {', '.join(choices)}."
             )
 
-    for key in ("gated_attention", "subtyping", "pooling_layernorm"):
+    for key in (
+        "gated_attention",
+        "subtyping",
+        "pooling_layernorm",
+        "pooling_use_variance",
+    ):
         if not isinstance(config.get(key), bool):
             raise ValueError(f"Config key '{key}' must be a boolean.")
     if config["pooling_layernorm"] is not True:
         raise ValueError(
             "Config key 'pooling_layernorm' must be true for sigmoid-over-T "
             "attention."
+        )
+    prototype_count = config.get("pooling_num_prototypes")
+    if (
+        isinstance(prototype_count, bool)
+        or not isinstance(prototype_count, int)
+        or prototype_count < 0
+    ):
+        raise ValueError(
+            "Config key 'pooling_num_prototypes' must be a nonnegative integer."
+        )
+    if prototype_count != 0:
+        raise ValueError(
+            "Prototype histogram pooling is deferred; config key "
+            "'pooling_num_prototypes' must be 0."
         )
 
     for key in (
@@ -374,7 +394,11 @@ def _validate_config(config: Mapping[str, Any]) -> None:
         if not isinstance(config.get(key), bool):
             raise ValueError(f"Config key '{key}' must be a boolean.")
     random_seed = config.get("random_seed")
-    if isinstance(random_seed, bool) or not isinstance(random_seed, int) or random_seed < 0:
+    if (
+        isinstance(random_seed, bool)
+        or not isinstance(random_seed, int)
+        or random_seed < 0
+    ):
         raise ValueError("Config key 'random_seed' must be a nonnegative integer.")
     minimum_epochs = config.get("min_epochs_before_early_stopping")
     if (
@@ -440,7 +464,9 @@ def _validate_config(config: Mapping[str, Any]) -> None:
         )
     for split in _SPLITS:
         cap = caps.get(split)
-        if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0):
+        if cap is not None and (
+            isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0
+        ):
             raise ValueError(
                 f"max_tiles_per_bag.{split} must be a positive integer or null."
             )
@@ -464,9 +490,7 @@ def _validate_config(config: Mapping[str, Any]) -> None:
         or not isinstance(render_workers, int)
         or render_workers <= 0
     ):
-        raise ValueError(
-            "visualization.render_workers must be a positive integer."
-        )
+        raise ValueError("visualization.render_workers must be a positive integer.")
 
 
 def _require_number(config: Mapping[str, Any], key: str) -> float:
@@ -552,9 +576,7 @@ def _resolve_paths(config: Dict[str, Any], config_dir: Path) -> None:
     config["paths"] = paths
 
     auto_keys_missing = [
-        key
-        for key in _EXPLICIT_PATH_KEYS
-        if not bool(config["_explicit_paths"][key])
+        key for key in _EXPLICIT_PATH_KEYS if not bool(config["_explicit_paths"][key])
     ]
     if not auto_keys_missing:
         return
