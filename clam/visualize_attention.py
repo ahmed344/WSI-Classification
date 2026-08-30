@@ -38,7 +38,7 @@ except ImportError:
 
 
 CLAMModel = Union[CLAM_SB, CLAM_MB]
-CHECKPOINT_SCHEMA = "canonical_clam_v3_distpool"
+CHECKPOINT_SCHEMA = "canonical_clam_v4_deterministic_stats"
 EVIDENCE_RECONSTRUCTION_TOLERANCE = 1e-4
 EVIDENCE_QUANTILE = 0.99
 TOP_EVIDENCE_TILE_COUNT = 25
@@ -86,7 +86,8 @@ def create_model(config: Mapping[str, Any]) -> CLAMModel:
         attention_dim=int(config["attention_dim"]),
         num_classes=int(config["num_classes"]),
         gated=bool(config["gated_attention"]),
-        dropout=float(config["dropout"]),
+        attention_dropout=float(config["attention_dropout"]),
+        classifier_dropout=float(config["classifier_dropout"]),
         k_sample=int(config["k_sample"]),
         subtyping=bool(config["subtyping"]),
         attention_normalization=str(config["attention_normalization"]),

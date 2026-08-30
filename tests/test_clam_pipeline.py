@@ -137,7 +137,8 @@ def _pipeline_config(
         "pooling_mode": "distributional",
         "pooling_use_variance": True,
         "pooling_num_prototypes": 0,
-        "dropout": 0.0,
+        "attention_dropout": 0.0,
+        "classifier_dropout": 0.0,
         "feature_projection_dropout": 0.0,
         "k_sample": 8,
         "subtyping": True,
@@ -163,6 +164,8 @@ def _pipeline_config(
         ("pooling_mode", "histogram", "pooling_mode"),
         ("pooling_use_variance", "yes", "pooling_use_variance"),
         ("pooling_num_prototypes", 16, "pooling_num_prototypes"),
+        ("attention_dropout", 1.0, "attention_dropout"),
+        ("classifier_dropout", -0.1, "classifier_dropout"),
     ],
 )
 def test_config_validation_rejects_invalid_values(
@@ -767,7 +770,8 @@ def test_short_bags_bound_top_bottom_instance_sampling(
         hidden_dim=8,
         attention_dim=4,
         num_classes=2,
-        dropout=0.0,
+        attention_dropout=0.0,
+        classifier_dropout=0.0,
         k_sample=8,
         subtyping=False,
     )
@@ -1054,7 +1058,8 @@ def test_tile_evidence_exactly_reconstructs_logits(
         hidden_dim=8,
         attention_dim=4,
         num_classes=3,
-        dropout=0.0,
+        attention_dropout=0.0,
+        classifier_dropout=0.0,
         pooling_mode="distributional",
         pooling_use_variance=True,
     )
@@ -1110,7 +1115,8 @@ def test_distributional_evidence_avoids_class_tile_feature_expansion(
         hidden_dim=8,
         attention_dim=4,
         num_classes=3,
-        dropout=0.0,
+        attention_dropout=0.0,
+        classifier_dropout=0.0,
         pooling_mode="distributional",
         pooling_use_variance=True,
     )
@@ -1178,7 +1184,8 @@ def test_sb_evidence_is_class_specific_with_shared_attention() -> None:
         hidden_dim=2,
         attention_dim=2,
         num_classes=2,
-        dropout=0.0,
+        attention_dropout=0.0,
+        classifier_dropout=0.0,
     )
     model.eval()
     with torch.no_grad():
@@ -1452,7 +1459,8 @@ def test_visualization_summary_includes_evidence_diagnostics(
         hidden_dim=8,
         attention_dim=4,
         num_classes=2,
-        dropout=0.0,
+        attention_dropout=0.0,
+        classifier_dropout=0.0,
     )
     output_dir = tmp_path / "heatmaps"
 

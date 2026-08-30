@@ -367,9 +367,10 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     if int(config["num_classes"]) < 2:
         raise ValueError("Config key 'num_classes' must be at least 2.")
     _require_positive_int(config, "k_sample")
-    dropout = _require_number(config, "dropout")
-    if not 0.0 <= dropout < 1.0:
-        raise ValueError("Config key 'dropout' must be in [0, 1).")
+    for dropout_key in ("attention_dropout", "classifier_dropout"):
+        dropout = _require_number(config, dropout_key)
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(f"Config key '{dropout_key}' must be in [0, 1).")
     bag_weight = _require_number(config, "bag_weight")
     if not 0.0 <= bag_weight <= 1.0:
         raise ValueError("Config key 'bag_weight' must be between 0 and 1.")

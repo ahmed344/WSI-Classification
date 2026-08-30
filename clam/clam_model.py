@@ -16,7 +16,7 @@ class _AttentionNetwork(nn.Module):
         attention_dim: int,
         branches: int,
         gated: bool,
-        dropout: float,
+        attention_dropout: float,
     ) -> None:
         """Initialize the attention network.
 
@@ -25,7 +25,8 @@ class _AttentionNetwork(nn.Module):
             attention_dim (int): Hidden attention dimension.
             branches (int): Number of attention branches.
             gated (bool): Whether to use gated attention.
-            dropout (float): Dropout probability in attention projections.
+            attention_dropout (float): Dropout probability in attention score
+                projections.
 
         Returns:
             None: The initialized module.
@@ -35,13 +36,13 @@ class _AttentionNetwork(nn.Module):
         self.attention_v = nn.Sequential(
             nn.Linear(input_dim, attention_dim),
             nn.Tanh(),
-            nn.Dropout(dropout),
+            nn.Dropout(attention_dropout),
         )
         if gated:
             self.attention_u: Optional[nn.Sequential] = nn.Sequential(
                 nn.Linear(input_dim, attention_dim),
                 nn.Sigmoid(),
-                nn.Dropout(dropout),
+                nn.Dropout(attention_dropout),
             )
         else:
             self.attention_u = None
@@ -72,7 +73,8 @@ class _CLAMBase(nn.Module):
         attention_dim: int,
         num_classes: int,
         gated: bool,
-        dropout: float,
+        attention_dropout: float,
+        classifier_dropout: float,
         k_sample: int,
         subtyping: bool,
         attention_branches: int,
@@ -90,7 +92,10 @@ class _CLAMBase(nn.Module):
             attention_dim (int): Attention hidden dimension.
             num_classes (int): Number of bag classes.
             gated (bool): Whether to use gated attention.
-            dropout (float): Dropout probability.
+            attention_dropout (float): Dropout probability in attention score
+                projections.
+            classifier_dropout (float): Dropout probability applied to the
+                normalized bag vector before classification.
             k_sample (int): Maximum positive and negative instances per class.
             subtyping (bool): Whether to supervise out-of-class branches.
             attention_branches (int): One for SB or ``num_classes`` for MB.
@@ -114,8 +119,10 @@ class _CLAMBase(nn.Module):
             raise ValueError("num_classes must be at least 2.")
         if k_sample <= 0:
             raise ValueError("k_sample must be positive.")
-        if not 0.0 <= dropout < 1.0:
-            raise ValueError("dropout must be in [0, 1).")
+        if not 0.0 <= attention_dropout < 1.0:
+            raise ValueError("attention_dropout must be in [0, 1).")
+        if not 0.0 <= classifier_dropout < 1.0:
+            raise ValueError("classifier_dropout must be in [0, 1).")
         if attention_normalization != "sigmoid_mean":
             raise ValueError("attention_normalization must be 'sigmoid_mean'.")
         if pooling_layernorm is not True:
@@ -157,16 +164,16 @@ class _CLAMBase(nn.Module):
         self.embedding = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
         )
         self.attention = _AttentionNetwork(
             input_dim=hidden_dim,
             attention_dim=attention_dim,
             branches=attention_branches,
             gated=gated,
-            dropout=dropout,
+            attention_dropout=attention_dropout,
         )
         self.pooling_layernorm = nn.LayerNorm(self.bag_feature_dim)
+        self.classifier_dropout = nn.Dropout(classifier_dropout)
         self.instance_classifiers = nn.ModuleList(
             nn.Linear(hidden_dim, 2) for _ in range(num_classes)
         )
@@ -403,7 +410,8 @@ class _CLAMBase(nn.Module):
             distribution_std = embedded.new_empty((embedded.shape[0], 1, 0))
             raw_pooled_features = attention_pooled_features
         pooled_features = self.pooling_layernorm(raw_pooled_features)
-        logits = self._classify_bags(pooled_features)
+        classification_features = self.classifier_dropout(pooled_features)
+        logits = self._classify_bags(classification_features)
         probabilities = F.softmax(logits, dim=1)
         predictions = probabilities.argmax(dim=1)
 
@@ -445,7 +453,8 @@ class CLAM_SB(_CLAMBase):
         attention_dim: int = 256,
         num_classes: int = 2,
         gated: bool = True,
-        dropout: float = 0.25,
+        attention_dropout: float = 0.2,
+        classifier_dropout: float = 0.2,
         k_sample: int = 8,
         subtyping: bool = False,
         attention_normalization: str = "sigmoid_mean",
@@ -462,7 +471,10 @@ class CLAM_SB(_CLAMBase):
             attention_dim (int): Attention hidden dimension.
             num_classes (int): Number of bag classes.
             gated (bool): Whether to use gated attention.
-            dropout (float): Dropout probability.
+            attention_dropout (float): Dropout probability in attention score
+                projections.
+            classifier_dropout (float): Dropout probability applied to the
+                normalized bag vector before classification.
             k_sample (int): Maximum positive and negative instances per class.
             subtyping (bool): Whether to supervise out-of-class classifiers.
             attention_normalization (str): Required ``sigmoid_mean`` pooling mode.
@@ -482,7 +494,8 @@ class CLAM_SB(_CLAMBase):
             attention_dim=attention_dim,
             num_classes=num_classes,
             gated=gated,
-            dropout=dropout,
+            attention_dropout=attention_dropout,
+            classifier_dropout=classifier_dropout,
             k_sample=k_sample,
             subtyping=subtyping,
             attention_branches=1,
@@ -523,7 +536,8 @@ class CLAM_MB(_CLAMBase):
         attention_dim: int = 256,
         num_classes: int = 2,
         gated: bool = True,
-        dropout: float = 0.25,
+        attention_dropout: float = 0.2,
+        classifier_dropout: float = 0.2,
         k_sample: int = 8,
         subtyping: bool = False,
         attention_normalization: str = "sigmoid_mean",
@@ -540,7 +554,10 @@ class CLAM_MB(_CLAMBase):
             attention_dim (int): Attention hidden dimension.
             num_classes (int): Number of bag classes and attention branches.
             gated (bool): Whether to use gated attention.
-            dropout (float): Dropout probability.
+            attention_dropout (float): Dropout probability in attention score
+                projections.
+            classifier_dropout (float): Dropout probability applied to the
+                normalized bag vector before classification.
             k_sample (int): Maximum positive and negative instances per class.
             subtyping (bool): Whether to supervise out-of-class branches.
             attention_normalization (str): Required ``sigmoid_mean`` pooling mode.
@@ -560,7 +577,8 @@ class CLAM_MB(_CLAMBase):
             attention_dim=attention_dim,
             num_classes=num_classes,
             gated=gated,
-            dropout=dropout,
+            attention_dropout=attention_dropout,
+            classifier_dropout=classifier_dropout,
             k_sample=k_sample,
             subtyping=subtyping,
             attention_branches=num_classes,

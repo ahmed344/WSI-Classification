@@ -29,7 +29,8 @@ pooling_use_variance: true  # Append per-channel population standard deviation i
 pooling_num_prototypes: 0  # Must remain 0 until prototype histogram pooling is implemented in a later stage
 hidden_dim: 512  # Shared tile embedding dimension
 attention_dim: 256  # Hidden dimension of the gated attention network
-dropout: 0.5  # Dropout in the shared embedding and attention projections
+attention_dropout: 0.2  # Dropout in gated attention score projections; pooled tile values and distribution statistics remain deterministic
+classifier_dropout: 0.2  # Dropout after pooled LayerNorm and immediately before bag classification
 num_classes: 5  # Number of slide-level target classes
 k_sample: 8  # Number of positive/negative instances sampled per bag
 subtyping: true  # Apply out-of-class instance supervision
@@ -76,7 +77,7 @@ visualization:  # Settings controlling attention/diagnostic visualization output
   max_slides: null  # null for all slides, or specify a number
   tile_size: 448  # Pixel size used when rendering visualization tiles
   dpi: 150  # Positive output DPI; use 300 for publication-scale heatmaps
-  render_workers: 1  # Parallel figure processes; raise toward CPU count if memory permits
+  render_workers: 8  # Parallel figure processes; raise toward CPU count if memory permits
 
 # Paths (can be overridden)
 paths:  # Optional explicit output/checkpoint paths overriding default derivations

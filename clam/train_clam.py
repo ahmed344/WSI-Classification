@@ -33,7 +33,7 @@ except ImportError:
     from losses import GeneralizedCrossEntropyLoss
 
 
-MODEL_SCHEMA = "canonical_clam_v3_distpool"
+MODEL_SCHEMA = "canonical_clam_v4_deterministic_stats"
 METRIC_KEYS = (
     "loss",
     "classification_loss",
@@ -64,7 +64,8 @@ def create_model(config: Mapping[str, Any]) -> nn.Module:
         attention_dim=int(config["attention_dim"]),
         num_classes=int(config["num_classes"]),
         gated=bool(config["gated_attention"]),
-        dropout=float(config["dropout"]),
+        attention_dropout=float(config["attention_dropout"]),
+        classifier_dropout=float(config["classifier_dropout"]),
         k_sample=int(config["k_sample"]),
         subtyping=bool(config["subtyping"]),
         attention_normalization=str(config["attention_normalization"]),

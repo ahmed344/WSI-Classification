@@ -83,7 +83,8 @@ def test_canonical_clam_forward_and_backward(
         attention_dim=4,
         num_classes=3,
         gated=True,
-        dropout=0.0,
+        attention_dropout=0.0,
+        classifier_dropout=0.0,
         k_sample=2,
         subtyping=True,
         pooling_mode="distributional",
@@ -140,7 +141,8 @@ def test_sigmoid_attention_is_invariant_to_right_padding(
         hidden_dim=8,
         attention_dim=4,
         num_classes=3,
-        dropout=0.0,
+        attention_dropout=0.0,
+        classifier_dropout=0.0,
         pooling_mode="distributional",
         pooling_use_variance=True,
     )
@@ -186,7 +188,8 @@ def test_distributional_statistics_match_masked_population_moments(
         hidden_dim=4,
         attention_dim=2,
         num_classes=2,
-        dropout=0.0,
+        attention_dropout=0.0,
+        classifier_dropout=0.0,
         pooling_mode="distributional",
         pooling_use_variance=True,
     )
@@ -230,7 +233,8 @@ def test_distributional_standard_deviation_has_finite_constant_bag_gradients() -
         hidden_dim=4,
         attention_dim=2,
         num_classes=2,
-        dropout=0.0,
+        attention_dropout=0.0,
+        classifier_dropout=0.0,
         pooling_mode="distributional",
         pooling_use_variance=True,
     )
@@ -264,7 +268,8 @@ def test_attention_pooling_mode_preserves_original_bag_width() -> None:
         hidden_dim=8,
         attention_dim=4,
         num_classes=3,
-        dropout=0.0,
+        attention_dropout=0.0,
+        classifier_dropout=0.0,
         pooling_mode="attention",
         pooling_use_variance=False,
     )
@@ -277,6 +282,76 @@ def test_attention_pooling_mode_preserves_original_bag_width() -> None:
         outputs["raw_pooled_features"],
         outputs["attention_pooled_features"],
     )
+
+
+def test_attention_dropout_does_not_contaminate_distribution_statistics() -> None:
+    """Verify training-time attention dropout leaves population moments stable.
+
+    Args:
+        None.
+
+    Returns:
+        None: Attention scores vary while deterministic mean and standard
+        deviation tensors remain identical.
+    """
+    model = CLAM_MB(
+        input_dim=4,
+        hidden_dim=8,
+        attention_dim=4,
+        num_classes=3,
+        attention_dropout=0.5,
+        classifier_dropout=0.0,
+        pooling_mode="distributional",
+        pooling_use_variance=True,
+    )
+    model.train()
+    features = torch.randn(2, 32, 4)
+
+    first = model(features, instance_eval=False)
+    second = model(features, instance_eval=False)
+
+    assert not any(
+        isinstance(module, torch.nn.Dropout) for module in model.embedding.modules()
+    )
+    assert not torch.equal(first["attention_scores"], second["attention_scores"])
+    assert torch.equal(first["distribution_mean"], second["distribution_mean"])
+    assert torch.equal(first["distribution_std"], second["distribution_std"])
+
+
+def test_classifier_dropout_only_changes_training_logits() -> None:
+    """Verify classifier dropout follows stable pooled bag representations.
+
+    Args:
+        None.
+
+    Returns:
+        None: Training logits vary after identical pooling, while evaluation
+        outputs are deterministic.
+    """
+    model = CLAM_SB(
+        input_dim=4,
+        hidden_dim=8,
+        attention_dim=4,
+        num_classes=3,
+        attention_dropout=0.0,
+        classifier_dropout=0.5,
+        pooling_mode="distributional",
+        pooling_use_variance=True,
+    )
+    features = torch.randn(2, 32, 4)
+    model.train()
+    first_train = model(features, instance_eval=False)
+    second_train = model(features, instance_eval=False)
+
+    assert torch.equal(first_train["pooled_features"], second_train["pooled_features"])
+    assert not torch.equal(first_train["logits"], second_train["logits"])
+
+    model.eval()
+    with torch.no_grad():
+        first_eval = model(features, instance_eval=False)
+        second_eval = model(features, instance_eval=False)
+    assert torch.equal(first_eval["pooled_features"], second_eval["pooled_features"])
+    assert torch.equal(first_eval["logits"], second_eval["logits"])
 
 
 def test_instance_supervision_keeps_raw_score_ranking() -> None:
@@ -293,7 +368,8 @@ def test_instance_supervision_keeps_raw_score_ranking() -> None:
         hidden_dim=4,
         attention_dim=3,
         num_classes=2,
-        dropout=0.0,
+        attention_dropout=0.0,
+        classifier_dropout=0.0,
         k_sample=2,
         subtyping=True,
     )
