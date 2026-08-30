@@ -15,6 +15,7 @@ _OPTIONS: Dict[str, Sequence[str]] = {
     "bag_level": ("tissue", "slide"),
     "feature_normalization": ("none", "l2", "layer_norm"),
     "tile_sampling": ("random", "uniform", "first"),
+    "attention_normalization": ("sigmoid_mean",),
 }
 _SPLITS = ("train", "val", "test")
 _RUN_ID_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}(?:_\d{2})?$")
@@ -314,9 +315,14 @@ def _validate_config(config: Mapping[str, Any]) -> None:
                 f"Invalid {key} '{value}'. Expected one of: {', '.join(choices)}."
             )
 
-    for key in ("gated_attention", "subtyping"):
+    for key in ("gated_attention", "subtyping", "pooling_layernorm"):
         if not isinstance(config.get(key), bool):
             raise ValueError(f"Config key '{key}' must be a boolean.")
+    if config["pooling_layernorm"] is not True:
+        raise ValueError(
+            "Config key 'pooling_layernorm' must be true for sigmoid-over-T "
+            "attention."
+        )
 
     for key in (
         "hidden_dim",

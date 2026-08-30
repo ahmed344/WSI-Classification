@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from matplotlib.collections import PolyCollection
 from matplotlib.figure import Figure
 from torch import nn
 from torch.utils.data import DataLoader
@@ -133,6 +134,8 @@ def _pipeline_config(
         "attention_dim": 4,
         "num_classes": num_classes,
         "gated_attention": True,
+        "attention_normalization": "sigmoid_mean",
+        "pooling_layernorm": True,
         "dropout": 0.0,
         "feature_projection_dropout": 0.0,
         "k_sample": 8,
@@ -154,6 +157,8 @@ def _pipeline_config(
         ("k_sample", 0, "k_sample"),
         ("q", 1.1, "q"),
         ("epsilon", 1.0, "epsilon"),
+        ("attention_normalization", "softmax", "attention_normalization"),
+        ("pooling_layernorm", False, "pooling_layernorm"),
     ],
 )
 def test_config_validation_rejects_invalid_values(
@@ -862,6 +867,36 @@ def test_checkpoint_payload_load_round_trip(
     assert torch.equal(actual, expected)
 
 
+def test_visualization_rejects_softmax_checkpoint_schema(tmp_path: Path) -> None:
+    """Verify visualization refuses pre-sigmoid CLAM checkpoints.
+
+    Args:
+        tmp_path (Path): Temporary checkpoint destination.
+
+    Returns:
+        None: The old schema rejection is asserted.
+    """
+    config = _pipeline_config(tmp_path, "tissue")
+    model = train_clam.create_model(config)
+    checkpoint_path = tmp_path / "old_softmax_checkpoint.pth"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "config": config,
+            "class_folders": ["Class0", "Class1"],
+            "model_schema": "canonical_clam_v1",
+            "bag_level": "tissue",
+        },
+        checkpoint_path,
+    )
+
+    with pytest.raises(ValueError, match="canonical_clam_v1"):
+        visualize_attention.load_checkpoint_model(
+            str(checkpoint_path),
+            torch.device("cpu"),
+        )
+
+
 def test_allocate_training_run_colocates_artifact_paths(tmp_path: Path) -> None:
     """Verify dated run allocation co-locates checkpoint and artifact paths.
 
@@ -1014,6 +1049,13 @@ def test_tile_evidence_exactly_reconstructs_logits(
         dropout=0.0,
     )
     model.eval()
+    with torch.no_grad():
+        model.pooling_layernorm.weight.copy_(
+            torch.linspace(0.5, 1.5, model.hidden_dim)
+        )
+        model.pooling_layernorm.bias.copy_(
+            torch.linspace(-0.3, 0.3, model.hidden_dim)
+        )
     features = torch.randn(2, 6, 4)
     masks = torch.tensor(
         [
@@ -1023,7 +1065,7 @@ def test_tile_evidence_exactly_reconstructs_logits(
     )
     with torch.no_grad():
         outputs = model(features, mask=masks, instance_eval=False)
-        evidence, errors = visualize_attention.compute_tile_evidence(
+        evidence, errors, class_baselines = visualize_attention.compute_tile_evidence(
             model=model,
             features=features,
             masks=masks,
@@ -1031,13 +1073,10 @@ def test_tile_evidence_exactly_reconstructs_logits(
             logits=outputs["logits"],
         )
 
-    biases = torch.stack(
-        [classifier.bias.squeeze(0) for classifier in model.classifiers]
-    )
     assert evidence.shape == (2, 3, 6)
     assert torch.count_nonzero(evidence[0, :, 4:]) == 0
     assert torch.allclose(
-        evidence.sum(dim=-1) + biases.unsqueeze(0),
+        evidence.sum(dim=-1) + class_baselines.unsqueeze(0),
         outputs["logits"],
         atol=1e-4,
         rtol=0.0,
@@ -1071,7 +1110,7 @@ def test_sb_evidence_is_class_specific_with_shared_attention() -> None:
     masks = torch.ones(1, 3, dtype=torch.bool)
     with torch.no_grad():
         outputs = model(features, mask=masks, instance_eval=False)
-        evidence, _ = visualize_attention.compute_tile_evidence(
+        evidence, _, _ = visualize_attention.compute_tile_evidence(
             model=model,
             features=features,
             masks=masks,
@@ -1170,6 +1209,121 @@ def test_attention_and_evidence_are_saved_in_one_figure(
 
     assert combined_path.is_file()
     assert saved_dpi["value"] == 72
+
+
+def _axis_by_title(figure: Figure, title: str) -> plt.Axes:
+    """Return the unique figure axis whose title matches ``title``.
+
+    Args:
+        figure (Figure): Combined attention/evidence figure.
+        title (str): Exact axis title to locate.
+
+    Returns:
+        plt.Axes: The matching axis.
+    """
+    matches = [axis for axis in figure.axes if axis.get_title() == title]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"Expected one axis titled {title!r}, found {len(matches)}."
+        )
+    return matches[0]
+
+
+def test_mean_attention_sits_above_original_in_five_class_figure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify a 5-class figure uses a 2x6 grid with mean attention over original.
+
+    Args:
+        tmp_path (Path): Temporary destination for the rendered PNG.
+        monkeypatch (pytest.MonkeyPatch): Fixture used to inspect the figure.
+
+    Returns:
+        None: First-column layout and 2x6 GridSpec are asserted.
+    """
+    coordinates = np.asarray(
+        [[0.0, 0.0], [448.0, 0.0], [0.0, 448.0]], dtype=np.float64
+    )
+    attention = np.asarray(
+        [
+            [0.10, 0.20, 0.30],
+            [0.40, 0.10, 0.20],
+            [0.15, 0.35, 0.25],
+            [0.05, 0.50, 0.10],
+            [0.30, 0.05, 0.40],
+        ],
+        dtype=np.float64,
+    )
+    evidence = np.asarray(
+        [
+            [0.2, -0.1, 0.4],
+            [-0.3, 0.2, 0.1],
+            [0.1, 0.0, -0.2],
+            [0.4, -0.2, 0.1],
+            [-0.1, 0.3, 0.2],
+        ],
+        dtype=np.float64,
+    )
+    class_names = [f"Class{index}" for index in range(5)]
+    captured_figure: Dict[str, Figure] = {}
+    original_savefig = Figure.savefig
+
+    def _capture_figure(
+        figure: Figure,
+        output_path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Record the figure being saved, then write it.
+
+        Args:
+            figure (Figure): Figure being saved.
+            output_path (Path): Destination image path.
+            *args (Any): Additional positional save arguments.
+            **kwargs (Any): Additional keyword save arguments.
+
+        Returns:
+            None: The original save operation is completed.
+        """
+        captured_figure["figure"] = figure
+        original_savefig(figure, output_path, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", _capture_figure)
+    output_path = tmp_path / "slide_tissue_attention.png"
+    visualize_attention.save_attention_evidence_figure(
+        branch_attention=attention,
+        class_evidence=evidence,
+        coordinates=coordinates,
+        branch_names=class_names,
+        class_names=class_names,
+        bag_evidence_sums=evidence.sum(axis=1),
+        predicted_index=2,
+        slide_name="slide",
+        tissue_name="tissue",
+        true_class="Class0",
+        predicted_class="Class2",
+        predicted_probability=0.6,
+        image_path=None,
+        output_path=output_path,
+        tile_size=448,
+        thumbnail_size=128,
+        render_dpi=72,
+    )
+
+    figure = captured_figure["figure"]
+    mean_axis = _axis_by_title(figure, "Attention — Mean")
+    original_axis = _axis_by_title(figure, "Original")
+    grid = original_axis.get_gridspec()
+    assert grid is not None
+    assert grid.nrows == 2
+    assert grid.ncols == 6
+    assert mean_axis.get_position().y0 > original_axis.get_position().y0
+    assert len(mean_axis.collections) == 1
+    assert isinstance(mean_axis.collections[0], PolyCollection)
+    assert len(mean_axis.collections[0].get_paths()) == coordinates.shape[0]
+    assert len(original_axis.collections) == 0
+    assert output_path.is_file()
 
 
 def test_heatmap_tiles_use_one_vectorized_collection_per_axis() -> None:

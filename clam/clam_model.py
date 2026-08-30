@@ -76,6 +76,8 @@ class _CLAMBase(nn.Module):
         k_sample: int,
         subtyping: bool,
         attention_branches: int,
+        attention_normalization: str,
+        pooling_layernorm: bool,
     ) -> None:
         """Initialize common CLAM modules.
 
@@ -89,6 +91,9 @@ class _CLAMBase(nn.Module):
             k_sample (int): Maximum positive and negative instances per class.
             subtyping (bool): Whether to supervise out-of-class branches.
             attention_branches (int): One for SB or ``num_classes`` for MB.
+            attention_normalization (str): Required ``sigmoid_mean`` pooling mode.
+            pooling_layernorm (bool): Whether pooled vectors are normalized before
+                classification; required for sigmoid-over-T attention.
 
         Returns:
             None: The initialized model.
@@ -102,6 +107,12 @@ class _CLAMBase(nn.Module):
             raise ValueError("k_sample must be positive.")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in [0, 1).")
+        if attention_normalization != "sigmoid_mean":
+            raise ValueError("attention_normalization must be 'sigmoid_mean'.")
+        if pooling_layernorm is not True:
+            raise ValueError(
+                "pooling_layernorm must be true for sigmoid-over-T attention."
+            )
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -109,6 +120,7 @@ class _CLAMBase(nn.Module):
         self.k_sample = k_sample
         self.subtyping = subtyping
         self.num_attention_branches = attention_branches
+        self.attention_normalization = attention_normalization
 
         self.embedding = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -122,6 +134,7 @@ class _CLAMBase(nn.Module):
             gated=gated,
             dropout=dropout,
         )
+        self.pooling_layernorm = nn.LayerNorm(hidden_dim)
         self.instance_classifiers = nn.ModuleList(
             nn.Linear(hidden_dim, 2) for _ in range(num_classes)
         )
@@ -321,9 +334,13 @@ class _CLAMBase(nn.Module):
         attention_scores = attention_scores.masked_fill(
             ~mask.unsqueeze(1), float("-inf")
         )
-        attention_weights = F.softmax(attention_scores, dim=-1)
+        valid_tile_counts = mask.sum(dim=1, keepdim=True).unsqueeze(1)
+        attention_weights = torch.sigmoid(attention_scores) / valid_tile_counts.to(
+            dtype=embedded.dtype
+        )
         attention_weights = attention_weights.masked_fill(~mask.unsqueeze(1), 0.0)
-        pooled_features = torch.bmm(attention_weights, embedded)
+        raw_pooled_features = torch.bmm(attention_weights, embedded)
+        pooled_features = self.pooling_layernorm(raw_pooled_features)
         logits = self._classify_bags(pooled_features)
         probabilities = F.softmax(logits, dim=1)
         predictions = probabilities.argmax(dim=1)
@@ -349,6 +366,7 @@ class _CLAMBase(nn.Module):
             "predictions": predictions,
             "attention_scores": attention_scores,
             "attention_weights": attention_weights,
+            "raw_pooled_features": raw_pooled_features,
             "pooled_features": pooled_features,
             "instance_loss": instance_loss,
             "instance_predictions": instance_predictions,
@@ -369,6 +387,8 @@ class CLAM_SB(_CLAMBase):
         dropout: float = 0.25,
         k_sample: int = 8,
         subtyping: bool = False,
+        attention_normalization: str = "sigmoid_mean",
+        pooling_layernorm: bool = True,
     ) -> None:
         """Initialize CLAM-SB.
 
@@ -381,6 +401,9 @@ class CLAM_SB(_CLAMBase):
             dropout (float): Dropout probability.
             k_sample (int): Maximum positive and negative instances per class.
             subtyping (bool): Whether to supervise out-of-class classifiers.
+            attention_normalization (str): Required ``sigmoid_mean`` pooling mode.
+            pooling_layernorm (bool): Whether to normalize pooled vectors before
+                classification; must be ``True``.
 
         Returns:
             None: The initialized CLAM-SB model.
@@ -395,6 +418,8 @@ class CLAM_SB(_CLAMBase):
             k_sample=k_sample,
             subtyping=subtyping,
             attention_branches=1,
+            attention_normalization=attention_normalization,
+            pooling_layernorm=pooling_layernorm,
         )
         self.classifiers = nn.ModuleList(
             nn.Linear(hidden_dim, 1) for _ in range(num_classes)
@@ -429,6 +454,8 @@ class CLAM_MB(_CLAMBase):
         dropout: float = 0.25,
         k_sample: int = 8,
         subtyping: bool = False,
+        attention_normalization: str = "sigmoid_mean",
+        pooling_layernorm: bool = True,
     ) -> None:
         """Initialize CLAM-MB.
 
@@ -441,6 +468,9 @@ class CLAM_MB(_CLAMBase):
             dropout (float): Dropout probability.
             k_sample (int): Maximum positive and negative instances per class.
             subtyping (bool): Whether to supervise out-of-class branches.
+            attention_normalization (str): Required ``sigmoid_mean`` pooling mode.
+            pooling_layernorm (bool): Whether to normalize pooled vectors before
+                classification; must be ``True``.
 
         Returns:
             None: The initialized CLAM-MB model.
@@ -455,6 +485,8 @@ class CLAM_MB(_CLAMBase):
             k_sample=k_sample,
             subtyping=subtyping,
             attention_branches=num_classes,
+            attention_normalization=attention_normalization,
+            pooling_layernorm=pooling_layernorm,
         )
         self.classifiers = nn.ModuleList(
             nn.Linear(hidden_dim, 1) for _ in range(num_classes)

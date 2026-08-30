@@ -93,9 +93,17 @@ def test_canonical_clam_forward_and_backward(model_class: type[torch.nn.Module])
     assert outputs["logits"].shape == (2, 3)
     assert outputs["attention_weights"].shape[0] == 2
     assert torch.all(outputs["attention_weights"].masked_select(~masks.unsqueeze(1)) == 0)
+    valid_counts = masks.sum(dim=1, keepdim=True).unsqueeze(1)
+    expected_attention = torch.sigmoid(outputs["attention_scores"]) / valid_counts
+    expected_attention = expected_attention.masked_fill(~masks.unsqueeze(1), 0.0)
     assert torch.allclose(
-        outputs["attention_weights"].sum(dim=-1),
-        torch.ones_like(outputs["attention_weights"].sum(dim=-1)),
+        outputs["attention_weights"],
+        expected_attention,
+    )
+    assert torch.all(outputs["attention_weights"].sum(dim=-1) < 1.0)
+    assert torch.allclose(
+        outputs["pooled_features"],
+        model.pooling_layernorm(outputs["raw_pooled_features"]),
     )
     assert set(outputs["instance_targets"].tolist()).issubset({0, 1})
 
@@ -105,8 +113,85 @@ def test_canonical_clam_forward_and_backward(model_class: type[torch.nn.Module])
     assert any(parameter.grad is not None for parameter in model.parameters())
 
 
+@pytest.mark.parametrize("model_class", [CLAM_SB, CLAM_MB])
+def test_sigmoid_attention_is_invariant_to_right_padding(
+    model_class: type[torch.nn.Module],
+) -> None:
+    """Verify padding does not alter sigmoid-over-T pooling or predictions.
+
+    Args:
+        model_class (type[torch.nn.Module]): CLAM variant under test.
+
+    Returns:
+        None: Unpadded and padded outputs are compared.
+    """
+    model = model_class(
+        input_dim=4,
+        hidden_dim=8,
+        attention_dim=4,
+        num_classes=3,
+        dropout=0.0,
+    )
+    model.eval()
+    features = torch.randn(1, 5, 4)
+    padded_features = torch.cat((features, torch.randn(1, 3, 4)), dim=1)
+    padded_mask = torch.tensor([[True] * 5 + [False] * 3])
+
+    with torch.no_grad():
+        unpadded = model(features, instance_eval=False)
+        padded = model(
+            padded_features,
+            mask=padded_mask,
+            instance_eval=False,
+        )
+
+    assert torch.allclose(
+        unpadded["attention_weights"],
+        padded["attention_weights"][:, :, :5],
+    )
+    assert torch.allclose(unpadded["raw_pooled_features"], padded["raw_pooled_features"])
+    assert torch.allclose(unpadded["logits"], padded["logits"])
+
+
+def test_instance_supervision_keeps_raw_score_ranking() -> None:
+    """Verify monotonic sigmoid scores select the same supervised instances.
+
+    Args:
+        None.
+
+    Returns:
+        None: Losses, predictions, and targets remain identical.
+    """
+    model = CLAM_MB(
+        input_dim=4,
+        hidden_dim=4,
+        attention_dim=3,
+        num_classes=2,
+        dropout=0.0,
+        k_sample=2,
+        subtyping=True,
+    )
+    embedded = torch.randn(1, 6, 4)
+    scores = torch.tensor(
+        [[[-4.0, 2.0, 0.5, 7.0, -1.0, 3.0], [1.0, -3.0, 5.0, 0.0, 4.0, -2.0]]]
+    )
+    mask = torch.ones(1, 6, dtype=torch.bool)
+    labels = torch.tensor([1])
+
+    raw_result = model._instance_supervision(embedded, scores, mask, labels)
+    sigmoid_result = model._instance_supervision(
+        embedded,
+        torch.sigmoid(scores),
+        mask,
+        labels,
+    )
+
+    for raw_value, sigmoid_value in zip(raw_result, sigmoid_result):
+        assert torch.equal(raw_value, sigmoid_value)
+
+
 def test_clam_rejects_empty_bags() -> None:
-    """Verify that all-padding bags fail before attention softmax.
+    """Verify that all-padding bags fail before attention normalization.
 
     Args:
         None.
