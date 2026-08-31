@@ -1,0 +1,83 @@
+# CLAM Configuration File
+
+# Data paths
+data_root: "/workspaces/WSI-Classification/data/HE-MYO/Processed"  # Root directory containing processed slide-level data
+checkpoint_dir: "checkpoints"  # Directory where training checkpoints are saved
+output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results"  # Directory for evaluation artifacts and visual outputs
+
+# Feature source selection
+# Choose which extracted feature set CLAM should load.
+feature_model: "uni2h"  # Active feature extractor name used to select feature files
+feature_model_suffixes:  # Mapping from feature model names to filename suffixes
+  default: "_features.pt"  # Suffix for the default feature set
+  hoptimus: "_features_hoptimus.pt"  # Suffix for H-Optimus feature files
+  uni2h: "_features_uni2h.pt"  # Suffix for UNI2-H feature files
+  genbio: "_features_genbio.pt"  # Suffix for GenBio-PathFM feature files
+feature_model_input_dims:  # Mapping from feature model names to input dimensions
+  default: 1536  # Input dimension for the default feature set
+  hoptimus: 1536  # Input dimension for H-Optimus features
+  uni2h: 1536  # Input dimension for UNI2-H features
+  genbio: 4608  # Input dimension for GenBio-PathFM features
+
+# Model architecture
+model_type: "clam_mb"  # Options: clam_mb, clam_sb
+gated_attention: true  # Use the canonical gated attention network
+attention_normalization: "sigmoid_mean"  # Must be sigmoid_mean; applies independent sigmoid gates and divides their weighted sum by the valid tile count
+pooling_layernorm: true  # Must be true; normalize sigmoid-over-T pooled vectors before classification
+hidden_dim: 512  # Shared tile embedding dimension
+attention_dim: 256  # Hidden dimension of the gated attention network
+dropout: 0.5  # Dropout in the shared embedding and attention projections
+num_classes: 5  # Number of slide-level target classes
+k_sample: 8  # Number of positive/negative instances sampled per bag
+subtyping: true  # Apply out-of-class instance supervision
+bag_weight: 0.5  # Weight of bag loss; instance loss receives 1 - bag_weight
+
+# Training parameters
+batch_size: 128  # Physical number of variable-length bags per micro-batch
+slide_evaluation_batch_size: 1  # Physical batch size for memory-intensive concatenated-slide validation/evaluation
+gradient_accumulation_steps: 1  # Effective batch size is batch_size * this value
+num_workers: 8  # Parallel DataLoader workers; limited by the container's 8 GB shared memory
+prefetch_factor: 2  # Complete batches prefetched per worker; requires num_workers greater than 0
+bag_level: "tissue"  # Options: tissue, slide
+feature_normalization: "none"  # Options: none, l2, layer_norm
+max_tiles_per_bag:  # Applied after constructing a complete tissue or slide bag
+  train: 2048
+  val: null
+  test: null
+tile_sampling: "random"  # Options: random, uniform, first
+epochs: 100  # Maximum number of training epochs
+lr_cls: 0.001  # Initial learning rate for classification-related parameters
+lr_scheduler_factor_cls: 0.5  # ReduceLROnPlateau factor for classification branch
+lr_scheduler_patience_cls: 5  # ReduceLROnPlateau patience for classification branch
+use_weighted_sampler: true  # If true, train DataLoader uses WeightedRandomSampler
+use_class_weighted_loss: false  # Apply inverse-frequency class weights to the bag-level loss
+q: 0.7  # Generalized cross-entropy exponent; 0 recovers standard cross entropy
+epsilon: 0.1  # Label-smoothing strength in [0, 1); 0 disables smoothing
+best_checkpoint_metric: "slide_balanced_accuracy"  # Options: slide_balanced_accuracy, balanced_accuracy, accuracy, loss, classification_loss, instance_loss
+weight_decay_cls: 0.0001  # Weight decay for feature projection, attention branches, and classifier
+train_ratio: 0.8  # Fraction of slides used for training split
+val_ratio: 0.1  # Fraction of slides used for validation split
+test_ratio: 0.1  # Fraction of slides used for test split
+min_epochs_before_early_stopping: 10  # Minimum epochs before early stopping checks begin
+patience: 10  # Early stopping patience based on the selected checkpoint metric
+random_seed: 42  # Random seed for deterministic data splitting and training behavior
+
+# Evaluation parameters
+evaluation:  # Controls additional bag levels and optional splits during standalone evaluation
+  supplementary_bag_level: "slide"  # Add concatenated-slide evaluation alongside the checkpoint's tissue bag level
+  include_train: false  # If true, evaluate the train split at both configured bag levels
+
+# Visualization parameters
+visualization:  # Settings controlling attention/diagnostic visualization outputs
+  split: "val"  # Options: train, val, test
+  max_slides: null  # null for all slides, or specify a number
+  tile_size: 448  # Pixel size used when rendering visualization tiles
+  dpi: 150  # Positive output DPI; use 300 for publication-scale heatmaps
+  render_workers: 8  # Parallel figure processes; raise toward CPU count if memory permits
+
+# Paths (can be overridden)
+paths:  # Optional explicit output/checkpoint paths overriding default derivations
+  checkpoint: null  # Will be set to checkpoints/best_model.pth if null
+  evaluation_output: null  # Will use output_dir/clam/evaluation_results if null
+  attention_output: null  # Will use output_dir/clam/attention_heatmaps if null
+
