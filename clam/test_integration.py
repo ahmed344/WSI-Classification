@@ -72,6 +72,8 @@ def _run_model_smoke(model_class: Type[nn.Module], bag_level: str) -> None:
         1,
         model.pooling_num_prototypes,
     )
+    assert model.prototype_assignment is not None
+    assert model.prototype_assignment.in_features == model.input_dim
     assert outputs["mean_gate"].shape == (2, expected_branches, 1)
     assert torch.allclose(
         outputs["mean_gate"],
@@ -82,9 +84,24 @@ def _run_model_smoke(model_class: Type[nn.Module], bag_level: str) -> None:
         expected_branches,
         3 * model.hidden_dim + model.pooling_num_prototypes + 1,
     )
+    assert outputs["tile_evidence_scores"].shape == (
+        2,
+        3,
+        features.shape[1],
+    )
+    assert outputs["detection_top_k_mask"].shape == (
+        2,
+        3,
+        features.shape[1],
+    )
+    assert outputs["prevalence_values"].shape == (2, 3)
+    assert outputs["detection_values"].shape == (2, 3)
+    assert torch.count_nonzero(outputs["detection_top_k_mask"] & ~masks.unsqueeze(1)) == 0
     assert torch.allclose(
-        outputs["pooled_features"],
-        model.pooling_layernorm(outputs["raw_pooled_features"]),
+        outputs["logits"],
+        outputs["base_logits"]
+        + outputs["prevalence_contributions"]
+        + outputs["detection_contributions"],
     )
     assert torch.isfinite(outputs["instance_loss"])
     assert set(outputs["instance_targets"].tolist()).issubset({0, 1})

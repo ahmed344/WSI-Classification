@@ -25,6 +25,7 @@ if str(CLAM_DIRECTORY) not in sys.path:
 import evaluate_clam
 import train_clam
 import visualize_attention
+from diagnose_prototypes import compute_histogram_cv, grouped_probe_scores
 from clam_dataset import collate_fn, create_bag_dataset
 from clam_model import CLAM_MB, CLAM_SB
 from config_loader import (
@@ -133,10 +134,11 @@ def _pipeline_config(
         "num_classes": num_classes,
         "gated_attention": True,
         "attention_normalization": "sigmoid_mean",
-        "pooling_layernorm": True,
+        "pooling_normalization": "selective_layernorm",
         "pooling_mode": "distributional",
         "pooling_use_variance": True,
         "pooling_num_prototypes": 0,
+        "detection_top_k": 3,
         "attention_dropout": 0.0,
         "classifier_dropout": 0.0,
         "feature_projection_dropout": 0.0,
@@ -160,14 +162,20 @@ def _pipeline_config(
         ("q", 1.1, "q"),
         ("epsilon", 1.0, "epsilon"),
         ("attention_normalization", "softmax", "attention_normalization"),
-        ("pooling_layernorm", False, "pooling_layernorm"),
+        ("pooling_normalization", "global_layernorm", "pooling_normalization"),
         ("pooling_mode", "histogram", "pooling_mode"),
         ("pooling_use_variance", "yes", "pooling_use_variance"),
         ("pooling_num_prototypes", -1, "pooling_num_prototypes"),
         ("pooling_prototype_temperature", 0.0, "pooling_prototype_temperature"),
+        (
+            "prototype_assignment_entropy_target",
+            1.0,
+            "prototype_assignment_entropy_target",
+        ),
         ("pooling_freeze_prototypes", "yes", "pooling_freeze_prototypes"),
         ("prototype_kmeans_max_tiles", 0, "prototype_kmeans_max_tiles"),
         ("prototype_kmeans_batch_size", 0, "prototype_kmeans_batch_size"),
+        ("detection_top_k", 0, "detection_top_k"),
         ("attention_dropout", 1.0, "attention_dropout"),
         ("classifier_dropout", -0.1, "classifier_dropout"),
     ],
@@ -214,8 +222,11 @@ def test_config_accepts_prototype_histogram_settings() -> None:
     assert config["pooling_mode"] == "distributional"
     assert config["pooling_num_prototypes"] == 16
     assert config["pooling_prototype_temperature"] is None
+    assert config["prototype_assignment_entropy_target"] == pytest.approx(0.3)
     assert config["prototype_kmeans_max_tiles"] >= 16
     assert config["prototype_kmeans_batch_size"] > 0
+    assert config["detection_top_k"] == 10
+    assert config["pooling_normalization"] == "selective_layernorm"
 
 
 def test_config_rejects_prototypes_with_attention_only_pooling(
@@ -239,6 +250,79 @@ def test_config_rejects_prototypes_with_attention_only_pooling(
 
     with pytest.raises(ValueError, match="requires.*distributional"):
         load_config(str(invalid_path))
+
+
+def test_optimizer_excludes_prototype_parameters_from_weight_decay(
+    tmp_path: Path,
+) -> None:
+    """Verify assignment and temperature parameters use a zero-decay group.
+
+    Args:
+        tmp_path (Path): Temporary root used to build a resolved test config.
+
+    Returns:
+        None: Optimizer group membership and decay values are asserted.
+    """
+    config = _pipeline_config(tmp_path, "tissue")
+    config["pooling_num_prototypes"] = 4
+    model = train_clam.create_model(config)
+    optimizer = train_clam.build_optimizer(model, config)
+    prototype_assignment = model.prototype_assignment
+    prototype_temperature = model.log_prototype_temperature
+    assert prototype_assignment is not None
+    assert prototype_temperature is not None
+    prototype_ids = {
+        id(prototype_assignment.weight),
+        id(prototype_assignment.bias),
+        id(prototype_temperature),
+    }
+    grouped_decay = {
+        id(parameter): float(group["weight_decay"])
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+
+    assert all(grouped_decay[parameter_id] == 0.0 for parameter_id in prototype_ids)
+    assert any(
+        decay == pytest.approx(float(config["weight_decay_cls"]))
+        for parameter_id, decay in grouped_decay.items()
+        if parameter_id not in prototype_ids
+    )
+
+
+def test_prototype_diagnostic_detects_informative_histograms() -> None:
+    """Verify grouped diagnostics recognize class-informative histograms.
+
+    Args:
+        None: Deterministic grouped synthetic arrays are constructed in the test.
+
+    Returns:
+        None: Histogram variation and probe improvement are asserted.
+    """
+    labels = np.repeat(np.arange(5), 10)
+    groups = np.repeat(
+        np.asarray([f"class_{class_index}_slide_{slide_index}"
+                    for class_index in range(5)
+                    for slide_index in range(5)]),
+        2,
+    )
+    mean_std_features = np.zeros((labels.size, 4), dtype=np.float64)
+    histograms = np.full((labels.size, 5), 0.01, dtype=np.float64)
+    histograms[np.arange(labels.size), labels] = 0.96
+
+    mean_cv, per_prototype_cv = compute_histogram_cv(histograms)
+    baseline_scores, augmented_scores = grouped_probe_scores(
+        mean_std_features,
+        histograms,
+        labels,
+        groups,
+        random_seed=17,
+    )
+
+    assert mean_cv > 0.4
+    assert per_prototype_cv.shape == (5,)
+    assert len(baseline_scores) == len(augmented_scores) == 5
+    assert np.mean(augmented_scores) > np.mean(baseline_scores)
 
 
 @pytest.mark.parametrize("dpi", [0, -1, 1.5, True])
@@ -1120,12 +1204,19 @@ def test_tile_evidence_exactly_reconstructs_logits(
     )
     model.eval()
     with torch.no_grad():
-        model.pooling_layernorm.weight.copy_(
-            torch.linspace(0.5, 1.5, model.bag_feature_dim)
+        model.distribution_mean_layernorm.weight.copy_(
+            torch.linspace(0.5, 1.5, model.hidden_dim)
         )
-        model.pooling_layernorm.bias.copy_(
-            torch.linspace(-0.3, 0.3, model.bag_feature_dim)
+        model.distribution_mean_layernorm.bias.copy_(
+            torch.linspace(-0.3, 0.3, model.hidden_dim)
         )
+        if model.distribution_std_layernorm is not None:
+            model.distribution_std_layernorm.weight.copy_(
+                torch.linspace(0.7, 1.3, model.hidden_dim)
+            )
+            model.distribution_std_layernorm.bias.copy_(
+                torch.linspace(-0.2, 0.2, model.hidden_dim)
+            )
     features = torch.randn(2, 6, 4)
     masks = torch.tensor(
         [
@@ -1214,8 +1305,7 @@ def test_distributional_evidence_avoids_class_tile_feature_expansion(
             logits=outputs["logits"],
         )
 
-    assert observed_input_ranks
-    assert max(observed_input_ranks) <= 3
+    assert max(observed_input_ranks, default=0) <= 3
     assert torch.allclose(
         evidence.sum(dim=-1) + class_baselines.unsqueeze(0),
         outputs["logits"],

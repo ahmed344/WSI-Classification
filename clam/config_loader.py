@@ -17,6 +17,7 @@ _OPTIONS: Dict[str, Sequence[str]] = {
     "feature_normalization": ("none", "l2", "layer_norm"),
     "tile_sampling": ("random", "uniform", "first"),
     "attention_normalization": ("sigmoid_mean",),
+    "pooling_normalization": ("selective_layernorm",),
     "pooling_mode": ("attention", "distributional"),
 }
 _SPLITS = ("train", "val", "test")
@@ -227,6 +228,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     config.setdefault("q", 0.0)
     config.setdefault("epsilon", 0.0)
     config.setdefault("pooling_prototype_temperature", None)
+    config.setdefault("prototype_assignment_entropy_target", 0.3)
     config.setdefault("pooling_freeze_prototypes", False)
     config.setdefault("prototype_kmeans_max_tiles", 200_000)
     config.setdefault("prototype_kmeans_batch_size", 4_096)
@@ -324,17 +326,11 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     for key in (
         "gated_attention",
         "subtyping",
-        "pooling_layernorm",
         "pooling_use_variance",
         "pooling_freeze_prototypes",
     ):
         if not isinstance(config.get(key), bool):
             raise ValueError(f"Config key '{key}' must be a boolean.")
-    if config["pooling_layernorm"] is not True:
-        raise ValueError(
-            "Config key 'pooling_layernorm' must be true for sigmoid-over-T "
-            "attention."
-        )
     prototype_count = config.get("pooling_num_prototypes")
     if (
         isinstance(prototype_count, bool)
@@ -361,6 +357,13 @@ def _validate_config(config: Mapping[str, Any]) -> None:
                 "Config key 'pooling_prototype_temperature' must be positive "
                 "and finite or null."
             )
+    prototype_entropy_target = _require_number(
+        config, "prototype_assignment_entropy_target"
+    )
+    if not 0.0 < prototype_entropy_target < 1.0:
+        raise ValueError(
+            "Config key 'prototype_assignment_entropy_target' must be in (0, 1)."
+        )
     for key in ("prototype_kmeans_max_tiles", "prototype_kmeans_batch_size"):
         _require_positive_int(config, key)
     if (
@@ -375,6 +378,7 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     for key in (
         "hidden_dim",
         "attention_dim",
+        "detection_top_k",
         "num_classes",
         "batch_size",
         "gradient_accumulation_steps",

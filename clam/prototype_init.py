@@ -17,9 +17,10 @@ except ImportError:
 
 
 MIN_PROTOTYPE_TEMPERATURE = 1e-6
+TEMPERATURE_SEARCH_STEPS = 48
 
 
-def collect_training_tile_embeddings(
+def collect_training_tile_features(
     model: nn.Module,
     train_dataset: WSIBagDataset,
     device: torch.device,
@@ -27,18 +28,18 @@ def collect_training_tile_embeddings(
     batch_size: int,
     random_seed: int,
 ) -> np.ndarray:
-    """Collect a deterministic sample of embedded training-split tiles.
+    """Collect a deterministic sample of frozen training-split tile features.
 
     Args:
-        model (nn.Module): CLAM model exposing an ``embedding`` module.
+        model (nn.Module): CLAM model exposing an integer ``input_dim``.
         train_dataset (WSIBagDataset): Training-split bag dataset.
-        device (torch.device): Device used to run tile embedding.
-        max_tiles (int): Maximum number of embedded tiles to retain.
-        batch_size (int): Maximum tile count per embedding operation.
+        device (torch.device): Device argument retained for a stable caller contract.
+        max_tiles (int): Maximum number of input-space tiles to retain.
+        batch_size (int): Maximum tile count copied per operation.
         random_seed (int): Seed controlling bag order and final-bag subsampling.
 
     Returns:
-        np.ndarray: Float32 embedded tiles shaped ``[sample_count, hidden_dim]``.
+        np.ndarray: Float32 tile features shaped ``[sample_count, input_dim]``.
     """
     if train_dataset.split != "train":
         raise ValueError("Prototype initialization requires a training-split dataset.")
@@ -46,44 +47,44 @@ def collect_training_tile_embeddings(
         raise ValueError("max_tiles and batch_size must be positive.")
     if random_seed < 0:
         raise ValueError("random_seed must be nonnegative.")
-    embedding = getattr(model, "embedding", None)
-    hidden_dim = getattr(model, "hidden_dim", None)
-    if not isinstance(embedding, nn.Module) or not isinstance(hidden_dim, int):
-        raise TypeError("model must expose an embedding module and integer hidden_dim.")
+    del device
+    input_dim = getattr(model, "input_dim", None)
+    if not isinstance(input_dim, int):
+        raise TypeError("model must expose an integer input_dim.")
 
     train_dataset.set_epoch(0)
     bag_order = np.arange(len(train_dataset), dtype=np.int64)
     generator = np.random.default_rng(random_seed)
     generator.shuffle(bag_order)
-    collected = np.empty((max_tiles, hidden_dim), dtype=np.float32)
+    collected = np.empty((max_tiles, input_dim), dtype=np.float32)
     sample_count = 0
-    was_training = model.training
-    model.eval()
-    try:
-        with torch.inference_mode():
-            for bag_index in bag_order:
-                features = train_dataset[int(bag_index)]["features"]
-                remaining = max_tiles - sample_count
-                if remaining <= 0:
-                    break
-                if features.shape[0] > remaining:
-                    selected = np.sort(
-                        generator.choice(
-                            int(features.shape[0]), size=remaining, replace=False
-                        )
+    with torch.inference_mode():
+        for bag_index in bag_order:
+            features = train_dataset[int(bag_index)]["features"]
+            remaining = max_tiles - sample_count
+            if remaining <= 0:
+                break
+            if features.shape[0] > remaining:
+                selected = np.sort(
+                    generator.choice(
+                        int(features.shape[0]), size=remaining, replace=False
                     )
-                    features = features[torch.from_numpy(selected)]
+                )
+                features = features[torch.from_numpy(selected)]
 
-                for start in range(0, int(features.shape[0]), batch_size):
-                    feature_batch = features[start : start + batch_size].to(device)
-                    embedded = embedding(feature_batch).detach().cpu().float().numpy()
-                    end = sample_count + embedded.shape[0]
-                    collected[sample_count:end] = embedded
-                    sample_count = end
-    finally:
-        model.train(was_training)
+            for start in range(0, int(features.shape[0]), batch_size):
+                feature_batch = (
+                    features[start : start + batch_size].detach().cpu().float().numpy()
+                )
+                if feature_batch.shape[1] != input_dim:
+                    raise ValueError(
+                        "Training tile feature width does not match model.input_dim."
+                    )
+                end = sample_count + feature_batch.shape[0]
+                collected[sample_count:end] = feature_batch
+                sample_count = end
 
-    return collected[:sample_count].copy()
+    return collected[:sample_count]
 
 
 def fit_prototype_centroids(
@@ -124,38 +125,154 @@ def estimate_prototype_temperature(
     embeddings: np.ndarray,
     centroids: np.ndarray,
     batch_size: int,
+    target_normalized_entropy: float,
 ) -> float:
-    """Estimate assignment temperature from nearest-centroid squared distances.
+    """Estimate a temperature targeting median normalized assignment entropy.
 
     Args:
-        embeddings (np.ndarray): Embedded tiles shaped ``[N, H]``.
-        centroids (np.ndarray): K-means centroids shaped ``[K, H]``.
+        embeddings (np.ndarray): Frozen tile features shaped ``[N, D]``.
+        centroids (np.ndarray): K-means centroids shaped ``[K, D]``.
         batch_size (int): Number of tiles processed per distance block.
+        target_normalized_entropy (float): Desired median ``H(q) / log(K)`` in
+            the open interval ``(0, 1)``.
 
     Returns:
-        float: Positive mean nearest-centroid squared distance.
+        float: Positive soft-assignment temperature.
+    """
+    squared_distances = _prototype_squared_distances(
+        embeddings=embeddings,
+        centroids=centroids,
+        batch_size=batch_size,
+    )
+    if not 0.0 < target_normalized_entropy < 1.0:
+        raise ValueError("target_normalized_entropy must be in (0, 1).")
+
+    lower = MIN_PROTOTYPE_TEMPERATURE
+    distance_spread = np.std(squared_distances, axis=1, dtype=np.float64)
+    upper = max(float(np.median(distance_spread)), 1.0)
+    while (
+        _median_normalized_entropy_from_distances(squared_distances, upper)
+        < target_normalized_entropy
+    ):
+        upper *= 2.0
+        if not math.isfinite(upper):
+            raise ValueError("Could not bracket a finite prototype temperature.")
+
+    if (
+        _median_normalized_entropy_from_distances(squared_distances, lower)
+        >= target_normalized_entropy
+    ):
+        return lower
+
+    for _ in range(TEMPERATURE_SEARCH_STEPS):
+        midpoint = math.sqrt(lower * upper)
+        median_entropy = _median_normalized_entropy_from_distances(
+            squared_distances, midpoint
+        )
+        if median_entropy < target_normalized_entropy:
+            lower = midpoint
+        else:
+            upper = midpoint
+    return max(math.sqrt(lower * upper), MIN_PROTOTYPE_TEMPERATURE)
+
+
+def compute_median_normalized_assignment_entropy(
+    embeddings: np.ndarray,
+    centroids: np.ndarray,
+    batch_size: int,
+    temperature: float,
+) -> float:
+    """Compute median normalized entropy for prototype soft assignments.
+
+    Args:
+        embeddings (np.ndarray): Frozen tile features shaped ``[N, D]``.
+        centroids (np.ndarray): K-means centroids shaped ``[K, D]``.
+        batch_size (int): Number of tiles processed per distance block.
+        temperature (float): Positive soft-assignment temperature.
+
+    Returns:
+        float: Median tile entropy divided by ``log(K)``.
+    """
+    squared_distances = _prototype_squared_distances(
+        embeddings=embeddings,
+        centroids=centroids,
+        batch_size=batch_size,
+    )
+    return _median_normalized_entropy_from_distances(
+        squared_distances, temperature
+    )
+
+
+def _prototype_squared_distances(
+    embeddings: np.ndarray,
+    centroids: np.ndarray,
+    batch_size: int,
+) -> np.ndarray:
+    """Compute nonnegative tile-to-centroid squared distances in blocks.
+
+    Args:
+        embeddings (np.ndarray): Frozen tile features shaped ``[N, D]``.
+        centroids (np.ndarray): Prototype centroids shaped ``[K, D]``.
+        batch_size (int): Number of tiles processed per matrix-product block.
+
+    Returns:
+        np.ndarray: Float64 squared distances shaped ``[N, K]``.
     """
     if embeddings.ndim != 2 or centroids.ndim != 2:
         raise ValueError("embeddings and centroids must be two-dimensional.")
     if embeddings.shape[1] != centroids.shape[1] or embeddings.shape[0] == 0:
         raise ValueError("embeddings and centroids must have matching nonempty widths.")
+    if centroids.shape[0] < 2:
+        raise ValueError("At least two centroids are required for entropy targeting.")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
 
     centroid_norms = np.square(centroids, dtype=np.float64).sum(axis=1)
-    nearest_distance_sum = 0.0
+    squared_distances = np.empty(
+        (embeddings.shape[0], centroids.shape[0]), dtype=np.float64
+    )
     for start in range(0, embeddings.shape[0], batch_size):
         block = embeddings[start : start + batch_size].astype(np.float64, copy=False)
-        squared_distances = (
+        block_distances = (
             np.square(block).sum(axis=1, keepdims=True)
             + centroid_norms[None, :]
             - 2.0 * block @ centroids.astype(np.float64, copy=False).T
         )
-        nearest_distance_sum += float(
-            np.maximum(squared_distances.min(axis=1), 0.0).sum()
+        stop = start + block.shape[0]
+        squared_distances[start:stop] = np.maximum(block_distances, 0.0)
+    return squared_distances
+
+
+def _median_normalized_entropy_from_distances(
+    squared_distances: np.ndarray,
+    temperature: float,
+) -> float:
+    """Compute median normalized softmax entropy from squared distances.
+
+    Args:
+        squared_distances (np.ndarray): Distances shaped ``[N, K]``.
+        temperature (float): Positive finite assignment temperature.
+
+    Returns:
+        float: Median entropy divided by ``log(K)``.
+    """
+    if squared_distances.ndim != 2 or squared_distances.shape[1] < 2:
+        raise ValueError("squared_distances must have shape [N, K] with K >= 2.")
+    if (
+        not math.isfinite(temperature)
+        or temperature < MIN_PROTOTYPE_TEMPERATURE
+    ):
+        raise ValueError(
+            f"temperature must be finite and at least {MIN_PROTOTYPE_TEMPERATURE}."
         )
-    estimated = nearest_distance_sum / float(embeddings.shape[0])
-    return max(estimated, MIN_PROTOTYPE_TEMPERATURE)
+    logits = -squared_distances / temperature
+    logits -= logits.max(axis=1, keepdims=True)
+    probabilities = np.exp(logits)
+    probabilities /= probabilities.sum(axis=1, keepdims=True)
+    safe_probabilities = np.maximum(probabilities, np.finfo(np.float64).tiny)
+    entropy = -np.sum(probabilities * np.log(safe_probabilities), axis=1)
+    normalized_entropy = entropy / math.log(squared_distances.shape[1])
+    return float(np.median(normalized_entropy))
 
 
 def initialize_prototype_assignment(
@@ -224,7 +341,7 @@ def initialize_prototypes_from_kmeans(
     max_tiles = int(config.get("prototype_kmeans_max_tiles", 200_000))
     batch_size = int(config.get("prototype_kmeans_batch_size", 4_096))
     random_seed = int(config["random_seed"])
-    embeddings = collect_training_tile_embeddings(
+    embeddings = collect_training_tile_features(
         model=model,
         train_dataset=train_dataset,
         device=device,
@@ -244,10 +361,22 @@ def initialize_prototypes_from_kmeans(
         random_seed=random_seed,
     )
     configured_temperature = config.get("pooling_prototype_temperature")
+    target_entropy = float(config.get("prototype_assignment_entropy_target", 0.3))
     temperature = (
-        estimate_prototype_temperature(embeddings, centroids, batch_size)
+        estimate_prototype_temperature(
+            embeddings,
+            centroids,
+            batch_size,
+            target_entropy,
+        )
         if configured_temperature is None
         else float(configured_temperature)
+    )
+    median_entropy = compute_median_normalized_assignment_entropy(
+        embeddings=embeddings,
+        centroids=centroids,
+        batch_size=batch_size,
+        temperature=temperature,
     )
     initialize_prototype_assignment(
         model=model,
@@ -258,5 +387,6 @@ def initialize_prototypes_from_kmeans(
     print(
         "Initialized prototype histogram from "
         f"{embeddings.shape[0]} training tiles "
-        f"(K={num_prototypes}, temperature={temperature:.6g})."
+        f"(K={num_prototypes}, temperature={temperature:.6g}, "
+        f"median_normalized_entropy={median_entropy:.4f})."
     )

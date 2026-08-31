@@ -35,7 +35,7 @@ except ImportError:
     from prototype_init import initialize_prototypes_from_kmeans
 
 
-MODEL_SCHEMA = "canonical_clam_v6_mean_gate"
+MODEL_SCHEMA = "canonical_clam_v8_raw_feature_prototypes"
 METRIC_KEYS = (
     "loss",
     "classification_loss",
@@ -71,7 +71,7 @@ def create_model(config: Mapping[str, Any]) -> nn.Module:
         k_sample=int(config["k_sample"]),
         subtyping=bool(config["subtyping"]),
         attention_normalization=str(config["attention_normalization"]),
-        pooling_layernorm=bool(config["pooling_layernorm"]),
+        pooling_normalization=str(config["pooling_normalization"]),
         pooling_mode=str(config.get("pooling_mode", "attention")),
         pooling_use_variance=bool(config.get("pooling_use_variance", False)),
         pooling_num_prototypes=int(config.get("pooling_num_prototypes", 0)),
@@ -79,6 +79,7 @@ def create_model(config: Mapping[str, Any]) -> nn.Module:
         pooling_freeze_prototypes=bool(
             config.get("pooling_freeze_prototypes", False)
         ),
+        detection_top_k=int(config.get("detection_top_k", 10)),
     )
 
 
@@ -289,6 +290,53 @@ def create_classification_criterion(
         epsilon=float(config.get("epsilon", 0.0)),
         weight=weight,
     )
+
+
+def build_optimizer(
+    model: nn.Module,
+    config: Mapping[str, Any],
+) -> optim.Adam:
+    """Build Adam with zero decay for prototype-specific parameters.
+
+    Args:
+        model (nn.Module): Configured CLAM model.
+        config (Mapping[str, Any]): Training configuration containing learning
+            rate and classification weight decay.
+
+    Returns:
+        optim.Adam: Adam optimizer with disjoint regular and prototype groups.
+    """
+    prototype_parameters = []
+    prototype_assignment = getattr(model, "prototype_assignment", None)
+    if isinstance(prototype_assignment, nn.Linear):
+        prototype_parameters.extend(prototype_assignment.parameters())
+    prototype_temperature = getattr(model, "log_prototype_temperature", None)
+    if isinstance(prototype_temperature, nn.Parameter):
+        prototype_parameters.append(prototype_temperature)
+
+    prototype_parameter_ids = {id(parameter) for parameter in prototype_parameters}
+    regular_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad and id(parameter) not in prototype_parameter_ids
+    ]
+    trainable_prototype_parameters = [
+        parameter for parameter in prototype_parameters if parameter.requires_grad
+    ]
+    parameter_groups = [
+        {
+            "params": regular_parameters,
+            "weight_decay": float(config["weight_decay_cls"]),
+        }
+    ]
+    if trainable_prototype_parameters:
+        parameter_groups.append(
+            {
+                "params": trainable_prototype_parameters,
+                "weight_decay": 0.0,
+            }
+        )
+    return optim.Adam(parameter_groups, lr=float(config["lr_cls"]))
 
 
 def resolve_best_checkpoint_metric(metric_name: str) -> Tuple[str, bool, str]:
@@ -744,11 +792,7 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
         config,
         class_weights.to(device),
     ).to(device)
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=float(config["lr_cls"]),
-        weight_decay=float(config["weight_decay_cls"]),
-    )
+    optimizer = build_optimizer(model, config)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",

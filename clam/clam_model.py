@@ -80,12 +80,13 @@ class _CLAMBase(nn.Module):
         subtyping: bool,
         attention_branches: int,
         attention_normalization: str,
-        pooling_layernorm: bool,
+        pooling_normalization: str,
         pooling_mode: str,
         pooling_use_variance: bool,
         pooling_num_prototypes: int,
         pooling_prototype_temperature: Optional[float],
         pooling_freeze_prototypes: bool,
+        detection_top_k: int,
     ) -> None:
         """Initialize common CLAM modules.
 
@@ -103,8 +104,7 @@ class _CLAMBase(nn.Module):
             subtyping (bool): Whether to supervise out-of-class branches.
             attention_branches (int): One for SB or ``num_classes`` for MB.
             attention_normalization (str): Required ``sigmoid_mean`` pooling mode.
-            pooling_layernorm (bool): Whether pooled vectors are normalized before
-                classification; required for sigmoid-over-T attention.
+            pooling_normalization (str): Required selective per-block normalization.
             pooling_mode (str): ``attention`` for attention pooling alone or
                 ``distributional`` to append uniform population statistics.
             pooling_use_variance (bool): Whether distributional pooling appends
@@ -115,6 +115,8 @@ class _CLAMBase(nn.Module):
                 soft-assignment temperature, or ``None`` for k-means initialization.
             pooling_freeze_prototypes (bool): Whether prototype assignment weights
                 and biases remain fixed after k-means initialization.
+            detection_top_k (int): Maximum tiles averaged by each class-specific
+                detection readout.
 
         Returns:
             None: The initialized model.
@@ -132,9 +134,9 @@ class _CLAMBase(nn.Module):
             raise ValueError("classifier_dropout must be in [0, 1).")
         if attention_normalization != "sigmoid_mean":
             raise ValueError("attention_normalization must be 'sigmoid_mean'.")
-        if pooling_layernorm is not True:
+        if pooling_normalization != "selective_layernorm":
             raise ValueError(
-                "pooling_layernorm must be true for sigmoid-over-T attention."
+                "pooling_normalization must be 'selective_layernorm'."
             )
         if pooling_mode not in {"attention", "distributional"}:
             raise ValueError("pooling_mode must be 'attention' or 'distributional'.")
@@ -163,6 +165,12 @@ class _CLAMBase(nn.Module):
             )
         if not isinstance(pooling_freeze_prototypes, bool):
             raise TypeError("pooling_freeze_prototypes must be a boolean.")
+        if (
+            isinstance(detection_top_k, bool)
+            or not isinstance(detection_top_k, int)
+            or detection_top_k <= 0
+        ):
+            raise ValueError("detection_top_k must be a positive integer.")
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -175,6 +183,7 @@ class _CLAMBase(nn.Module):
         self.pooling_use_variance = pooling_use_variance
         self.pooling_num_prototypes = pooling_num_prototypes
         self.pooling_freeze_prototypes = pooling_freeze_prototypes
+        self.detection_top_k = detection_top_k
         self.statistics_pooling_epsilon = 1e-5
         statistics_blocks = (
             1 + int(pooling_use_variance) if pooling_mode == "distributional" else 0
@@ -205,7 +214,7 @@ class _CLAMBase(nn.Module):
                 else float(pooling_prototype_temperature)
             )
             self.prototype_assignment: Optional[nn.Linear] = nn.Linear(
-                hidden_dim, pooling_num_prototypes
+                input_dim, pooling_num_prototypes
             )
             self.log_prototype_temperature: Optional[nn.Parameter] = nn.Parameter(
                 torch.tensor(math.log(initial_temperature), dtype=torch.float32)
@@ -219,7 +228,15 @@ class _CLAMBase(nn.Module):
         else:
             self.prototype_assignment = None
             self.register_parameter("log_prototype_temperature", None)
-        self.pooling_layernorm = nn.LayerNorm(self.bag_feature_dim)
+        self.distribution_mean_layernorm = nn.LayerNorm(hidden_dim)
+        self.distribution_std_layernorm = (
+            nn.LayerNorm(hidden_dim)
+            if pooling_mode == "distributional" and pooling_use_variance
+            else None
+        )
+        self.tile_evidence = nn.Linear(hidden_dim, num_classes, bias=False)
+        self.prevalence_scales = nn.Parameter(torch.ones(num_classes))
+        self.detection_scales = nn.Parameter(torch.ones(num_classes))
         self.classifier_dropout = nn.Dropout(classifier_dropout)
         self.instance_classifiers = nn.ModuleList(
             nn.Linear(hidden_dim, 2) for _ in range(num_classes)
@@ -393,6 +410,95 @@ class _CLAMBase(nn.Module):
         instance_predictions = instance_logits.argmax(dim=1)
         return instance_loss, instance_predictions, instance_targets
 
+    def _normalize_pooled_blocks(
+        self,
+        attention_pooled_features: torch.Tensor,
+        distribution_mean: torch.Tensor,
+        distribution_std: torch.Tensor,
+        prototype_histogram: torch.Tensor,
+        mean_gate: torch.Tensor,
+    ) -> torch.Tensor:
+        """Normalize only population-statistic blocks before classification.
+
+        Args:
+            attention_pooled_features (torch.Tensor): Attention-pooled features
+                shaped ``[B, K, H]``.
+            distribution_mean (torch.Tensor): Uniform means shaped ``[B, 1, H]``.
+            distribution_std (torch.Tensor): Population standard deviations shaped
+                ``[B, 1, H]``, or an empty final dimension.
+            prototype_histogram (torch.Tensor): Prototype frequencies shaped
+                ``[B, 1, P]``, or an empty final dimension.
+            mean_gate (torch.Tensor): Mean gate values shaped ``[B, K, 1]``.
+
+        Returns:
+            torch.Tensor: Selectively normalized bag features shaped
+            ``[B, K, bag_feature_dim]``.
+        """
+        if self.pooling_mode == "attention":
+            return attention_pooled_features
+
+        branch_count = attention_pooled_features.shape[1]
+        normalized_parts = [
+            attention_pooled_features,
+            self.distribution_mean_layernorm(distribution_mean).expand(
+                -1, branch_count, -1
+            ),
+        ]
+        if self.pooling_use_variance:
+            if self.distribution_std_layernorm is None:
+                raise RuntimeError("Distribution standard-deviation LayerNorm is missing.")
+            normalized_parts.append(
+                self.distribution_std_layernorm(distribution_std).expand(
+                    -1, branch_count, -1
+                )
+            )
+        if self.pooling_num_prototypes > 0:
+            normalized_parts.append(
+                prototype_histogram.expand(-1, branch_count, -1)
+            )
+        normalized_parts.append(mean_gate)
+        return torch.cat(normalized_parts, dim=-1)
+
+    def _pool_detection_evidence(
+        self,
+        embedded: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pool per-class tile evidence into prevalence and top-k detection terms.
+
+        Args:
+            embedded (torch.Tensor): Embedded tile features shaped ``[B, N, H]``.
+            mask (torch.Tensor): Boolean valid-tile mask shaped ``[B, N]``.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            Masked tile scores ``[B, C, N]``, top-k selection mask ``[B, C, N]``,
+            prevalence values ``[B, C]``, and detection values ``[B, C]``.
+        """
+        tile_scores = self.tile_evidence(embedded).transpose(1, 2)
+        masked_tile_scores = tile_scores.masked_fill(~mask.unsqueeze(1), 0.0)
+        valid_counts = mask.sum(dim=1, keepdim=True)
+        prevalence = masked_tile_scores.sum(dim=-1) / valid_counts.to(
+            dtype=embedded.dtype
+        )
+        top_k_mask = torch.zeros_like(tile_scores, dtype=torch.bool)
+        detection_parts = []
+        for bag_index in range(embedded.shape[0]):
+            valid_indices = mask[bag_index].nonzero(as_tuple=False).flatten()
+            selected_count = min(self.detection_top_k, int(valid_indices.numel()))
+            valid_scores = tile_scores[bag_index, :, valid_indices]
+            selected_local = valid_scores.topk(selected_count, dim=-1).indices
+            selected_indices = valid_indices[selected_local]
+            top_k_mask[bag_index].scatter_(
+                dim=1,
+                index=selected_indices,
+                value=True,
+            )
+            selected_scores = tile_scores[bag_index].gather(1, selected_indices)
+            detection_parts.append(selected_scores.mean(dim=-1))
+        detection = torch.stack(detection_parts, dim=0)
+        return masked_tile_scores, top_k_mask, prevalence, detection
+
     def forward(
         self,
         features: torch.Tensor,
@@ -454,7 +560,7 @@ class _CLAMBase(nn.Module):
                 if self.log_prototype_temperature is None:
                     raise RuntimeError("Prototype temperature parameter is missing.")
                 prototype_temperature = self.log_prototype_temperature.exp()
-                prototype_logits = self.prototype_assignment(embedded)
+                prototype_logits = self.prototype_assignment(features)
                 prototype_assignments = F.softmax(
                     prototype_logits / prototype_temperature, dim=-1
                 ).masked_fill(~mask.unsqueeze(-1), 0.0)
@@ -486,9 +592,24 @@ class _CLAMBase(nn.Module):
             )
             prototype_histogram = embedded.new_empty((embedded.shape[0], 1, 0))
             raw_pooled_features = attention_pooled_features
-        pooled_features = self.pooling_layernorm(raw_pooled_features)
+        pooled_features = self._normalize_pooled_blocks(
+            attention_pooled_features=attention_pooled_features,
+            distribution_mean=distribution_mean,
+            distribution_std=distribution_std,
+            prototype_histogram=prototype_histogram,
+            mean_gate=mean_gate,
+        )
         classification_features = self.classifier_dropout(pooled_features)
-        logits = self._classify_bags(classification_features)
+        base_logits = self._classify_bags(classification_features)
+        (
+            tile_evidence_scores,
+            detection_top_k_mask,
+            prevalence_values,
+            detection_values,
+        ) = self._pool_detection_evidence(embedded, mask)
+        prevalence_contributions = prevalence_values * self.prevalence_scales
+        detection_contributions = detection_values * self.detection_scales
+        logits = base_logits + prevalence_contributions + detection_contributions
         probabilities = F.softmax(logits, dim=1)
         predictions = probabilities.argmax(dim=1)
 
@@ -517,6 +638,13 @@ class _CLAMBase(nn.Module):
             "prototype_histogram": prototype_histogram,
             "raw_pooled_features": raw_pooled_features,
             "pooled_features": pooled_features,
+            "base_logits": base_logits,
+            "tile_evidence_scores": tile_evidence_scores,
+            "detection_top_k_mask": detection_top_k_mask,
+            "prevalence_values": prevalence_values,
+            "detection_values": detection_values,
+            "prevalence_contributions": prevalence_contributions,
+            "detection_contributions": detection_contributions,
             "instance_loss": instance_loss,
             "instance_predictions": instance_predictions,
             "instance_targets": instance_targets,
@@ -538,12 +666,13 @@ class CLAM_SB(_CLAMBase):
         k_sample: int = 8,
         subtyping: bool = False,
         attention_normalization: str = "sigmoid_mean",
-        pooling_layernorm: bool = True,
+        pooling_normalization: str = "selective_layernorm",
         pooling_mode: str = "attention",
         pooling_use_variance: bool = False,
         pooling_num_prototypes: int = 0,
         pooling_prototype_temperature: Optional[float] = None,
         pooling_freeze_prototypes: bool = False,
+        detection_top_k: int = 10,
     ) -> None:
         """Initialize CLAM-SB.
 
@@ -560,8 +689,7 @@ class CLAM_SB(_CLAMBase):
             k_sample (int): Maximum positive and negative instances per class.
             subtyping (bool): Whether to supervise out-of-class classifiers.
             attention_normalization (str): Required ``sigmoid_mean`` pooling mode.
-            pooling_layernorm (bool): Whether to normalize pooled vectors before
-                classification; must be ``True``.
+            pooling_normalization (str): Required selective per-block normalization.
             pooling_mode (str): ``attention`` or ``distributional`` pooling.
             pooling_use_variance (bool): Whether distributional pooling appends
                 per-channel standard deviation.
@@ -571,6 +699,7 @@ class CLAM_SB(_CLAMBase):
                 assignment temperature, or ``None`` for k-means initialization.
             pooling_freeze_prototypes (bool): Whether to freeze assignment weights
                 after initialization.
+            detection_top_k (int): Maximum tiles in each class detection readout.
 
         Returns:
             None: The initialized CLAM-SB model.
@@ -587,12 +716,13 @@ class CLAM_SB(_CLAMBase):
             subtyping=subtyping,
             attention_branches=1,
             attention_normalization=attention_normalization,
-            pooling_layernorm=pooling_layernorm,
+            pooling_normalization=pooling_normalization,
             pooling_mode=pooling_mode,
             pooling_use_variance=pooling_use_variance,
             pooling_num_prototypes=pooling_num_prototypes,
             pooling_prototype_temperature=pooling_prototype_temperature,
             pooling_freeze_prototypes=pooling_freeze_prototypes,
+            detection_top_k=detection_top_k,
         )
         self.classifiers = nn.ModuleList(
             nn.Linear(self.bag_feature_dim, 1) for _ in range(num_classes)
@@ -630,12 +760,13 @@ class CLAM_MB(_CLAMBase):
         k_sample: int = 8,
         subtyping: bool = False,
         attention_normalization: str = "sigmoid_mean",
-        pooling_layernorm: bool = True,
+        pooling_normalization: str = "selective_layernorm",
         pooling_mode: str = "attention",
         pooling_use_variance: bool = False,
         pooling_num_prototypes: int = 0,
         pooling_prototype_temperature: Optional[float] = None,
         pooling_freeze_prototypes: bool = False,
+        detection_top_k: int = 10,
     ) -> None:
         """Initialize CLAM-MB.
 
@@ -652,8 +783,7 @@ class CLAM_MB(_CLAMBase):
             k_sample (int): Maximum positive and negative instances per class.
             subtyping (bool): Whether to supervise out-of-class branches.
             attention_normalization (str): Required ``sigmoid_mean`` pooling mode.
-            pooling_layernorm (bool): Whether to normalize pooled vectors before
-                classification; must be ``True``.
+            pooling_normalization (str): Required selective per-block normalization.
             pooling_mode (str): ``attention`` or ``distributional`` pooling.
             pooling_use_variance (bool): Whether distributional pooling appends
                 per-channel standard deviation.
@@ -663,6 +793,7 @@ class CLAM_MB(_CLAMBase):
                 assignment temperature, or ``None`` for k-means initialization.
             pooling_freeze_prototypes (bool): Whether to freeze assignment weights
                 after initialization.
+            detection_top_k (int): Maximum tiles in each class detection readout.
 
         Returns:
             None: The initialized CLAM-MB model.
@@ -679,12 +810,13 @@ class CLAM_MB(_CLAMBase):
             subtyping=subtyping,
             attention_branches=num_classes,
             attention_normalization=attention_normalization,
-            pooling_layernorm=pooling_layernorm,
+            pooling_normalization=pooling_normalization,
             pooling_mode=pooling_mode,
             pooling_use_variance=pooling_use_variance,
             pooling_num_prototypes=pooling_num_prototypes,
             pooling_prototype_temperature=pooling_prototype_temperature,
             pooling_freeze_prototypes=pooling_freeze_prototypes,
+            detection_top_k=detection_top_k,
         )
         self.classifiers = nn.ModuleList(
             nn.Linear(self.bag_feature_dim, 1) for _ in range(num_classes)

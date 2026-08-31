@@ -23,16 +23,18 @@ feature_model_input_dims:  # Mapping from feature model names to input dimension
 model_type: "clam_mb"  # Options: clam_mb, clam_sb
 gated_attention: true  # Use the canonical gated attention network
 attention_normalization: "sigmoid_mean"  # Must be sigmoid_mean; applies independent sigmoid gates and divides their weighted sum by the valid tile count
-pooling_layernorm: true  # Must be true; normalize sigmoid-over-T pooled vectors before classification
+pooling_normalization: "selective_layernorm"  # Must be selective_layernorm; normalize mean/std blocks independently while preserving attention, histogram, and gate scales
 pooling_mode: "distributional"  # Options: attention, distributional; distributional appends uniformly pooled mean and optional standard deviation
 pooling_use_variance: true  # Append per-channel population standard deviation in distributional mode
 pooling_num_prototypes: 16  # Morphological histogram width K; 0 disables prototypes, positive values require distributional pooling
-pooling_prototype_temperature: null  # Positive initial soft-assignment temperature; null uses the mean nearest-centroid squared distance from k-means
+pooling_prototype_temperature: null  # Positive initial soft-assignment temperature; null solves for prototype_assignment_entropy_target after k-means
+prototype_assignment_entropy_target: 0.3  # Target median H(q)/log(K) in (0, 1) when pooling_prototype_temperature is null
 pooling_freeze_prototypes: false  # Freeze prototype assignment weights after k-means while leaving assignment temperature learnable
 prototype_kmeans_max_tiles: 200000  # Maximum training-split tiles used to initialize prototypes; must be at least pooling_num_prototypes
 prototype_kmeans_batch_size: 4096  # Positive tile embedding and MiniBatchKMeans batch size used during prototype initialization
 hidden_dim: 512  # Shared tile embedding dimension
 attention_dim: 256  # Hidden dimension of the gated attention network
+detection_top_k: 10  # Positive maximum number of highest-scoring tiles averaged by each class-specific detection readout
 attention_dropout: 0.2  # Dropout in gated attention score projections; pooled tile values and distribution statistics remain deterministic
 classifier_dropout: 0.2  # Dropout after pooled LayerNorm and immediately before bag classification
 num_classes: 5  # Number of slide-level target classes
@@ -61,7 +63,7 @@ use_weighted_sampler: true  # If true, train DataLoader uses WeightedRandomSampl
 use_class_weighted_loss: false  # Apply inverse-frequency class weights to the bag-level loss
 q: 0.0  # Generalized cross-entropy exponent; 0 recovers standard cross entropy
 epsilon: 0.0  # Label-smoothing strength in [0, 1); 0 disables smoothing
-best_checkpoint_metric: "slide_balanced_accuracy"  # Options: slide_balanced_accuracy, balanced_accuracy, accuracy, loss, classification_loss, instance_loss
+best_checkpoint_metric: "balanced_accuracy"  # Options: slide_balanced_accuracy, balanced_accuracy, accuracy, loss, classification_loss, instance_loss
 weight_decay_cls: 0.001  # Weight decay for feature projection, attention branches, and classifier
 train_ratio: 0.8  # Fraction of slides used for training split
 val_ratio: 0.1  # Fraction of slides used for validation split

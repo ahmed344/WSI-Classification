@@ -38,7 +38,7 @@ except ImportError:
 
 
 CLAMModel = Union[CLAM_SB, CLAM_MB]
-CHECKPOINT_SCHEMA = "canonical_clam_v6_mean_gate"
+CHECKPOINT_SCHEMA = "canonical_clam_v8_raw_feature_prototypes"
 EVIDENCE_RECONSTRUCTION_TOLERANCE = 1e-4
 EVIDENCE_QUANTILE = 0.99
 TOP_EVIDENCE_TILE_COUNT = 25
@@ -91,7 +91,7 @@ def create_model(config: Mapping[str, Any]) -> CLAMModel:
         k_sample=int(config["k_sample"]),
         subtyping=bool(config["subtyping"]),
         attention_normalization=str(config["attention_normalization"]),
-        pooling_layernorm=bool(config["pooling_layernorm"]),
+        pooling_normalization=str(config["pooling_normalization"]),
         pooling_mode=str(config.get("pooling_mode", "attention")),
         pooling_use_variance=bool(config.get("pooling_use_variance", False)),
         pooling_num_prototypes=int(config.get("pooling_num_prototypes", 0)),
@@ -99,6 +99,7 @@ def create_model(config: Mapping[str, Any]) -> CLAMModel:
         pooling_freeze_prototypes=bool(
             config.get("pooling_freeze_prototypes", False)
         ),
+        detection_top_k=int(config.get("detection_top_k", 10)),
     )
 
 
@@ -331,7 +332,6 @@ def compute_tile_evidence(
         if attention_weights.shape[1] == 1
         else attention_weights
     )
-    raw_pooled_parts = [torch.bmm(class_attention, embedded)]
     uniform_weights: Optional[torch.Tensor] = None
     valid_embedded: Optional[torch.Tensor] = None
     centered_squared: Optional[torch.Tensor] = None
@@ -343,7 +343,6 @@ def compute_tile_evidence(
         uniform_weights = valid_mask / valid_counts
         valid_embedded = embedded.masked_fill(~masks.unsqueeze(-1), 0.0)
         distribution_mean = (valid_embedded * uniform_weights).sum(dim=1, keepdim=True)
-        raw_pooled_parts.append(distribution_mean.expand(-1, class_count, -1))
         if model.pooling_use_variance:
             centered_squared = (
                 (embedded - distribution_mean)
@@ -356,81 +355,93 @@ def compute_tile_evidence(
             distribution_std = torch.sqrt(
                 distribution_variance + model.statistics_pooling_epsilon
             )
-            raw_pooled_parts.append(distribution_std.expand(-1, class_count, -1))
         if model.prototype_assignment is not None:
             if model.log_prototype_temperature is None:
                 raise RuntimeError("Prototype temperature parameter is missing.")
             prototype_assignments = torch.softmax(
-                model.prototype_assignment(embedded)
+                model.prototype_assignment(features)
                 / model.log_prototype_temperature.exp(),
                 dim=-1,
             ).masked_fill(~masks.unsqueeze(-1), 0.0)
-            prototype_histogram = (
-                prototype_assignments * uniform_weights
-            ).sum(dim=1, keepdim=True)
-            raw_pooled_parts.append(
-                prototype_histogram.expand(-1, class_count, -1)
-            )
-        raw_pooled_parts.append(class_attention.sum(dim=-1, keepdim=True))
-    raw_pooled_features = torch.cat(raw_pooled_parts, dim=-1)
-    layernorm = model.pooling_layernorm
-    if layernorm.weight is None or layernorm.bias is None:
-        raise ValueError("Pooling LayerNorm must use learnable affine parameters.")
-    scaled_classifier_weights = classifier_weights * layernorm.weight.unsqueeze(0)
-    centered_classifier_weights = (
-        scaled_classifier_weights - scaled_classifier_weights.mean(dim=-1, keepdim=True)
-    )
-    pooled_scale = torch.sqrt(
-        raw_pooled_features.var(dim=-1, unbiased=False, keepdim=True) + layernorm.eps
-    )
-    effective_classifier_weights = (
-        centered_classifier_weights.unsqueeze(0) / pooled_scale
-    )
     hidden_dim = model.hidden_dim
     attention_tile_scores = torch.einsum(
-        "bnh,bch->bcn",
+        "bnh,ch->bcn",
         embedded,
-        effective_classifier_weights[:, :, :hidden_dim],
+        classifier_weights[:, :hidden_dim],
     )
     evidence = class_attention * attention_tile_scores
+    class_baselines = classifier_biases.clone()
     if model.pooling_mode == "distributional":
         if uniform_weights is None or valid_embedded is None:
             raise RuntimeError("Distributional evidence tensors were not initialized.")
         population_weights = uniform_weights.squeeze(-1).unsqueeze(1)
         feature_offset = hidden_dim
+        mean_layernorm = model.distribution_mean_layernorm
+        if mean_layernorm.weight is None or mean_layernorm.bias is None:
+            raise ValueError("Mean LayerNorm must use learnable affine parameters.")
+        mean_weights = classifier_weights[
+            :, feature_offset : feature_offset + hidden_dim
+        ]
+        scaled_mean_weights = mean_weights * mean_layernorm.weight.unsqueeze(0)
+        centered_mean_weights = scaled_mean_weights - scaled_mean_weights.mean(
+            dim=-1, keepdim=True
+        )
+        mean_scale = torch.sqrt(
+            distribution_mean.var(dim=-1, unbiased=False, keepdim=True)
+            + mean_layernorm.eps
+        )
+        effective_mean_weights = centered_mean_weights.unsqueeze(0) / mean_scale
         mean_tile_scores = torch.einsum(
             "bnh,bch->bcn",
             valid_embedded,
-            effective_classifier_weights[
-                :, :, feature_offset : feature_offset + hidden_dim
-            ],
+            effective_mean_weights,
         )
         evidence = evidence + population_weights * mean_tile_scores
+        class_baselines = class_baselines + torch.einsum(
+            "ch,h->c", mean_weights, mean_layernorm.bias
+        )
         feature_offset += hidden_dim
         if model.pooling_use_variance:
             if centered_squared is None or distribution_std is None:
                 raise RuntimeError("Variance evidence tensors were not initialized.")
-            std_classifier_weights = (
-                effective_classifier_weights[
-                    :, :, feature_offset : feature_offset + hidden_dim
-                ]
-                / distribution_std
+            std_layernorm = model.distribution_std_layernorm
+            if (
+                std_layernorm is None
+                or std_layernorm.weight is None
+                or std_layernorm.bias is None
+            ):
+                raise ValueError("Standard-deviation LayerNorm must use affine parameters.")
+            std_weights = classifier_weights[
+                :, feature_offset : feature_offset + hidden_dim
+            ]
+            scaled_std_weights = std_weights * std_layernorm.weight.unsqueeze(0)
+            centered_std_weights = scaled_std_weights - scaled_std_weights.mean(
+                dim=-1, keepdim=True
+            )
+            std_scale = torch.sqrt(
+                distribution_std.var(dim=-1, unbiased=False, keepdim=True)
+                + std_layernorm.eps
+            )
+            effective_std_weights = (
+                centered_std_weights.unsqueeze(0) / std_scale / distribution_std
             )
             std_tile_scores = torch.einsum(
                 "bnh,bch->bcn",
                 centered_squared + model.statistics_pooling_epsilon,
-                std_classifier_weights,
+                effective_std_weights,
             )
             evidence = evidence + population_weights * std_tile_scores
+            class_baselines = class_baselines + torch.einsum(
+                "ch,h->c", std_weights, std_layernorm.bias
+            )
             feature_offset += hidden_dim
         if model.pooling_num_prototypes > 0:
             if prototype_assignments is None:
                 raise RuntimeError("Prototype evidence tensors were not initialized.")
             histogram_tile_scores = torch.einsum(
-                "bnk,bck->bcn",
+                "bnk,ck->bcn",
                 prototype_assignments,
-                effective_classifier_weights[
-                    :,
+                classifier_weights[
                     :,
                     feature_offset : feature_offset
                     + model.pooling_num_prototypes,
@@ -438,10 +449,29 @@ def compute_tile_evidence(
             )
             evidence = evidence + population_weights * histogram_tile_scores
             feature_offset += model.pooling_num_prototypes
-        gate_classifier_weights = effective_classifier_weights[:, :, feature_offset]
+        gate_classifier_weights = classifier_weights[:, feature_offset]
         evidence = evidence + class_attention * gate_classifier_weights.unsqueeze(-1)
-    class_baselines = classifier_biases + torch.einsum(
-        "ch,h->c", classifier_weights, layernorm.bias
+
+    tile_evidence_scores, detection_top_k_mask, _, _ = (
+        model._pool_detection_evidence(embedded, masks)
+    )
+    prevalence_weights = (
+        masks.to(dtype=embedded.dtype)
+        / masks.sum(dim=1, keepdim=True).to(dtype=embedded.dtype)
+    ).unsqueeze(1)
+    evidence = evidence + (
+        prevalence_weights
+        * tile_evidence_scores
+        * model.prevalence_scales.view(1, -1, 1)
+    )
+    selected_counts = detection_top_k_mask.sum(dim=-1, keepdim=True).to(
+        dtype=embedded.dtype
+    )
+    evidence = evidence + (
+        detection_top_k_mask.to(dtype=embedded.dtype)
+        * tile_evidence_scores
+        * model.detection_scales.view(1, -1, 1)
+        / selected_counts
     )
     evidence = evidence.masked_fill(~masks.unsqueeze(1), 0.0)
     reconstructed_logits = evidence.sum(dim=-1) + class_baselines.unsqueeze(0)
