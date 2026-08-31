@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Dict
 
+import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -10,6 +11,12 @@ from torch.utils.data import DataLoader
 
 from clam.clam_dataset import collate_fn, create_bag_dataset
 from clam.clam_model import CLAM_MB, CLAM_SB
+from clam.prototype_init import (
+    collect_training_tile_embeddings,
+    estimate_prototype_temperature,
+    fit_prototype_centroids,
+    initialize_prototype_assignment,
+)
 
 
 def _write_fixture_dataset(root: Path) -> None:
@@ -89,6 +96,7 @@ def test_canonical_clam_forward_and_backward(
         subtyping=True,
         pooling_mode="distributional",
         pooling_use_variance=True,
+        pooling_num_prototypes=4,
     )
     features = torch.randn(2, 7, 4)
     masks = torch.tensor([[True, True, True, True, True, False, False], [True] * 7])
@@ -109,9 +117,20 @@ def test_canonical_clam_forward_and_backward(
     )
     assert torch.all(outputs["attention_weights"].sum(dim=-1) < 1.0)
     expected_branches = 1 if model_class is CLAM_SB else 3
-    assert outputs["raw_pooled_features"].shape == (2, expected_branches, 24)
+    assert outputs["raw_pooled_features"].shape == (2, expected_branches, 29)
+    assert outputs["mean_gate"].shape == (2, expected_branches, 1)
+    assert torch.allclose(
+        outputs["mean_gate"],
+        outputs["attention_weights"].sum(dim=-1, keepdim=True),
+    )
     assert outputs["distribution_mean"].shape == (2, 1, 8)
     assert outputs["distribution_std"].shape == (2, 1, 8)
+    assert outputs["prototype_assignments"].shape == (2, 7, 4)
+    assert outputs["prototype_histogram"].shape == (2, 1, 4)
+    assert torch.allclose(
+        outputs["prototype_histogram"].sum(dim=-1),
+        torch.ones(2, 1),
+    )
     assert torch.allclose(
         outputs["pooled_features"],
         model.pooling_layernorm(outputs["raw_pooled_features"]),
@@ -122,6 +141,10 @@ def test_canonical_clam_forward_and_backward(
     loss = 0.7 * loss + 0.3 * outputs["instance_loss"]
     loss.backward()
     assert any(parameter.grad is not None for parameter in model.parameters())
+    assert model.prototype_assignment is not None
+    assert model.prototype_assignment.weight.grad is not None
+    assert model.log_prototype_temperature is not None
+    assert model.log_prototype_temperature.grad is not None
 
 
 @pytest.mark.parametrize("model_class", [CLAM_SB, CLAM_MB])
@@ -145,6 +168,7 @@ def test_sigmoid_attention_is_invariant_to_right_padding(
         classifier_dropout=0.0,
         pooling_mode="distributional",
         pooling_use_variance=True,
+        pooling_num_prototypes=4,
     )
     model.eval()
     features = torch.randn(1, 5, 4)
@@ -168,6 +192,15 @@ def test_sigmoid_attention_is_invariant_to_right_padding(
     )
     assert torch.allclose(unpadded["distribution_mean"], padded["distribution_mean"])
     assert torch.allclose(unpadded["distribution_std"], padded["distribution_std"])
+    assert torch.allclose(
+        unpadded["prototype_assignments"],
+        padded["prototype_assignments"][:, :5],
+    )
+    assert torch.allclose(
+        unpadded["prototype_histogram"], padded["prototype_histogram"]
+    )
+    assert torch.allclose(unpadded["mean_gate"], padded["mean_gate"])
+    assert torch.count_nonzero(padded["prototype_assignments"][:, 5:]) == 0
     assert torch.allclose(unpadded["logits"], padded["logits"])
 
 
@@ -252,6 +285,140 @@ def test_distributional_standard_deviation_has_finite_constant_bag_gradients() -
     )
     assert features.grad is not None
     assert torch.isfinite(features.grad).all()
+
+
+def test_prototype_histogram_matches_masked_soft_assignments() -> None:
+    """Verify histogram pooling averages valid-tile assignments uniformly.
+
+    Args:
+        None: This test constructs a deterministic synthetic model and bag.
+
+    Returns:
+        None: Analytic assignments and histogram values are asserted.
+    """
+    model = CLAM_SB(
+        input_dim=3,
+        hidden_dim=4,
+        attention_dim=2,
+        num_classes=2,
+        attention_dropout=0.0,
+        classifier_dropout=0.0,
+        pooling_mode="distributional",
+        pooling_use_variance=False,
+        pooling_num_prototypes=3,
+        pooling_prototype_temperature=0.75,
+    )
+    assert model.prototype_assignment is not None
+    assert model.log_prototype_temperature is not None
+    with torch.no_grad():
+        model.prototype_assignment.weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                ]
+            )
+        )
+        model.prototype_assignment.bias.copy_(torch.tensor([0.1, -0.2, 0.3]))
+    features = torch.tensor(
+        [[[1.0, 2.0, 3.0], [2.0, 1.0, 0.0], [9.0, 9.0, 9.0]]]
+    )
+    masks = torch.tensor([[True, True, False]])
+
+    with torch.no_grad():
+        outputs = model(features, mask=masks, instance_eval=False)
+        embedded = model.embedding(features)
+        expected_assignments = torch.softmax(
+            model.prototype_assignment(embedded) / 0.75, dim=-1
+        )
+        expected_assignments[:, 2:] = 0.0
+        expected_histogram = expected_assignments[:, :2].mean(
+            dim=1, keepdim=True
+        )
+
+    assert torch.allclose(
+        outputs["prototype_assignments"], expected_assignments, atol=1e-6
+    )
+    assert torch.allclose(
+        outputs["prototype_histogram"], expected_histogram, atol=1e-6
+    )
+    assert model.bag_feature_dim == 2 * model.hidden_dim + 3 + 1
+
+
+def test_kmeans_prototype_initialization_is_deterministic_and_freezable(
+    tmp_path: Path,
+) -> None:
+    """Verify training-only k-means initialization is repeatable and freezable.
+
+    Args:
+        tmp_path (Path): Temporary synthetic feature-data root.
+
+    Returns:
+        None: Samples, centroids, temperature, and frozen state are asserted.
+    """
+    _write_fixture_dataset(tmp_path)
+    train_dataset = create_bag_dataset(
+        _dataset_config(tmp_path, "tissue"), "train"
+    )
+    val_dataset = create_bag_dataset(_dataset_config(tmp_path, "tissue"), "val")
+    torch.manual_seed(23)
+    first_model = CLAM_SB(
+        input_dim=4,
+        hidden_dim=6,
+        attention_dim=3,
+        num_classes=2,
+        pooling_mode="distributional",
+        pooling_num_prototypes=3,
+    )
+    torch.manual_seed(23)
+    second_model = CLAM_SB(
+        input_dim=4,
+        hidden_dim=6,
+        attention_dim=3,
+        num_classes=2,
+        pooling_mode="distributional",
+        pooling_num_prototypes=3,
+    )
+    first_embeddings = collect_training_tile_embeddings(
+        first_model, train_dataset, torch.device("cpu"), 20, 4, 31
+    )
+    second_embeddings = collect_training_tile_embeddings(
+        second_model, train_dataset, torch.device("cpu"), 20, 4, 31
+    )
+    first_centroids = fit_prototype_centroids(first_embeddings, 3, 4, 31)
+    second_centroids = fit_prototype_centroids(second_embeddings, 3, 4, 31)
+    temperature = estimate_prototype_temperature(
+        first_embeddings, first_centroids, 4
+    )
+    initialize_prototype_assignment(
+        first_model, first_centroids, temperature, freeze_prototypes=True
+    )
+
+    assert np.array_equal(first_embeddings, second_embeddings)
+    assert np.allclose(first_centroids, second_centroids)
+    assert temperature > 0.0
+    assert first_model.prototype_assignment is not None
+    assert torch.allclose(
+        first_model.prototype_assignment.weight,
+        2.0 * torch.from_numpy(first_centroids),
+    )
+    assert torch.allclose(
+        first_model.prototype_assignment.bias,
+        -torch.from_numpy(first_centroids).square().sum(dim=1),
+    )
+    assert first_model.prototype_assignment.weight.requires_grad is False
+    assert first_model.prototype_assignment.bias.requires_grad is False
+    assert first_model.log_prototype_temperature is not None
+    assert torch.allclose(
+        first_model.log_prototype_temperature.exp(),
+        torch.tensor(temperature),
+    )
+    assert first_model.log_prototype_temperature.requires_grad is True
+    with pytest.raises(ValueError, match="training-split"):
+        collect_training_tile_embeddings(
+            second_model, val_dataset, torch.device("cpu"), 20, 4, 31
+        )
 
 
 def test_attention_pooling_mode_preserves_original_bag_width() -> None:

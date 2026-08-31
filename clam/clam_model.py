@@ -1,5 +1,6 @@
 """Canonical batched CLAM single-branch and multi-branch models."""
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -83,6 +84,8 @@ class _CLAMBase(nn.Module):
         pooling_mode: str,
         pooling_use_variance: bool,
         pooling_num_prototypes: int,
+        pooling_prototype_temperature: Optional[float],
+        pooling_freeze_prototypes: bool,
     ) -> None:
         """Initialize common CLAM modules.
 
@@ -106,8 +109,12 @@ class _CLAMBase(nn.Module):
                 ``distributional`` to append uniform population statistics.
             pooling_use_variance (bool): Whether distributional pooling appends
                 the per-channel standard deviation after the mean.
-            pooling_num_prototypes (int): Prototype histogram width. Only zero is
-                currently supported because prototype pooling is deferred.
+            pooling_num_prototypes (int): Prototype histogram width, or zero to
+                disable prototype pooling.
+            pooling_prototype_temperature (Optional[float]): Positive initial
+                soft-assignment temperature, or ``None`` for k-means initialization.
+            pooling_freeze_prototypes (bool): Whether prototype assignment weights
+                and biases remain fixed after k-means initialization.
 
         Returns:
             None: The initialized model.
@@ -139,11 +146,23 @@ class _CLAMBase(nn.Module):
             or pooling_num_prototypes < 0
         ):
             raise ValueError("pooling_num_prototypes must be a nonnegative integer.")
-        if pooling_num_prototypes != 0:
+        if pooling_num_prototypes > 0 and pooling_mode != "distributional":
             raise ValueError(
-                "Prototype histogram pooling is deferred; "
-                "pooling_num_prototypes must be 0."
+                "Prototype histogram pooling requires pooling_mode='distributional'."
             )
+        if (
+            pooling_prototype_temperature is not None
+            and (
+                isinstance(pooling_prototype_temperature, bool)
+                or not math.isfinite(float(pooling_prototype_temperature))
+                or float(pooling_prototype_temperature) <= 0.0
+            )
+        ):
+            raise ValueError(
+                "pooling_prototype_temperature must be positive and finite or None."
+            )
+        if not isinstance(pooling_freeze_prototypes, bool):
+            raise TypeError("pooling_freeze_prototypes must be a boolean.")
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -155,11 +174,18 @@ class _CLAMBase(nn.Module):
         self.pooling_mode = pooling_mode
         self.pooling_use_variance = pooling_use_variance
         self.pooling_num_prototypes = pooling_num_prototypes
+        self.pooling_freeze_prototypes = pooling_freeze_prototypes
         self.statistics_pooling_epsilon = 1e-5
         statistics_blocks = (
             1 + int(pooling_use_variance) if pooling_mode == "distributional" else 0
         )
-        self.bag_feature_dim = hidden_dim * (1 + statistics_blocks)
+        histogram_dim = (
+            pooling_num_prototypes if pooling_mode == "distributional" else 0
+        )
+        mean_gate_dim = int(pooling_mode == "distributional")
+        self.bag_feature_dim = (
+            hidden_dim * (1 + statistics_blocks) + histogram_dim + mean_gate_dim
+        )
 
         self.embedding = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -172,6 +198,27 @@ class _CLAMBase(nn.Module):
             gated=gated,
             attention_dropout=attention_dropout,
         )
+        if pooling_num_prototypes > 0:
+            initial_temperature = (
+                1.0
+                if pooling_prototype_temperature is None
+                else float(pooling_prototype_temperature)
+            )
+            self.prototype_assignment: Optional[nn.Linear] = nn.Linear(
+                hidden_dim, pooling_num_prototypes
+            )
+            self.log_prototype_temperature: Optional[nn.Parameter] = nn.Parameter(
+                torch.tensor(math.log(initial_temperature), dtype=torch.float32)
+            )
+            self.prototype_assignment.weight.requires_grad_(
+                not pooling_freeze_prototypes
+            )
+            self.prototype_assignment.bias.requires_grad_(
+                not pooling_freeze_prototypes
+            )
+        else:
+            self.prototype_assignment = None
+            self.register_parameter("log_prototype_temperature", None)
         self.pooling_layernorm = nn.LayerNorm(self.bag_feature_dim)
         self.classifier_dropout = nn.Dropout(classifier_dropout)
         self.instance_classifiers = nn.ModuleList(
@@ -378,6 +425,7 @@ class _CLAMBase(nn.Module):
         )
         attention_weights = attention_weights.masked_fill(~mask.unsqueeze(1), 0.0)
         attention_pooled_features = torch.bmm(attention_weights, embedded)
+        mean_gate = attention_weights.sum(dim=-1, keepdim=True)
 
         if self.pooling_mode == "distributional":
             valid_mask = mask.unsqueeze(-1).to(dtype=embedded.dtype)
@@ -402,12 +450,41 @@ class _CLAMBase(nn.Module):
                 distribution_parts.append(
                     distribution_std.expand(-1, self.num_attention_branches, -1)
                 )
+            if self.prototype_assignment is not None:
+                if self.log_prototype_temperature is None:
+                    raise RuntimeError("Prototype temperature parameter is missing.")
+                prototype_temperature = self.log_prototype_temperature.exp()
+                prototype_logits = self.prototype_assignment(embedded)
+                prototype_assignments = F.softmax(
+                    prototype_logits / prototype_temperature, dim=-1
+                ).masked_fill(~mask.unsqueeze(-1), 0.0)
+                prototype_histogram = (
+                    prototype_assignments.sum(dim=1, keepdim=True)
+                    / population_counts
+                )
+                distribution_parts.append(
+                    prototype_histogram.expand(
+                        -1, self.num_attention_branches, -1
+                    )
+                )
+            else:
+                prototype_assignments = embedded.new_empty(
+                    (embedded.shape[0], embedded.shape[1], 0)
+                )
+                prototype_histogram = embedded.new_empty(
+                    (embedded.shape[0], 1, 0)
+                )
+            distribution_parts.append(mean_gate)
             raw_pooled_features = torch.cat(
                 [attention_pooled_features, *distribution_parts], dim=-1
             )
         else:
             distribution_mean = embedded.new_empty((embedded.shape[0], 1, 0))
             distribution_std = embedded.new_empty((embedded.shape[0], 1, 0))
+            prototype_assignments = embedded.new_empty(
+                (embedded.shape[0], embedded.shape[1], 0)
+            )
+            prototype_histogram = embedded.new_empty((embedded.shape[0], 1, 0))
             raw_pooled_features = attention_pooled_features
         pooled_features = self.pooling_layernorm(raw_pooled_features)
         classification_features = self.classifier_dropout(pooled_features)
@@ -433,8 +510,11 @@ class _CLAMBase(nn.Module):
             "attention_scores": attention_scores,
             "attention_weights": attention_weights,
             "attention_pooled_features": attention_pooled_features,
+            "mean_gate": mean_gate,
             "distribution_mean": distribution_mean,
             "distribution_std": distribution_std,
+            "prototype_assignments": prototype_assignments,
+            "prototype_histogram": prototype_histogram,
             "raw_pooled_features": raw_pooled_features,
             "pooled_features": pooled_features,
             "instance_loss": instance_loss,
@@ -462,6 +542,8 @@ class CLAM_SB(_CLAMBase):
         pooling_mode: str = "attention",
         pooling_use_variance: bool = False,
         pooling_num_prototypes: int = 0,
+        pooling_prototype_temperature: Optional[float] = None,
+        pooling_freeze_prototypes: bool = False,
     ) -> None:
         """Initialize CLAM-SB.
 
@@ -483,7 +565,12 @@ class CLAM_SB(_CLAMBase):
             pooling_mode (str): ``attention`` or ``distributional`` pooling.
             pooling_use_variance (bool): Whether distributional pooling appends
                 per-channel standard deviation.
-            pooling_num_prototypes (int): Prototype histogram width; must be zero.
+            pooling_num_prototypes (int): Prototype histogram width, or zero to
+                disable the histogram branch.
+            pooling_prototype_temperature (Optional[float]): Positive initial
+                assignment temperature, or ``None`` for k-means initialization.
+            pooling_freeze_prototypes (bool): Whether to freeze assignment weights
+                after initialization.
 
         Returns:
             None: The initialized CLAM-SB model.
@@ -504,6 +591,8 @@ class CLAM_SB(_CLAMBase):
             pooling_mode=pooling_mode,
             pooling_use_variance=pooling_use_variance,
             pooling_num_prototypes=pooling_num_prototypes,
+            pooling_prototype_temperature=pooling_prototype_temperature,
+            pooling_freeze_prototypes=pooling_freeze_prototypes,
         )
         self.classifiers = nn.ModuleList(
             nn.Linear(self.bag_feature_dim, 1) for _ in range(num_classes)
@@ -545,6 +634,8 @@ class CLAM_MB(_CLAMBase):
         pooling_mode: str = "attention",
         pooling_use_variance: bool = False,
         pooling_num_prototypes: int = 0,
+        pooling_prototype_temperature: Optional[float] = None,
+        pooling_freeze_prototypes: bool = False,
     ) -> None:
         """Initialize CLAM-MB.
 
@@ -566,7 +657,12 @@ class CLAM_MB(_CLAMBase):
             pooling_mode (str): ``attention`` or ``distributional`` pooling.
             pooling_use_variance (bool): Whether distributional pooling appends
                 per-channel standard deviation.
-            pooling_num_prototypes (int): Prototype histogram width; must be zero.
+            pooling_num_prototypes (int): Prototype histogram width, or zero to
+                disable the histogram branch.
+            pooling_prototype_temperature (Optional[float]): Positive initial
+                assignment temperature, or ``None`` for k-means initialization.
+            pooling_freeze_prototypes (bool): Whether to freeze assignment weights
+                after initialization.
 
         Returns:
             None: The initialized CLAM-MB model.
@@ -587,6 +683,8 @@ class CLAM_MB(_CLAMBase):
             pooling_mode=pooling_mode,
             pooling_use_variance=pooling_use_variance,
             pooling_num_prototypes=pooling_num_prototypes,
+            pooling_prototype_temperature=pooling_prototype_temperature,
+            pooling_freeze_prototypes=pooling_freeze_prototypes,
         )
         self.classifiers = nn.ModuleList(
             nn.Linear(self.bag_feature_dim, 1) for _ in range(num_classes)

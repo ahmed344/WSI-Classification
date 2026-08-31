@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -225,6 +226,10 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     config: Dict[str, Any] = dict(loaded)
     config.setdefault("q", 0.0)
     config.setdefault("epsilon", 0.0)
+    config.setdefault("pooling_prototype_temperature", None)
+    config.setdefault("pooling_freeze_prototypes", False)
+    config.setdefault("prototype_kmeans_max_tiles", 200_000)
+    config.setdefault("prototype_kmeans_batch_size", 4_096)
     _validate_config(config)
     config["input_dim"] = resolve_input_dim(config)
     config["feature_file_suffix"] = resolve_feature_file_suffix(config)
@@ -321,6 +326,7 @@ def _validate_config(config: Mapping[str, Any]) -> None:
         "subtyping",
         "pooling_layernorm",
         "pooling_use_variance",
+        "pooling_freeze_prototypes",
     ):
         if not isinstance(config.get(key), bool):
             raise ValueError(f"Config key '{key}' must be a boolean.")
@@ -338,10 +344,32 @@ def _validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError(
             "Config key 'pooling_num_prototypes' must be a nonnegative integer."
         )
-    if prototype_count != 0:
+    if prototype_count > 0 and config["pooling_mode"] != "distributional":
         raise ValueError(
-            "Prototype histogram pooling is deferred; config key "
-            "'pooling_num_prototypes' must be 0."
+            "Config key 'pooling_num_prototypes' requires "
+            "pooling_mode='distributional' when greater than 0."
+        )
+    prototype_temperature = config.get("pooling_prototype_temperature")
+    if prototype_temperature is not None:
+        if (
+            isinstance(prototype_temperature, bool)
+            or not isinstance(prototype_temperature, (int, float))
+            or not math.isfinite(float(prototype_temperature))
+            or float(prototype_temperature) <= 0.0
+        ):
+            raise ValueError(
+                "Config key 'pooling_prototype_temperature' must be positive "
+                "and finite or null."
+            )
+    for key in ("prototype_kmeans_max_tiles", "prototype_kmeans_batch_size"):
+        _require_positive_int(config, key)
+    if (
+        prototype_count > 0
+        and int(config["prototype_kmeans_max_tiles"]) < prototype_count
+    ):
+        raise ValueError(
+            "Config key 'prototype_kmeans_max_tiles' must be at least "
+            "pooling_num_prototypes."
         )
 
     for key in (

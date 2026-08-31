@@ -26,7 +26,11 @@ attention_normalization: "sigmoid_mean"  # Must be sigmoid_mean; applies indepen
 pooling_layernorm: true  # Must be true; normalize sigmoid-over-T pooled vectors before classification
 pooling_mode: "distributional"  # Options: attention, distributional; distributional appends uniformly pooled mean and optional standard deviation
 pooling_use_variance: true  # Append per-channel population standard deviation in distributional mode
-pooling_num_prototypes: 0  # Must remain 0 until prototype histogram pooling is implemented in a later stage
+pooling_num_prototypes: 16  # Morphological histogram width K; 0 disables prototypes, positive values require distributional pooling
+pooling_prototype_temperature: null  # Positive initial soft-assignment temperature; null uses the mean nearest-centroid squared distance from k-means
+pooling_freeze_prototypes: false  # Freeze prototype assignment weights after k-means while leaving assignment temperature learnable
+prototype_kmeans_max_tiles: 200000  # Maximum training-split tiles used to initialize prototypes; must be at least pooling_num_prototypes
+prototype_kmeans_batch_size: 4096  # Positive tile embedding and MiniBatchKMeans batch size used during prototype initialization
 hidden_dim: 512  # Shared tile embedding dimension
 attention_dim: 256  # Hidden dimension of the gated attention network
 attention_dropout: 0.2  # Dropout in gated attention score projections; pooled tile values and distribution statistics remain deterministic
@@ -52,13 +56,13 @@ tile_sampling: "random"  # Options: random, uniform, first
 epochs: 100  # Maximum number of training epochs
 lr_cls: 0.001  # Initial learning rate for classification-related parameters
 lr_scheduler_factor_cls: 0.5  # ReduceLROnPlateau factor for classification branch
-lr_scheduler_patience_cls: 5  # ReduceLROnPlateau patience for classification branch
+lr_scheduler_patience_cls: 3  # ReduceLROnPlateau patience for classification branch
 use_weighted_sampler: true  # If true, train DataLoader uses WeightedRandomSampler
 use_class_weighted_loss: false  # Apply inverse-frequency class weights to the bag-level loss
-q: 0.7  # Generalized cross-entropy exponent; 0 recovers standard cross entropy
-epsilon: 0.1  # Label-smoothing strength in [0, 1); 0 disables smoothing
+q: 0.0  # Generalized cross-entropy exponent; 0 recovers standard cross entropy
+epsilon: 0.0  # Label-smoothing strength in [0, 1); 0 disables smoothing
 best_checkpoint_metric: "slide_balanced_accuracy"  # Options: slide_balanced_accuracy, balanced_accuracy, accuracy, loss, classification_loss, instance_loss
-weight_decay_cls: 0.0001  # Weight decay for feature projection, attention branches, and classifier
+weight_decay_cls: 0.001  # Weight decay for feature projection, attention branches, and classifier
 train_ratio: 0.8  # Fraction of slides used for training split
 val_ratio: 0.1  # Fraction of slides used for validation split
 test_ratio: 0.1  # Fraction of slides used for test split

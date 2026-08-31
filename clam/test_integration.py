@@ -39,7 +39,7 @@ def _run_model_smoke(model_class: Type[nn.Module], bag_level: str) -> None:
         subtyping=True,
         pooling_mode="distributional",
         pooling_use_variance=True,
-        pooling_num_prototypes=0,
+        pooling_num_prototypes=4,
     )
     features = torch.randn(2, 5 if bag_level == "tissue" else 7, 4)
     masks = torch.ones(features.shape[:2], dtype=torch.bool)
@@ -62,10 +62,25 @@ def _run_model_smoke(model_class: Type[nn.Module], bag_level: str) -> None:
     assert torch.allclose(outputs["attention_weights"], expected_attention)
     assert outputs["distribution_mean"].shape == (2, 1, model.hidden_dim)
     assert outputs["distribution_std"].shape == (2, 1, model.hidden_dim)
+    assert outputs["prototype_assignments"].shape == (
+        2,
+        features.shape[1],
+        model.pooling_num_prototypes,
+    )
+    assert outputs["prototype_histogram"].shape == (
+        2,
+        1,
+        model.pooling_num_prototypes,
+    )
+    assert outputs["mean_gate"].shape == (2, expected_branches, 1)
+    assert torch.allclose(
+        outputs["mean_gate"],
+        outputs["attention_weights"].sum(dim=-1, keepdim=True),
+    )
     assert outputs["raw_pooled_features"].shape == (
         2,
         expected_branches,
-        3 * model.hidden_dim,
+        3 * model.hidden_dim + model.pooling_num_prototypes + 1,
     )
     assert torch.allclose(
         outputs["pooled_features"],

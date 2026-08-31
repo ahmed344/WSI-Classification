@@ -163,7 +163,11 @@ def _pipeline_config(
         ("pooling_layernorm", False, "pooling_layernorm"),
         ("pooling_mode", "histogram", "pooling_mode"),
         ("pooling_use_variance", "yes", "pooling_use_variance"),
-        ("pooling_num_prototypes", 16, "pooling_num_prototypes"),
+        ("pooling_num_prototypes", -1, "pooling_num_prototypes"),
+        ("pooling_prototype_temperature", 0.0, "pooling_prototype_temperature"),
+        ("pooling_freeze_prototypes", "yes", "pooling_freeze_prototypes"),
+        ("prototype_kmeans_max_tiles", 0, "prototype_kmeans_max_tiles"),
+        ("prototype_kmeans_batch_size", 0, "prototype_kmeans_batch_size"),
         ("attention_dropout", 1.0, "attention_dropout"),
         ("classifier_dropout", -0.1, "classifier_dropout"),
     ],
@@ -193,6 +197,47 @@ def test_config_validation_rejects_invalid_values(
     with invalid_path.open("w", encoding="utf-8") as config_file:
         yaml.safe_dump(config, config_file)
     with pytest.raises(ValueError, match=message):
+        load_config(str(invalid_path))
+
+
+def test_config_accepts_prototype_histogram_settings() -> None:
+    """Verify the canonical configuration enables prototype histogram pooling.
+
+    Args:
+        None: The repository's canonical configuration is loaded.
+
+    Returns:
+        None: Prototype count, temperature, and k-means bounds are asserted.
+    """
+    config = load_config()
+
+    assert config["pooling_mode"] == "distributional"
+    assert config["pooling_num_prototypes"] == 16
+    assert config["pooling_prototype_temperature"] is None
+    assert config["prototype_kmeans_max_tiles"] >= 16
+    assert config["prototype_kmeans_batch_size"] > 0
+
+
+def test_config_rejects_prototypes_with_attention_only_pooling(
+    tmp_path: Path,
+) -> None:
+    """Verify enabled histograms require distributional pooling.
+
+    Args:
+        tmp_path (Path): Temporary invalid configuration destination.
+
+    Returns:
+        None: The incompatible pooling modes are rejected.
+    """
+    canonical_path = CLAM_DIRECTORY / "config.yml"
+    with canonical_path.open("r", encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file)
+    config["pooling_mode"] = "attention"
+    invalid_path = tmp_path / "attention_with_prototypes.yml"
+    with invalid_path.open("w", encoding="utf-8") as config_file:
+        yaml.safe_dump(config, config_file)
+
+    with pytest.raises(ValueError, match="requires.*distributional"):
         load_config(str(invalid_path))
 
 
@@ -846,6 +891,7 @@ def test_checkpoint_payload_load_round_trip(
         None: Assertions verify schema metadata, state, and identical logits.
     """
     config = _pipeline_config(tmp_path, "slide", model_type)
+    config["pooling_num_prototypes"] = 4
     model = train_clam.create_model(config)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
@@ -1042,13 +1088,21 @@ def test_apply_run_artifact_paths_updates_all_keys(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("model_class", [CLAM_SB, CLAM_MB])
+@pytest.mark.parametrize(
+    ("pooling_use_variance", "pooling_num_prototypes"),
+    [(False, 0), (True, 0), (False, 4), (True, 4)],
+)
 def test_tile_evidence_exactly_reconstructs_logits(
     model_class: Type[nn.Module],
+    pooling_use_variance: bool,
+    pooling_num_prototypes: int,
 ) -> None:
     """Verify SB and MB tile evidence reconstruct logits and ignores padding.
 
     Args:
         model_class (Type[nn.Module]): Canonical CLAM variant under test.
+        pooling_use_variance (bool): Whether to include population standard deviation.
+        pooling_num_prototypes (int): Prototype histogram width under test.
 
     Returns:
         None: Evidence shape, masking, and reconstruction are asserted.
@@ -1061,7 +1115,8 @@ def test_tile_evidence_exactly_reconstructs_logits(
         attention_dropout=0.0,
         classifier_dropout=0.0,
         pooling_mode="distributional",
-        pooling_use_variance=True,
+        pooling_use_variance=pooling_use_variance,
+        pooling_num_prototypes=pooling_num_prototypes,
     )
     model.eval()
     with torch.no_grad():

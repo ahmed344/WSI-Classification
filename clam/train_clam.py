@@ -26,14 +26,16 @@ try:
     from .clam_model import CLAM_MB, CLAM_SB
     from .config_loader import allocate_training_run, load_config
     from .losses import GeneralizedCrossEntropyLoss
+    from .prototype_init import initialize_prototypes_from_kmeans
 except ImportError:
     from clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
     from clam_model import CLAM_MB, CLAM_SB
     from config_loader import allocate_training_run, load_config
     from losses import GeneralizedCrossEntropyLoss
+    from prototype_init import initialize_prototypes_from_kmeans
 
 
-MODEL_SCHEMA = "canonical_clam_v4_deterministic_stats"
+MODEL_SCHEMA = "canonical_clam_v6_mean_gate"
 METRIC_KEYS = (
     "loss",
     "classification_loss",
@@ -73,6 +75,10 @@ def create_model(config: Mapping[str, Any]) -> nn.Module:
         pooling_mode=str(config.get("pooling_mode", "attention")),
         pooling_use_variance=bool(config.get("pooling_use_variance", False)),
         pooling_num_prototypes=int(config.get("pooling_num_prototypes", 0)),
+        pooling_prototype_temperature=config.get("pooling_prototype_temperature"),
+        pooling_freeze_prototypes=bool(
+            config.get("pooling_freeze_prototypes", False)
+        ),
     )
 
 
@@ -733,6 +739,7 @@ def train(config_path: Optional[str] = None) -> Dict[str, str]:
         batch_size=int(config.get("slide_evaluation_batch_size", 1)),
     )
     model = create_model(config).to(device)
+    initialize_prototypes_from_kmeans(model, train_dataset, config, device)
     criterion = create_classification_criterion(
         config,
         class_weights.to(device),
