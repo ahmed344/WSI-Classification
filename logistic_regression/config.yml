@@ -1,0 +1,53 @@
+# Logistic-regression baseline configuration
+
+data_root: "/workspaces/WSI-Classification/data/HE-MYO/Processed"  # Root containing class/slide feature and coordinate files
+checkpoint_dir: "checkpoints"  # Fallback directory used when paths.model is explicit or no dated run exists
+output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results"  # Root under which logistic_regression dated runs are stored
+
+feature_model: "uni2h"  # Active feature extractor used to resolve file suffix and tensor width
+feature_model_suffixes:  # Feature extractor names mapped to on-disk tensor suffixes
+  default: "_features.pt"  # Default feature tensor filename suffix
+  hoptimus: "_features_hoptimus.pt"  # H-Optimus feature tensor filename suffix
+  uni2h: "_features_uni2h.pt"  # UNI2-H feature tensor filename suffix
+  genbio: "_features_genbio.pt"  # GenBio-PathFM feature tensor filename suffix
+feature_model_input_dims:  # Feature extractor names mapped to raw tile feature widths
+  default: 1536  # Default feature tensor width
+  hoptimus: 1536  # H-Optimus feature tensor width
+  uni2h: 1536  # UNI2-H feature tensor width
+  genbio: 4608  # GenBio-PathFM feature tensor width
+
+bag_level: "tissue"  # Bag granularity; options: tissue, slide
+feature_normalization: "none"  # Per-tile normalization; options: none, l2, layer_norm
+num_classes: 5  # Number of fixed target classes expected in the discovered class ordering
+pooling_population_std_epsilon: 0.0  # Nonnegative variance floor before population-standard-deviation square root
+use_standard_scaler: true  # Fit StandardScaler on training bag vectors before logistic regression
+max_tiles_per_bag:  # Deterministic tile caps applied after complete bag construction
+  train: 2048  # Positive cap or null; random sampling varies deterministically by epoch
+  val: null  # Positive cap or null; validation sampling is fixed across epochs
+  test: null  # Positive cap or null; test sampling is fixed across epochs
+tile_sampling: "random"  # Capped-bag sampling; options: random, uniform, first
+batch_size: 128  # Number of variable-length bags per DataLoader batch
+num_workers: 8  # Number of DataLoader worker processes; use 0 for synchronous loading
+prefetch_factor: 2  # Batches prefetched per worker; used only when num_workers is positive
+
+train_ratio: 0.8  # Fraction of slides assigned to training
+val_ratio: 0.1  # Fraction of slides assigned to validation
+test_ratio: 0.1  # Fraction of slides assigned to testing
+random_seed: 42  # Nonnegative seed for slide splitting, tile sampling, and PyTorch fitting
+
+c_values: [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]  # Positive inverse-regularization candidates selected on validation data
+device: "cuda"  # Fitting and inference device; cuda is required for GPU model fitting
+optimizer: "lbfgs"  # Full-batch PyTorch optimizer; this baseline currently requires lbfgs
+learning_rate: 1.0  # Positive L-BFGS step size used for each regularization candidate
+max_iter: 1000  # Positive maximum L-BFGS iterations for each C candidate
+tolerance: 0.00001  # Positive L-BFGS gradient and parameter stopping tolerance
+class_weight: "balanced"  # Class weighting; use balanced or null
+selection_metric: "balanced_accuracy"  # Validation metric used to select C; options: balanced_accuracy, accuracy
+
+evaluation:  # Standalone evaluation controls
+  supplementary_bag_level: "slide"  # Optional second bag level; options: tissue, slide, null
+  include_train: true  # Whether standalone evaluation should include the training split
+
+paths:  # Optional artifact paths; null values attach to the newest dated run when available
+  checkpoint: null  # Explicit joblib path or null for logistic_regression/<run>/best_model.joblib
+  evaluation_output: null  # Explicit evaluation directory or null for logistic_regression/<run>/evaluation_results
