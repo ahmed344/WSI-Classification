@@ -1,0 +1,110 @@
+# PANTHER classification configuration
+#
+# This reproduces the CVPR 2024 PANTHER workflow:
+#   training-only K-means prototypes -> per-slide MAP-EM GMM -> linear classifier.
+# All implementation code and artifacts are owned by the panther package. No other
+# model package is imported. Run from the repository root with:
+#   python -m panther.train_panther --config panther/config.yaml
+#   python -m panther.evaluate_panther --config panther/config.yaml
+
+# Input data. The expected layout is data_root/class_name/slide_name/*.pt.
+data_root: "/workspaces/WSI-Classification/data/HE-MYO/Processed"
+output_dir: "/workspaces/WSI-Classification/data/HE-MYO/Results"
+
+# Feature file selection. feature_model chooses one entry from each mapping.
+feature_model: "uni2h"
+feature_model_suffixes:
+  default: "_features.pt"
+  hoptimus: "_features_hoptimus.pt"
+  uni2h: "_features_uni2h.pt"
+  genbio: "_features_genbio.pt"
+feature_model_input_dims:
+  default: 1536
+  hoptimus: 1536
+  uni2h: 1536
+  genbio: 4608
+
+# Optional explicit class order. null discovers class directories alphabetically.
+class_folders: null
+
+# Match CLAM's slide-level, stratified split exactly for direct comparison.
+train_ratio: 0.8
+val_ratio: 0.1
+test_ratio: 0.1
+random_seed: 42
+
+# PANTHER natively aggregates every tissue feature file belonging to one slide.
+# "none" is the original behavior; "l2" is an upstream-recommended ablation.
+feature_normalization: "none"  # Options: none, l2
+max_tiles_per_slide: null       # null uses all tiles; positive integer caps each slide
+tile_sampling: "random"        # Options when capped: random, uniform, first
+
+# Step 1: global morphological prototype construction on training slides only.
+prototype:
+  method: "kmeans"              # Faithful CPU sklearn K-means implementation
+  num_prototypes: 16            # C=16 is the paper's default supervised setting
+  patches_per_prototype: 10000  # At most 160,000 balanced training patches in total
+  max_iterations: 50
+  num_initializations: 5
+  algorithm: "lloyd"            # sklearn options: lloyd, elkan
+
+# Step 2: per-slide diagonal Gaussian-mixture MAP-EM representation.
+model:
+  em_iterations: 1              # Original downstream scripts use one EM update
+  tau: 1.0                      # Strength of the prototype-centered conjugate prior
+  covariance_regularizer: 1.0   # Initial/prior diagonal variance (upstream --ot_eps)
+  variance_floor: 1.0e-6        # Numerical safeguard after the MAP variance update
+  output_type: "allcat"         # Concatenate pi, means, and diagonal variances
+  fix_prototypes: true           # Preserve training-only K-means centroids
+  em_chunk_size: 65536           # Tile chunk size; null evaluates a slide in one block
+
+# Step 3: original bias-free linear downstream classifier.
+training:
+  epochs: 50
+  batch_size: 64
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  optimizer: "adamw"             # Options: adamw, sgd
+  scheduler: "cosine"            # Options: cosine, linear, constant
+  warmup_epochs: 1
+  gradient_accumulation_steps: 1
+  input_dropout: 0.0
+  classifier_bias: false
+  class_weighted_loss: false
+  # "last" matches the official no-early-stopping classification workflow.
+  # "best_val_loss" evaluates the lowest-validation-loss epoch instead.
+  checkpoint_selection: "last"
+
+# Evaluation outputs mirror CLAM: JSON report, CSV/JSON predictions, and matrix PNG.
+evaluation:
+  splits: ["val", "test"]
+  include_train: false
+  confusion_matrix_dpi: 300
+
+# Original-style prototypical assignment maps and GMM mixture plots. The
+# official notebook uses a 128x downsample, alpha=0.4, and the same fixed
+# categorical palette. Here a slide-level GMM is rendered over every aligned
+# tissue image belonging to that slide.
+visualization:
+  split: "test"                 # Options: train, val, test
+  max_slides: null              # null renders the complete selected split
+  tile_size: 448                # Stored CSV coordinates are tile centers
+  downsample: 128               # Official notebook visualization downsample
+  alpha: 0.4                    # Official categorical-overlay opacity
+  dpi: 300
+  save_individual_tissues: true
+
+# Runtime controls do not alter the mathematical method.
+runtime:
+  device: "auto"                # Options: auto, cuda, cpu
+  num_workers: 4
+  pin_memory: true
+
+# Leave these null for dated runs under output_dir/panther/. During evaluation,
+# null paths resolve to the newest completed run. Set run_dir to reproduce one run.
+paths:
+  run_dir: null
+  checkpoint: null
+  evaluation_output: null
+  visualization_output: null
+
