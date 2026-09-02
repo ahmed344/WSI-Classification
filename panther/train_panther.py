@@ -11,6 +11,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -30,6 +34,13 @@ from .prototype import fit_prototypes
 
 
 MODEL_SCHEMA = "panther-original-v1"
+HISTORY_METRIC_KEYS = (
+    "loss",
+    "accuracy",
+    "balanced_accuracy",
+    "macro_f1",
+    "multiclass_roc_auc",
+)
 
 
 def seed_everything(seed: int) -> None:
@@ -303,7 +314,65 @@ def train_classifier(
     return model, history, details
 
 
+def plot_training_history(
+    history: Sequence[Mapping[str, Any]],
+    save_path: Path | str,
+    best_epoch: int,
+) -> None:
+    """Plot train and validation metric curves in the CLAM stacked-panel style.
+
+    Args:
+        history (Sequence[Mapping[str, Any]]): Per-epoch records containing
+            ``train`` and ``val`` metric mappings.
+        save_path (Path | str): Destination PNG path.
+        best_epoch (int): One-based best validation epoch. Values ``<= 0`` skip
+            the vertical marker.
+
+    Returns:
+        None: The figure is written to disk.
+    """
+    if not history:
+        raise ValueError("Cannot plot an empty training history.")
+    metric_keys = [
+        key
+        for key in HISTORY_METRIC_KEYS
+        if all(
+            entry.get(split, {}).get(key) is not None
+            for entry in history
+            for split in ("train", "val")
+        )
+    ]
+    if not metric_keys:
+        raise ValueError("Training history contains no plottable metrics.")
+
+    figure, axes = plt.subplots(
+        len(metric_keys), 1, figsize=(10, 4 * len(metric_keys)), squeeze=False
+    )
+    for axis, key in zip(axes.ravel(), metric_keys):
+        axis.plot([entry["train"][key] for entry in history], label="train")
+        axis.plot([entry["val"][key] for entry in history], label="val")
+        if best_epoch > 0:
+            axis.axvline(best_epoch - 1, color="red", linestyle="--", label="best")
+        axis.set_ylabel(key)
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+    axes.ravel()[-1].set_xlabel("epoch")
+    figure.tight_layout()
+    destination = Path(save_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(destination, dpi=200)
+    plt.close(figure)
+
+
 def run_training(config_path: str | None = None) -> Path:
+    """Fit prototypes, encode slides, train the linear head, and save a run.
+
+    Args:
+        config_path (str | None): YAML path, or ``None`` for the module default.
+
+    Returns:
+        Path: Created or reused training-run directory.
+    """
     config = load_config(config_path)
     run_dir = allocate_training_run(config)
     seed_everything(int(config["random_seed"]))
@@ -334,6 +403,11 @@ def run_training(config_path: str | None = None) -> Path:
 
     with (run_dir / "training_history.json").open("w", encoding="utf-8") as handle:
         json.dump(history, handle, indent=2)
+    plot_training_history(
+        history,
+        run_dir / "training_history.png",
+        int(training_details["best_validation_epoch"]),
+    )
     checkpoint = {
         "model_schema": MODEL_SCHEMA,
         "model_state_dict": classifier.state_dict(),

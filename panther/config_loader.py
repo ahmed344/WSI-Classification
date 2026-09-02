@@ -193,6 +193,8 @@ def _validate(config: Mapping[str, Any]) -> None:
     alpha = _number(visualization, "alpha")
     if not 0.0 <= alpha <= 1.0:
         raise ValueError("visualization.alpha must be in [0, 1].")
+    if not isinstance(visualization.get("save_mixture_proportions"), bool):
+        raise ValueError("visualization.save_mixture_proportions must be a boolean.")
     if not isinstance(visualization.get("save_individual_tissues"), bool):
         raise ValueError("visualization.save_individual_tissues must be a boolean.")
 

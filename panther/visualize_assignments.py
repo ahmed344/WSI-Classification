@@ -2,8 +2,9 @@
 
 This is an independent port of the official PANTHER visualization notebook at
 Mahmood Lab PANTHER commit e7ffae402e146363fe1ca3813ffe68d248ec570f.
-The original notebook colors each tile by argmax of the slide GMM posterior and
-plots the fitted mixture probabilities with a fixed categorical palette.
+Tiles are colored by argmax of the slide GMM posterior. Mixture probabilities
+use a purple- and pink-free categorical palette rather than the notebook's
+original colors.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image
 
 try:
     import openslide
@@ -44,8 +45,15 @@ from .panther_dataset import (
     select_tile_indices,
     stable_seed,
 )
+from .panther_model import LinearClassifier
 from .prototype import load_prototypes
-from .train_panther import MODEL_SCHEMA, create_panther, resolve_device, seed_everything
+from .train_panther import (
+    MODEL_SCHEMA,
+    create_panther,
+    plot_training_history,
+    resolve_device,
+    seed_everything,
+)
 
 
 OFFICIAL_PANTHER_COMMIT = "e7ffae402e146363fe1ca3813ffe68d248ec570f"
@@ -55,14 +63,14 @@ OFFICIAL_NOTEBOOK = (
     + "/src/visualization/prototypical_assignment_map_visualization.ipynb"
 )
 DEFAULT_HEX_COLORS = (
-    "#696969", "#556b2f", "#a0522d", "#483d8b",
-    "#008000", "#008b8b", "#000080", "#7f007f",
-    "#8fbc8f", "#b03060", "#ff0000", "#ffa500",
-    "#00ff00", "#8a2be2", "#00ff7f", "#FFFF54",
-    "#00ffff", "#00bfff", "#f4a460", "#adff2f",
-    "#da70d6", "#b0c4de", "#ff00ff", "#1e90ff",
-    "#f0e68c", "#0000ff", "#dc143c", "#90ee90",
-    "#ff1493", "#7b68ee", "#ffefd5", "#ffb6c1",
+    "#4A4A4A", "#2E7D32", "#8D6E63", "#00897B",
+    "#1565C0", "#EF6C00", "#6D4C41", "#43A047",
+    "#0277BD", "#C62828", "#F9A825", "#558B2F",
+    "#00838F", "#F57C00", "#1B5E20", "#FDD835",
+    "#01579B", "#A1887F", "#7CB342", "#00ACC1",
+    "#E53935", "#FFB300", "#33691E", "#26A69A",
+    "#1E88E5", "#5D4037", "#D84315", "#9E9D24",
+    "#81C784", "#FF7043", "#90A4AE", "#BCAAA4",
 )
 IMAGE_SUFFIXES = (
     ".ome.tiff", ".ome.tif", ".tiff", ".tif", ".svs", ".png", ".jpg", ".jpeg"
@@ -83,7 +91,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def get_default_color_map(num_prototypes: int) -> Dict[int, tuple[int, int, int]]:
-    """Return the exact 32-color categorical palette from the official notebook."""
+    """Return a 32-color categorical palette without purple or pink hues.
+
+    Args:
+        num_prototypes (int): Number of GMM components to color, in ``[1, 32]``.
+
+    Returns:
+        Dict[int, tuple[int, int, int]]: Prototype index to RGB triple.
+    """
     if not 0 < num_prototypes <= len(DEFAULT_HEX_COLORS):
         raise ValueError(
             f"num_prototypes must be in [1, {len(DEFAULT_HEX_COLORS)}]."
@@ -248,7 +263,19 @@ def blend_categorical_overlay(
 
     The official PANTHER utility receives top-left patch coordinates. HE-MYO CSV
     files store patch centers, so half a tile is subtracted before applying the
-    same colored-block blend and one-pixel dark border.
+    same colored-block blend without a per-tile border.
+
+    Args:
+        preview (np.ndarray): RGB preview with shape ``[height, width, 3]``.
+        coordinates (np.ndarray): Level-zero tile-center coordinates ``[N, 2]``.
+        labels (np.ndarray): Prototype index for each coordinate, length ``N``.
+        original_dimensions (tuple[int, int]): Level-zero ``(width, height)``.
+        tile_size (int): Tile side length in level-zero pixels.
+        alpha (float): Overlay opacity in ``[0, 1]``.
+        color_map (Mapping[int, tuple[int, int, int]]): Prototype RGB colors.
+
+    Returns:
+        Image.Image: RGB overlay with the same spatial size as ``preview``.
     """
     if coordinates.shape != (labels.shape[0], 2):
         raise ValueError("Coordinates and labels must be exactly aligned.")
@@ -281,11 +308,9 @@ def blend_categorical_overlay(
         image_block = canvas[top:bottom, left:right].copy()
         color_block = np.empty_like(image_block)
         color_block[...] = color_map[int(raw_label)]
-        blended = cv2.addWeighted(color_block, alpha, image_block, 1.0 - alpha, 0)
-        bordered = ImageOps.expand(
-            Image.fromarray(blended), border=1, fill=(50, 50, 50)
-        ).resize((right - left, bottom - top))
-        canvas[top:bottom, left:right] = np.asarray(bordered)
+        canvas[top:bottom, left:right] = cv2.addWeighted(
+            color_block, alpha, image_block, 1.0 - alpha, 0
+        )
     return Image.fromarray(canvas)
 
 
@@ -294,6 +319,16 @@ def _mixture_axis(
     mixtures: np.ndarray,
     color_map: Mapping[int, tuple[int, int, int]],
 ) -> None:
+    """Draw the official-style GMM mixture-proportion bar chart on one axis.
+
+    Args:
+        axis (plt.Axes): Destination matplotlib axis.
+        mixtures (np.ndarray): Nonnegative mixture weights of length ``C``.
+        color_map (Mapping[int, tuple[int, int, int]]): Prototype RGB colors.
+
+    Returns:
+        None: The axis is mutated in place.
+    """
     colors = [np.asarray(color_map[index]) / 255.0 for index in range(len(mixtures))]
     indices = np.arange(len(mixtures))
     axis.bar(indices, mixtures, color=colors, width=0.8)
@@ -313,7 +348,17 @@ def save_mixture_plot(
     output_path: Path,
     dpi: int,
 ) -> None:
-    """Save the official-style GMM mixture-proportion bar chart."""
+    """Save the official-style GMM mixture-proportion bar chart.
+
+    Args:
+        mixtures (np.ndarray): Nonnegative mixture weights of length ``C``.
+        color_map (Mapping[int, tuple[int, int, int]]): Prototype RGB colors.
+        output_path (Path): Destination PNG path.
+        dpi (int): Positive output resolution in dots per inch.
+
+    Returns:
+        None: The figure is written to disk.
+    """
     figure, axis = plt.subplots(figsize=(6, 3))
     _mixture_axis(axis, mixtures, color_map)
     figure.tight_layout()
@@ -323,43 +368,115 @@ def save_mixture_plot(
 
 
 def save_slide_overview(
-    overlays: Sequence[tuple[str, Image.Image]],
-    mixtures: np.ndarray,
-    color_map: Mapping[int, tuple[int, int, int]],
+    tissues: Sequence[tuple[str, Image.Image, Image.Image]],
     slide_name: str,
-    class_name: str,
+    true_class: str,
+    predicted_class: str,
+    class_probabilities: Mapping[str, float],
     split: str,
     output_path: Path,
     dpi: int,
 ) -> None:
-    """Save all tissue assignment maps and the slide mixture chart as one figure."""
-    panel_count = len(overlays) + 1
-    columns = min(3, panel_count)
-    rows = math.ceil(panel_count / columns)
+    """Save original tissue previews above their prototypical assignment maps.
+
+    Args:
+        tissues (Sequence[tuple[str, Image.Image, Image.Image]]): Tissue name,
+            original preview, and assignment overlay for each tissue.
+        slide_name (str): Slide directory name.
+        true_class (str): Ground-truth class name.
+        predicted_class (str): Predicted class name.
+        class_probabilities (Mapping[str, float]): Softmax probability per class.
+        split (str): Dataset split name.
+        output_path (Path): Destination PNG path.
+        dpi (int): Positive output resolution in dots per inch.
+
+    Returns:
+        None: The figure is written to disk.
+    """
+    if not tissues:
+        raise ValueError("Cannot save an assignment overview with no tissues.")
+    if predicted_class not in class_probabilities:
+        raise ValueError(
+            f"Predicted class '{predicted_class}' is missing from class_probabilities."
+        )
+    columns = len(tissues)
     figure, axes = plt.subplots(
-        rows, columns, figsize=(4.5 * columns, 3.9 * rows), squeeze=False
+        2, columns, figsize=(4.5 * columns, 7.2), squeeze=False
     )
-    flat_axes = axes.ravel()
-    for axis, (tissue_name, overlay) in zip(flat_axes, overlays):
-        axis.imshow(overlay)
-        axis.set_title(tissue_name, fontsize=8)
-        axis.axis("off")
-    mixture_axis = flat_axes[len(overlays)]
-    _mixture_axis(mixture_axis, mixtures, color_map)
-    mixture_axis.set_title("Slide GMM mixture proportions", fontsize=9)
-    for axis in flat_axes[panel_count:]:
-        axis.axis("off")
+    for column, (tissue_name, original, overlay) in enumerate(tissues):
+        axes[0, column].imshow(original)
+        axes[0, column].set_title(tissue_name, fontsize=8)
+        axes[0, column].axis("off")
+        axes[1, column].imshow(overlay)
+        axes[1, column].set_title("")
+        axes[1, column].axis("off")
+    probability_text = " | ".join(
+        f"{name} {class_probabilities[name]:.3f}" for name in class_probabilities
+    )
+    predicted_probability = float(class_probabilities[predicted_class])
     figure.suptitle(
-        f"PANTHER prototypical assignments | {class_name} | {slide_name} | {split}",
+        f"True: {true_class} | Predicted: {predicted_class} "
+        f"(p={predicted_probability:.3f})\n"
+        f"{probability_text}",
         fontsize=11,
     )
-    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
 
 
+def assignment_output_paths(
+    output_root: Path,
+    split: str,
+    class_name: str,
+    slide_name: str,
+    tissue_names: Sequence[str],
+    save_mixture: bool,
+    save_individual_tissues: bool,
+) -> Dict[str, Any]:
+    """Build flat PNG paths under one split directory.
+
+    Args:
+        output_root (Path): Visualization output root.
+        split (str): Dataset split name, for example ``test``.
+        class_name (str): Ground-truth class name.
+        slide_name (str): Slide directory name.
+        tissue_names (Sequence[str]): Ordered tissue names on the slide.
+        save_mixture (bool): Whether an independent mixture PNG is requested.
+        save_individual_tissues (bool): Whether per-tissue assignment PNGs are
+            requested.
+
+    Returns:
+        Dict[str, Any]: Split directory, overview path, optional mixture path,
+        and a tissue-name to assignment-PNG mapping.
+    """
+    split_dir = output_root / split
+    stem = f"{_safe_slug(class_name)}_{_safe_slug(slide_name)}"
+    return {
+        "split_dir": split_dir,
+        "assignment_overview": split_dir / f"{stem}_assignment_overview.png",
+        "mixture_plot": (
+            split_dir / f"{stem}_mixture_proportions.png" if save_mixture else None
+        ),
+        "tissues": {
+            name: split_dir / f"{stem}_{_safe_slug(name)}_assignment.png"
+            for name in tissue_names
+        }
+        if save_individual_tissues
+        else {},
+    }
+
+
 def _safe_slug(value: str) -> str:
+    """Convert a class, slide, or tissue name into a unique filename stem.
+
+    Args:
+        value (str): Raw identifier.
+
+    Returns:
+        str: Conservative slug with an 8-character content hash suffix.
+    """
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
     digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
     return f"{cleaned[:90] or 'slide'}_{digest}"
@@ -402,6 +519,8 @@ def _visualize_slide(
     dataset: PantherSlideDataset,
     index: int,
     panther: torch.nn.Module,
+    classifier: LinearClassifier,
+    class_names: Sequence[str],
     device: torch.device,
     config: Mapping[str, Any],
     settings: Mapping[str, Any],
@@ -409,22 +528,56 @@ def _visualize_slide(
     split: str,
     color_map: Mapping[int, tuple[int, int, int]],
 ) -> Dict[str, Any]:
+    """Render one slide's original/assignment overview and optional extras.
+
+    Args:
+        dataset (PantherSlideDataset): Split dataset containing the slide.
+        index (int): Dataset index of the slide to render.
+        panther (torch.nn.Module): Frozen MAP-EM encoder.
+        classifier (LinearClassifier): Trained downstream linear head.
+        class_names (Sequence[str]): Ordered checkpoint class names.
+        device (torch.device): Inference device.
+        config (Mapping[str, Any]): Checkpoint training configuration.
+        settings (Mapping[str, Any]): Visualization settings.
+        output_root (Path): Visualization output root.
+        split (str): Dataset split name.
+        color_map (Mapping[int, tuple[int, int, int]]): Prototype RGB colors.
+
+    Returns:
+        Dict[str, Any]: Per-slide manifest payload including output paths.
+    """
     item = dataset[index]
     record = dataset.records[index]
     encoded = panther(item["features"].to(device), return_assignments=True)
+    logits = classifier(encoded["representation"])
+    probabilities = torch.softmax(logits, dim=1)[0].cpu().numpy()
+    predicted_index = int(probabilities.argmax())
+    true_class = str(item["class_name"])
+    predicted_class = str(class_names[predicted_index])
+    predicted_probability = float(probabilities[predicted_index])
+    class_probabilities = {
+        str(name): float(probabilities[class_index])
+        for class_index, name in enumerate(class_names)
+    }
     responsibilities = encoded["assignments"][0].cpu().numpy()
     mixtures = encoded["mixture_weights"][0].cpu().numpy()
     hard_assignments = responsibilities.argmax(axis=1).astype(np.int64)
     tissue_assignments = _split_assignments_by_tissue(record, hard_assignments, config)
-
-    slide_dir = (
-        output_root / split / _safe_slug(str(item["class_name"]))
-        / _safe_slug(str(item["slide_name"]))
+    tissue_names = [str(tissue["tissue_name"]) for tissue, _, _ in tissue_assignments]
+    paths = assignment_output_paths(
+        output_root,
+        split,
+        true_class,
+        str(item["slide_name"]),
+        tissue_names,
+        bool(settings["save_mixture_proportions"]),
+        bool(settings["save_individual_tissues"]),
     )
-    slide_dir.mkdir(parents=True, exist_ok=True)
-    tissue_dir = slide_dir / "tissue_assignment_maps"
-    overlays: list[tuple[str, Image.Image]] = []
+    paths["split_dir"].mkdir(parents=True, exist_ok=True)
+
+    tissues: list[tuple[str, Image.Image, Image.Image]] = []
     tissue_payload = []
+    individual_paths = paths["tissues"]
     for tissue, coordinates, labels in tissue_assignments:
         tissue_name = str(tissue["tissue_name"])
         image_path = find_tissue_image(
@@ -434,15 +587,14 @@ def _visualize_slide(
         preview, dimensions = load_image_preview(
             image_path, int(settings["downsample"])
         )
+        original = Image.fromarray(preview)
         overlay = blend_categorical_overlay(
             preview, coordinates, labels, dimensions, int(settings["tile_size"]),
             float(settings["alpha"]), color_map,
         )
-        overlays.append((tissue_name, overlay))
-        tissue_output: Optional[Path] = None
-        if bool(settings["save_individual_tissues"]):
-            tissue_output = tissue_dir / f"{_safe_slug(tissue_name)}.png"
-            tissue_output.parent.mkdir(parents=True, exist_ok=True)
+        tissues.append((tissue_name, original, overlay))
+        tissue_output: Optional[Path] = individual_paths.get(tissue_name)
+        if tissue_output is not None:
             overlay.save(tissue_output)
         tissue_payload.append(
             {
@@ -454,12 +606,19 @@ def _visualize_slide(
             }
         )
 
-    mixture_path = slide_dir / "mixture_proportions.png"
-    overview_path = slide_dir / "assignment_overview.png"
-    save_mixture_plot(mixtures, color_map, mixture_path, int(settings["dpi"]))
+    mixture_path = paths["mixture_plot"]
+    overview_path = paths["assignment_overview"]
+    if mixture_path is not None:
+        save_mixture_plot(mixtures, color_map, mixture_path, int(settings["dpi"]))
     save_slide_overview(
-        overlays, mixtures, color_map, str(item["slide_name"]),
-        str(item["class_name"]), split, overview_path, int(settings["dpi"]),
+        tissues,
+        str(item["slide_name"]),
+        true_class,
+        predicted_class,
+        class_probabilities,
+        split,
+        overview_path,
+        int(settings["dpi"]),
     )
     hard_counts = np.bincount(
         hard_assignments, minlength=len(color_map)
@@ -472,8 +631,13 @@ def _visualize_slide(
     return {
         "slide_key": str(item["slide_key"]),
         "slide_name": str(item["slide_name"]),
-        "class_name": str(item["class_name"]),
+        "class_name": true_class,
+        "true_class": true_class,
         "label": int(item["label"]),
+        "predicted_class": predicted_class,
+        "predicted_label": predicted_index,
+        "predicted_probability": predicted_probability,
+        "class_probabilities": class_probabilities,
         "split": split,
         "num_tiles": int(item["num_tiles"]),
         "num_tissues": int(item["num_tissues"]),
@@ -488,7 +652,7 @@ def _visualize_slide(
         "mean_normalized_posterior_entropy": float(
             entropy.mean() / math.log(len(color_map))
         ),
-        "mixture_plot": str(mixture_path),
+        "mixture_plot": str(mixture_path) if mixture_path is not None else None,
         "assignment_overview": str(overview_path),
         "tissues": tissue_payload,
     }
@@ -522,6 +686,30 @@ def _select_indices(
     return indices
 
 
+def _plot_run_training_history(run_dir: Path, checkpoint: Mapping[str, Any]) -> Optional[Path]:
+    """Write ``training_history.png`` from a run's saved epoch JSON if present.
+
+    Args:
+        run_dir (Path): Dated training-run directory.
+        checkpoint (Mapping[str, Any]): Loaded checkpoint payload.
+
+    Returns:
+        Optional[Path]: Written PNG path, or ``None`` when history is absent.
+    """
+    history_path = run_dir / "training_history.json"
+    if not history_path.is_file():
+        return None
+    with history_path.open(encoding="utf-8") as handle:
+        history = json.load(handle)
+    if not isinstance(history, list) or not history:
+        return None
+    details = checkpoint.get("training_details", {})
+    best_epoch = int(details.get("best_validation_epoch", -1)) if isinstance(details, Mapping) else -1
+    plot_path = run_dir / "training_history.png"
+    plot_training_history(history, plot_path, best_epoch)
+    return plot_path
+
+
 def run_visualization(
     config_path: Optional[str] = None,
     split_override: Optional[str] = None,
@@ -529,7 +717,18 @@ def run_visualization(
     slide_keys: Optional[Sequence[str]] = None,
     output_override: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Render original-style PANTHER visualizations for a checkpoint split."""
+    """Render original-style PANTHER visualizations for a checkpoint split.
+
+    Args:
+        config_path (Optional[str]): YAML path, or ``None`` for the module default.
+        split_override (Optional[str]): Optional split replacing ``visualization.split``.
+        max_slides_override (Optional[int]): Optional slide cap.
+        slide_keys (Optional[Sequence[str]]): Optional exact slide keys to render.
+        output_override (Optional[str]): Optional visualization output directory.
+
+    Returns:
+        Dict[str, Any]: Visualization manifest payload written to disk.
+    """
     runtime_config = load_config(config_path)
     run_dir = resolve_evaluation_run(runtime_config)
     checkpoint_path = Path(runtime_config["paths"]["checkpoint"])
@@ -571,7 +770,15 @@ def run_visualization(
     device = resolve_device(runtime_config)
     prototypes, prototype_metadata = load_prototypes(run_dir / "prototypes.pkl")
     panther = create_panther(prototypes, checkpoint_config).eval().to(device)
+    input_dim = int(checkpoint["training_details"]["input_dim"])
+    classifier = LinearClassifier(
+        input_dim,
+        len(class_names),
+        bias=bool(checkpoint_config["training"]["classifier_bias"]),
+    ).eval().to(device)
+    classifier.load_state_dict(checkpoint["model_state_dict"], strict=True)
     color_map = get_default_color_map(panther.num_prototypes)
+    history_plot = _plot_run_training_history(run_dir, checkpoint)
 
     output_root.mkdir(parents=True, exist_ok=True)
     slide_payload = []
@@ -582,8 +789,8 @@ def run_visualization(
     )
     for position, index in enumerate(indices, start=1):
         payload = _visualize_slide(
-            datasets[split], index, panther, device, checkpoint_config, settings,
-            output_root, split, color_map,
+            datasets[split], index, panther, classifier, class_names, device,
+            checkpoint_config, settings, output_root, split, color_map,
         )
         slide_payload.append(payload)
         global_counts += np.asarray(payload["hard_assignment_counts"], dtype=np.int64)
@@ -612,12 +819,13 @@ def run_visualization(
             "palette": list(DEFAULT_HEX_COLORS[: panther.num_prototypes]),
             "coordinates": "level-zero tile centers",
             "adaptation": (
-                "one slide-level GMM over concatenated tissues; assignments "
-                "rendered separately on each aligned tissue image"
+                "one slide-level GMM over concatenated tissues; originals and "
+                "assignments rendered side by side under the split directory"
             ),
             "settings": settings,
         },
         "split": split,
+        "training_history_plot": str(history_plot) if history_plot is not None else None,
         "num_slides": len(slide_payload),
         "num_tissues": int(sum(slide["num_tissues"] for slide in slide_payload)),
         "num_tiles": int(global_counts.sum()),
@@ -639,6 +847,14 @@ def run_visualization(
 
 
 def main() -> None:
+    """Run assignment visualization from the command line.
+
+    Args:
+        None: Configuration is read from command-line arguments.
+
+    Returns:
+        None: Figures and a JSON manifest are written to disk.
+    """
     arguments = parse_args()
     run_visualization(
         arguments.config,

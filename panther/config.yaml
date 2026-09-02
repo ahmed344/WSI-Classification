@@ -60,8 +60,8 @@ model:
 
 # Step 3: original bias-free linear downstream classifier.
 training:
-  epochs: 50
-  batch_size: 64
+  epochs: 200
+  batch_size: 256
   learning_rate: 0.0001
   weight_decay: 0.00001
   optimizer: "adamw"             # Options: adamw, sgd
@@ -70,7 +70,7 @@ training:
   gradient_accumulation_steps: 1
   input_dropout: 0.0
   classifier_bias: false
-  class_weighted_loss: false
+  class_weighted_loss: true
   # "last" matches the official no-early-stopping classification workflow.
   # "best_val_loss" evaluates the lowest-validation-loss epoch instead.
   checkpoint_selection: "last"
@@ -92,7 +92,8 @@ visualization:
   downsample: 128               # Official notebook visualization downsample
   alpha: 0.4                    # Official categorical-overlay opacity
   dpi: 300
-  save_individual_tissues: true
+  save_mixture_proportions: true  # Independent mixture_proportions.png; false skips it
+  save_individual_tissues: false
 
 # Runtime controls do not alter the mathematical method.
 runtime:
