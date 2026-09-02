@@ -13,6 +13,9 @@ import torch
 from torch import nn
 
 
+OUTPUT_TYPES = ("allcat", "pi", "mean", "variance")
+
+
 class PANTHER(nn.Module):
     """Summarize each slide by mixture weights, means, and diagonal variances."""
 
@@ -31,8 +34,10 @@ class PANTHER(nn.Module):
         prototypes = torch.as_tensor(prototypes, dtype=torch.float32)
         if prototypes.ndim != 2 or min(prototypes.shape) <= 0:
             raise ValueError("prototypes must have shape [num_prototypes, feature_dim].")
-        if output_type != "allcat":
-            raise ValueError("Only the original PANTHER 'allcat' output is supported.")
+        if output_type not in OUTPUT_TYPES:
+            raise ValueError(
+                f"Invalid output_type '{output_type}'; expected one of {OUTPUT_TYPES}."
+            )
         self.num_prototypes = int(prototypes.shape[0])
         self.feature_dim = int(prototypes.shape[1])
         self.em_iterations = int(em_iterations)
@@ -45,7 +50,11 @@ class PANTHER(nn.Module):
 
     @property
     def output_dim(self) -> int:
-        """Dimension of `[pi, flattened mu, flattened diagonal variance]`."""
+        """Dimension of the selected flattened slide representation."""
+        if self.output_type == "pi":
+            return self.num_prototypes
+        if self.output_type in ("mean", "variance"):
+            return self.num_prototypes * self.feature_dim
         return self.num_prototypes + 2 * self.num_prototypes * self.feature_dim
 
     def forward(
@@ -129,7 +138,16 @@ class PANTHER(nn.Module):
             if assignment_parts is not None:
                 assignments = torch.cat(assignment_parts, dim=0)
 
-        representation = torch.cat((pi.flatten(), mu.flatten(), variance.flatten()))
+        components = {
+            "pi": pi.flatten(),
+            "mean": mu.flatten(),
+            "variance": variance.flatten(),
+        }
+        representation = (
+            torch.cat(tuple(components.values()))
+            if self.output_type == "allcat"
+            else components[self.output_type]
+        )
         result = {
             "representation": representation,
             "mixture_weights": pi,

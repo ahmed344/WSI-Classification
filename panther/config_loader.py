@@ -8,6 +8,8 @@ from typing import Any, Dict, Mapping, MutableMapping, Optional, Sequence
 
 import yaml
 
+from .panther_model import OUTPUT_TYPES
+
 
 SPLITS = ("train", "val", "test")
 
@@ -147,7 +149,17 @@ def _validate(config: Mapping[str, Any]) -> None:
     for key in ("tau", "covariance_regularizer", "variance_floor"):
         if _number(model, key) <= 0.0:
             raise ValueError(f"model.{key} must be positive.")
-    _choice(model, "output_type", ("allcat",))
+    output_types = model.get("output_type")
+    if (
+        not isinstance(output_types, list)
+        or not output_types
+        or any(output_type not in OUTPUT_TYPES for output_type in output_types)
+        or len(set(output_types)) != len(output_types)
+    ):
+        raise ValueError(
+            "model.output_type must be a nonempty list of unique values from "
+            f"{OUTPUT_TYPES}."
+        )
     if not isinstance(model.get("fix_prototypes"), bool):
         raise ValueError("model.fix_prototypes must be a boolean.")
     chunk = model.get("em_chunk_size")

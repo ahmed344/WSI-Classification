@@ -33,7 +33,12 @@ from .panther_model import LinearClassifier, PANTHER
 from .prototype import fit_prototypes
 
 
-MODEL_SCHEMA = "panther-original-v1"
+MODEL_SCHEMA = "panther-original-v2"
+EMBEDDING_COMPONENT_KEYS = {
+    "pi": "mixture_weights",
+    "mean": "means",
+    "variance": "variances",
+}
 HISTORY_METRIC_KEYS = (
     "loss",
     "accuracy",
@@ -41,6 +46,7 @@ HISTORY_METRIC_KEYS = (
     "macro_f1",
     "multiclass_roc_auc",
 )
+ROOT_SELECTION_METRIC = "val_balanced_accuracy"
 
 
 def seed_everything(seed: int) -> None:
@@ -64,7 +70,9 @@ def resolve_device(config: Mapping[str, Any]) -> torch.device:
 
 
 def create_panther(
-    prototypes: torch.Tensor, config: Mapping[str, Any]
+    prototypes: torch.Tensor,
+    config: Mapping[str, Any],
+    output_type: str = "allcat",
 ) -> PANTHER:
     settings = config["model"]
     return PANTHER(
@@ -73,10 +81,55 @@ def create_panther(
         tau=float(settings["tau"]),
         covariance_regularizer=float(settings["covariance_regularizer"]),
         variance_floor=float(settings["variance_floor"]),
-        output_type=str(settings["output_type"]),
+        output_type=output_type,
         fix_prototypes=bool(settings["fix_prototypes"]),
         em_chunk_size=settings.get("em_chunk_size"),
     )
+
+
+def component_embedding_paths(directory: Path) -> Dict[str, Path]:
+    """Return the three persistent component-cache paths for one run."""
+    return {
+        component: directory / f"slide_embeddings_{component}.pt"
+        for component in EMBEDDING_COMPONENT_KEYS
+    }
+
+
+def compose_slide_embeddings(
+    component_embeddings: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    output_type: str,
+) -> Dict[str, Dict[str, Any]]:
+    """Select one component or concatenate all components in canonical order."""
+    if output_type != "allcat" and output_type not in EMBEDDING_COMPONENT_KEYS:
+        raise ValueError(f"Unsupported PANTHER output type: {output_type}.")
+
+    reference = component_embeddings["pi"]
+    selected_components = (
+        tuple(EMBEDDING_COMPONENT_KEYS)
+        if output_type == "allcat"
+        else (output_type,)
+    )
+    composed: Dict[str, Dict[str, Any]] = {}
+    for split, reference_cache in reference.items():
+        representations = []
+        for component in selected_components:
+            cache = component_embeddings[component][split]
+            if cache["slide_keys"] != reference_cache["slide_keys"]:
+                raise ValueError(
+                    f"{component} embedding cache does not match the {split} slides."
+                )
+            if not torch.equal(cache["labels"], reference_cache["labels"]):
+                raise ValueError(
+                    f"{component} embedding cache does not match the {split} labels."
+                )
+            representations.append(cache["representations"])
+        composed[split] = dict(reference_cache)
+        composed[split]["representations"] = (
+            representations[0]
+            if len(representations) == 1
+            else torch.cat(representations, dim=1)
+        )
+    return composed
 
 
 @torch.no_grad()
@@ -85,13 +138,17 @@ def aggregate_slide_embeddings(
     panther: PANTHER,
     device: torch.device,
     destination: Path,
-) -> Dict[str, Dict[str, Any]]:
-    """Run the frozen MAP-EM slide encoder once and cache all split embeddings."""
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Encode each slide once and persist pi, mean, and variance separately."""
     panther.eval().to(device)
-    payload: Dict[str, Dict[str, Any]] = {}
+    payloads: Dict[str, Dict[str, Dict[str, Any]]] = {
+        component: {} for component in EMBEDDING_COMPONENT_KEYS
+    }
     for split, dataset in datasets.items():
         started = time.time()
-        representations = []
+        representations = {
+            component: [] for component in EMBEDDING_COMPONENT_KEYS
+        }
         labels = []
         slide_names = []
         slide_keys = []
@@ -99,28 +156,37 @@ def aggregate_slide_embeddings(
         for index in range(len(dataset)):
             item = dataset[index]
             features = item["features"].to(device, non_blocking=True)
-            result = panther(features)["representation"].squeeze(0).cpu()
-            if not torch.isfinite(result).all():
-                raise FloatingPointError(
-                    f"Non-finite PANTHER representation for {item['slide_key']}."
-                )
-            representations.append(result)
+            encoded = panther(features)
+            for component, result_key in EMBEDDING_COMPONENT_KEYS.items():
+                result = encoded[result_key].squeeze(0).flatten().cpu()
+                if not torch.isfinite(result).all():
+                    raise FloatingPointError(
+                        f"Non-finite PANTHER {component} for {item['slide_key']}."
+                    )
+                representations[component].append(result)
             labels.append(int(item["label"]))
             slide_names.append(str(item["slide_name"]))
             slide_keys.append(str(item["slide_key"]))
             tile_counts.append(int(item["num_tiles"]))
             if (index + 1) % 25 == 0 or index + 1 == len(dataset):
                 print(f"PANTHER aggregation {split}: {index + 1}/{len(dataset)} slides")
-        payload[split] = {
-            "representations": torch.stack(representations),
+        metadata = {
             "labels": torch.tensor(labels, dtype=torch.long),
             "slide_names": slide_names,
             "slide_keys": slide_keys,
             "tile_counts": tile_counts,
             "elapsed_seconds": float(time.time() - started),
         }
-    torch.save(payload, destination)
-    return payload
+        for component in EMBEDDING_COMPONENT_KEYS:
+            payloads[component][split] = {
+                "representations": torch.stack(representations[component]),
+                **metadata,
+            }
+
+    destination.mkdir(parents=True, exist_ok=True)
+    for component, path in component_embedding_paths(destination).items():
+        torch.save(payloads[component], path)
+    return payloads
 
 
 def _class_weights(labels: torch.Tensor, num_classes: int) -> torch.Tensor:
@@ -224,9 +290,10 @@ def train_classifier(
     class_names: Sequence[str],
     config: Mapping[str, Any],
     device: torch.device,
-    run_dir: Path,
+    model_dir: Path,
 ) -> tuple[LinearClassifier, list[Dict[str, Any]], Dict[str, Any]]:
     settings = config["training"]
+    model_dir.mkdir(parents=True, exist_ok=True)
     train_data = embeddings["train"]
     input_dim = int(train_data["representations"].shape[1])
     model = LinearClassifier(
@@ -293,12 +360,12 @@ def train_classifier(
     final_state = copy.deepcopy(model.state_dict())
     torch.save(
         {"model_state_dict": final_state, "epoch": int(settings["epochs"])},
-        run_dir / "final_model.pth",
+        model_dir / "final_model.pth",
     )
     assert best_state is not None
     torch.save(
         {"model_state_dict": best_state, "epoch": best_epoch},
-        run_dir / "best_validation_model.pth",
+        model_dir / "best_validation_model.pth",
     )
     selection = str(settings["checkpoint_selection"])
     selected_state = final_state if selection == "last" else best_state
@@ -312,6 +379,93 @@ def train_classifier(
         "checkpoint_selection": selection,
     }
     return model, history, details
+
+
+def select_primary_output_type(
+    trained_models: Mapping[str, Mapping[str, Any]],
+    training_histories: Mapping[str, Sequence[Mapping[str, Any]]],
+    output_types: Sequence[str],
+) -> tuple[str, Dict[str, Any]]:
+    """Pick the representation whose selected epoch has the highest val balanced accuracy.
+
+    Ties prefer the lower validation loss at that epoch, then the earlier entry in
+    ``output_types``. Test metrics are never consulted.
+
+    Args:
+        trained_models (Mapping[str, Mapping[str, Any]]): Per-output payloads that
+            include ``training_details`` with ``selected_epoch``.
+        training_histories (Mapping[str, Sequence[Mapping[str, Any]]]): Per-output
+            epoch records containing ``val`` metric mappings.
+        output_types (Sequence[str]): Configured representation order used as the
+            final tie-breaker.
+
+    Returns:
+        tuple[str, Dict[str, Any]]: Winning output type and an auditable selection
+            record with per-type selected-epoch scores.
+    """
+    if not output_types:
+        raise ValueError("At least one output_type is required to select a primary model.")
+    candidates: list[Dict[str, Any]] = []
+    for output_type in output_types:
+        if output_type not in trained_models:
+            raise ValueError(f"Missing trained model for output_type={output_type}.")
+        if output_type not in training_histories:
+            raise ValueError(f"Missing training history for output_type={output_type}.")
+        details = trained_models[output_type].get("training_details")
+        if not isinstance(details, Mapping):
+            raise ValueError(f"training_details missing for output_type={output_type}.")
+        selected_epoch = int(details["selected_epoch"])
+        history = list(training_histories[output_type])
+        if selected_epoch < 1 or selected_epoch > len(history):
+            raise ValueError(
+                f"selected_epoch {selected_epoch} is out of range for "
+                f"output_type={output_type} with {len(history)} epochs."
+            )
+        val_metrics = history[selected_epoch - 1].get("val")
+        if not isinstance(val_metrics, Mapping):
+            raise ValueError(f"Validation metrics missing for output_type={output_type}.")
+        candidates.append(
+            {
+                "output_type": output_type,
+                "selected_epoch": selected_epoch,
+                "val_balanced_accuracy": float(val_metrics["balanced_accuracy"]),
+                "val_loss": float(val_metrics["loss"]),
+            }
+        )
+    winner = min(
+        enumerate(candidates),
+        key=lambda item: (
+            -item[1]["val_balanced_accuracy"],
+            item[1]["val_loss"],
+            item[0],
+        ),
+    )[1]
+    return winner["output_type"], {
+        "metric": ROOT_SELECTION_METRIC,
+        "winner": winner["output_type"],
+        "candidates": candidates,
+    }
+
+
+def resolve_checkpoint_output_type(checkpoint: Mapping[str, Any]) -> str:
+    """Return the deployed representation type stored on a run-root checkpoint.
+
+    Args:
+        checkpoint (Mapping[str, Any]): Loaded run-root checkpoint payload.
+
+    Returns:
+        str: ``default_output_type`` when present, else the training-details
+            output type, else ``allcat``.
+    """
+    default = checkpoint.get("default_output_type")
+    if isinstance(default, str) and default:
+        return default
+    details = checkpoint.get("training_details")
+    if isinstance(details, Mapping):
+        output_type = details.get("output_type")
+        if isinstance(output_type, str) and output_type:
+            return output_type
+    return "allcat"
 
 
 def plot_training_history(
@@ -393,31 +547,87 @@ def run_training(config_path: str | None = None) -> Path:
         datasets["train"], config, prototype_path
     )
     panther = create_panther(prototypes, config)
-    embedding_path = run_dir / "slide_embeddings.pt"
-    embeddings = aggregate_slide_embeddings(
-        datasets, panther, device, embedding_path
+    component_embeddings = aggregate_slide_embeddings(
+        datasets, panther, device, run_dir
     )
-    classifier, history, training_details = train_classifier(
-        embeddings, class_names, config, device, run_dir
-    )
+    output_types = list(config["model"]["output_type"])
+    trained_models: Dict[str, Dict[str, Any]] = {}
+    training_histories: Dict[str, list[Dict[str, Any]]] = {}
+    for output_type in output_types:
+        seed_everything(int(config["random_seed"]))
+        embeddings = compose_slide_embeddings(component_embeddings, output_type)
+        model_dir = run_dir / "models" / output_type
+        print(
+            f"Training output_type={output_type} with "
+            f"{embeddings['train']['representations'].shape[1]} features"
+        )
+        classifier, history, training_details = train_classifier(
+            embeddings, class_names, config, device, model_dir
+        )
+        training_details["output_type"] = output_type
+        history_path = model_dir / "training_history.json"
+        with history_path.open("w", encoding="utf-8") as handle:
+            json.dump(history, handle, indent=2)
+        history_plot_path = model_dir / "training_history.png"
+        plot_training_history(
+            history,
+            history_plot_path,
+            int(training_details["best_validation_epoch"]),
+        )
+        selected_checkpoint_path = model_dir / "best_model.pth"
+        model_payload = {
+            "model_state_dict": classifier.state_dict(),
+            "training_details": training_details,
+            "output_type": output_type,
+        }
+        torch.save(model_payload, selected_checkpoint_path)
+        trained_models[output_type] = {
+            **model_payload,
+            "model_dir": str(model_dir),
+            "checkpoint": str(selected_checkpoint_path),
+            "training_history": str(history_path),
+            "training_history_plot": str(history_plot_path),
+        }
+        training_histories[output_type] = history
 
+    primary_output_type, root_model_selection = select_primary_output_type(
+        trained_models, training_histories, output_types
+    )
+    winner_scores = next(
+        candidate
+        for candidate in root_model_selection["candidates"]
+        if candidate["output_type"] == primary_output_type
+    )
+    print(
+        f"Root best_model.pth: {primary_output_type} "
+        f"(val_bacc={winner_scores['val_balanced_accuracy']:.4f})"
+    )
+    primary_model = trained_models[primary_output_type]
+    primary_history = training_histories[primary_output_type]
     with (run_dir / "training_history.json").open("w", encoding="utf-8") as handle:
-        json.dump(history, handle, indent=2)
+        json.dump(primary_history, handle, indent=2)
     plot_training_history(
-        history,
+        primary_history,
         run_dir / "training_history.png",
-        int(training_details["best_validation_epoch"]),
+        int(primary_model["training_details"]["best_validation_epoch"]),
     )
     checkpoint = {
         "model_schema": MODEL_SCHEMA,
-        "model_state_dict": classifier.state_dict(),
+        "output_types": output_types,
+        "models": trained_models,
         "prototypes": prototypes,
         "class_folders": list(class_names),
         "config": dict(config),
         "prototype_metadata": prototype_metadata,
-        "training_details": training_details,
         "split_manifest": str(run_dir / "split_manifest.json"),
-        "embedding_cache": str(embedding_path),
+        "embedding_caches": {
+            component: str(path)
+            for component, path in component_embedding_paths(run_dir).items()
+        },
+        "default_output_type": primary_output_type,
+        "model_state_dict": primary_model["model_state_dict"],
+        "training_details": primary_model["training_details"],
+        "root_model_selection": root_model_selection,
     }
     torch.save(checkpoint, Path(config["paths"]["checkpoint"]))
     with (run_dir / "resolved_config.json").open("w", encoding="utf-8") as handle:

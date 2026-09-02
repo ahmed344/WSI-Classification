@@ -19,7 +19,13 @@ from .config_loader import load_config, resolve_evaluation_run
 from .metrics import classification_metrics
 from .panther_dataset import build_datasets, class_counts, load_split_manifest
 from .panther_model import LinearClassifier
-from .train_panther import MODEL_SCHEMA, resolve_device, seed_everything
+from .train_panther import (
+    MODEL_SCHEMA,
+    component_embedding_paths,
+    compose_slide_embeddings,
+    resolve_device,
+    seed_everything,
+)
 
 
 @torch.no_grad()
@@ -152,69 +158,115 @@ def run_evaluation(config_path: str | None = None) -> Dict[str, Any]:
     if discovered_classes != class_names:
         raise ValueError("Current dataset class order disagrees with the checkpoint.")
 
-    embedding_path = run_dir / "slide_embeddings.pt"
-    if not embedding_path.is_file():
+    cache_paths = component_embedding_paths(run_dir)
+    missing_caches = [path for path in cache_paths.values() if not path.is_file()]
+    if missing_caches:
         raise FileNotFoundError(
-            f"Slide embedding cache is missing: {embedding_path}. Re-run training."
+            f"Slide embedding caches are missing: {missing_caches}. Re-run training."
         )
-    embeddings = torch.load(embedding_path, map_location="cpu", weights_only=False)
-    for split, dataset in datasets.items():
-        expected_keys = [record["slide_key"] for record in dataset.records]
-        if embeddings[split]["slide_keys"] != expected_keys:
-            raise ValueError(f"Embedding cache does not match the {split} manifest.")
+    component_embeddings = {
+        component: torch.load(path, map_location="cpu", weights_only=False)
+        for component, path in cache_paths.items()
+    }
+    for component, embeddings in component_embeddings.items():
+        for split, dataset in datasets.items():
+            expected_keys = [record["slide_key"] for record in dataset.records]
+            if embeddings[split]["slide_keys"] != expected_keys:
+                raise ValueError(
+                    f"{component} embedding cache does not match the {split} manifest."
+                )
+
+    models = checkpoint.get("models")
+    output_types = checkpoint.get("output_types")
+    if (
+        not isinstance(models, Mapping)
+        or not isinstance(output_types, list)
+        or any(output_type not in models for output_type in output_types)
+    ):
+        raise ValueError("Checkpoint is missing its output types or trained models.")
 
     seed_everything(int(checkpoint_config["random_seed"]))
     device = resolve_device(runtime_config)
-    input_dim = int(checkpoint["training_details"]["input_dim"])
-    model = LinearClassifier(
-        input_dim,
-        len(class_names),
-        bias=bool(checkpoint_config["training"]["classifier_bias"]),
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     requested_splits = list(runtime_config["evaluation"]["splits"])
-    if bool(runtime_config["evaluation"]["include_train"]) and "train" not in requested_splits:
+    if (
+        bool(runtime_config["evaluation"]["include_train"])
+        and "train" not in requested_splits
+    ):
         requested_splits.append("train")
 
-    results: Dict[str, Any] = {}
-    for split in requested_splits:
-        split_cache = embeddings[split]
-        metrics, probabilities = evaluate_arrays(
-            model,
-            split_cache["representations"],
-            split_cache["labels"],
-            class_names,
-            device,
-            int(checkpoint_config["training"]["batch_size"]),
-        )
-        artifacts = save_split_results(
-            split,
-            metrics,
-            probabilities,
-            split_cache,
-            class_names,
-            output_dir,
-            int(runtime_config["evaluation"]["confusion_matrix_dpi"]),
-        )
-        printable_auc = metrics["multiclass_roc_auc"]
-        auc_text = "not valid" if printable_auc is None else f"{printable_auc:.4f}"
-        print(
-            f"slide/{split}: n={len(datasets[split])} {class_counts(datasets[split])} "
-            f"accuracy={metrics['accuracy']:.4f} "
-            f"balanced_accuracy={metrics['balanced_accuracy']:.4f} "
-            f"macro_f1={metrics['macro_f1']:.4f} auc={auc_text}"
-        )
-        compact = dict(metrics)
-        compact.pop("predictions")
-        results[f"slide/{split}"] = {**compact, "artifacts": artifacts}
+    all_results: Dict[str, Any] = {}
+    evaluation_directories: Dict[str, str] = {}
+    for output_type in output_types:
+        model_payload = models[output_type]
+        if not isinstance(model_payload, Mapping):
+            raise ValueError(f"Invalid model payload for output_type={output_type}.")
+        embeddings = compose_slide_embeddings(component_embeddings, output_type)
+        training_details = model_payload.get("training_details")
+        if not isinstance(training_details, Mapping):
+            raise ValueError(f"Missing training details for output_type={output_type}.")
+        model = LinearClassifier(
+            int(training_details["input_dim"]),
+            len(class_names),
+            bias=bool(checkpoint_config["training"]["classifier_bias"]),
+        ).to(device)
+        model.load_state_dict(model_payload["model_state_dict"], strict=True)
+        type_output_dir = output_dir / output_type
+        type_results: Dict[str, Any] = {}
+        for split in requested_splits:
+            split_cache = embeddings[split]
+            metrics, probabilities = evaluate_arrays(
+                model,
+                split_cache["representations"],
+                split_cache["labels"],
+                class_names,
+                device,
+                int(checkpoint_config["training"]["batch_size"]),
+            )
+            artifacts = save_split_results(
+                split,
+                metrics,
+                probabilities,
+                split_cache,
+                class_names,
+                type_output_dir,
+                int(runtime_config["evaluation"]["confusion_matrix_dpi"]),
+            )
+            printable_auc = metrics["multiclass_roc_auc"]
+            auc_text = "not valid" if printable_auc is None else f"{printable_auc:.4f}"
+            print(
+                f"{output_type}/slide/{split}: n={len(datasets[split])} "
+                f"{class_counts(datasets[split])} accuracy={metrics['accuracy']:.4f} "
+                f"balanced_accuracy={metrics['balanced_accuracy']:.4f} "
+                f"macro_f1={metrics['macro_f1']:.4f} auc={auc_text}"
+            )
+            compact = dict(metrics)
+            compact.pop("predictions")
+            type_results[f"slide/{split}"] = {**compact, "artifacts": artifacts}
+
+        type_manifest = {
+            "checkpoint": str(checkpoint_path),
+            "model_schema": MODEL_SCHEMA,
+            "class_folders": class_names,
+            "bag_level": "slide",
+            "native_panther_representation": output_type,
+            "results": type_results,
+        }
+        type_output_dir.mkdir(parents=True, exist_ok=True)
+        with (
+            type_output_dir / "evaluation_manifest.json"
+        ).open("w", encoding="utf-8") as handle:
+            json.dump(type_manifest, handle, indent=2)
+        all_results[output_type] = type_results
+        evaluation_directories[output_type] = str(type_output_dir)
 
     manifest = {
         "checkpoint": str(checkpoint_path),
         "model_schema": MODEL_SCHEMA,
         "class_folders": class_names,
         "bag_level": "slide",
-        "native_panther_representation": "allcat",
-        "results": results,
+        "output_types": output_types,
+        "evaluation_directories": evaluation_directories,
+        "results": all_results,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "evaluation_manifest.json").open("w", encoding="utf-8") as handle:

@@ -54,7 +54,9 @@ model:
   tau: 1.0                      # Strength of the prototype-centered conjugate prior
   covariance_regularizer: 1.0   # Initial/prior diagonal variance (upstream --ot_eps)
   variance_floor: 1.0e-6        # Numerical safeguard after the MAP variance update
-  output_type: "allcat"         # Concatenate pi, means, and diagonal variances
+  # Train one linear classifier per requested representation. "variance" is the
+  # flattened diagonal-variance block; "allcat" concatenates all three blocks.
+  output_type: ["allcat", "pi", "mean", "variance"]
   fix_prototypes: true           # Preserve training-only K-means centroids
   em_chunk_size: 65536           # Tile chunk size; null evaluates a slide in one block
 
@@ -73,6 +75,9 @@ training:
   class_weighted_loss: true
   # "last" matches the official no-early-stopping classification workflow.
   # "best_val_loss" evaluates the lowest-validation-loss epoch instead.
+  # Each models/<output_type>/best_model.pth follows this rule. The run-root
+  # best_model.pth then copies the selected-epoch head with the highest
+  # validation balanced accuracy (ties: lower val loss, then config order).
   checkpoint_selection: "last"
 
 # Evaluation outputs mirror CLAM: JSON report, CSV/JSON predictions, and matrix PNG.

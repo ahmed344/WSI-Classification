@@ -51,6 +51,7 @@ from .train_panther import (
     MODEL_SCHEMA,
     create_panther,
     plot_training_history,
+    resolve_checkpoint_output_type,
     resolve_device,
     seed_everything,
 )
@@ -769,7 +770,10 @@ def run_visualization(
     seed_everything(int(checkpoint_config["random_seed"]))
     device = resolve_device(runtime_config)
     prototypes, prototype_metadata = load_prototypes(run_dir / "prototypes.pkl")
-    panther = create_panther(prototypes, checkpoint_config).eval().to(device)
+    output_type = resolve_checkpoint_output_type(checkpoint)
+    panther = create_panther(
+        prototypes, checkpoint_config, output_type=output_type
+    ).eval().to(device)
     input_dim = int(checkpoint["training_details"]["input_dim"])
     classifier = LinearClassifier(
         input_dim,
@@ -785,7 +789,7 @@ def run_visualization(
     global_counts = np.zeros(panther.num_prototypes, dtype=np.int64)
     print(
         f"Visualizing {len(indices)} PANTHER {split} slides on {device} "
-        f"from run {run_dir.name}."
+        f"from run {run_dir.name} with output_type={output_type}."
     )
     for position, index in enumerate(indices, start=1):
         payload = _visualize_slide(
@@ -809,6 +813,7 @@ def run_visualization(
         "run_id": run_dir.name,
         "run_dir": str(run_dir),
         "checkpoint": str(checkpoint_path),
+        "output_type": output_type,
         "prototypes": str(run_dir / "prototypes.pkl"),
         "prototype_metadata": prototype_metadata,
         "official_reference_commit": OFFICIAL_PANTHER_COMMIT,

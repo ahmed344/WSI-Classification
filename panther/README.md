@@ -9,8 +9,10 @@ The stages are:
 
 1. sample training tiles evenly across training slides and fit K-means prototypes;
 2. fit a prototype-centred diagonal GMM independently to every slide by MAP-EM;
-3. concatenate mixture weights, means, and variances (`allcat`);
-4. train the original bias-free linear downstream classifier;
+3. cache mixture weights (`pi`), means (`mean`), and diagonal variances
+   (`variance`) in three separate slide-embedding files;
+4. train one original bias-free linear classifier for each configured
+   `output_type`, with `allcat` derived by concatenating the three caches;
 5. evaluate at the native slide level and save reports, predictions, and confusion matrices;
 6. reproduce the official categorical prototypical-assignment maps and GMM
    mixture-proportion plots for aligned tissue images.
@@ -26,10 +28,14 @@ pytest panther/test_integration.py -q
 
 Each training run receives a dated directory under
 `output_dir/panther/`. The directory contains the exact split manifest,
-prototype pickle, cached slide representations, training history, final and
-best-validation classifier states, the selected `best_model.pth`, and an
-`evaluation_results/` directory after evaluation. Set `paths.run_dir` in the
-configuration to evaluate a specific run; null selects the newest completed run.
+prototype pickle, `slide_embeddings_pi.pt`, `slide_embeddings_mean.pt`, and
+`slide_embeddings_variance.pt`. Per-output checkpoints and histories are stored
+under `models/<output_type>/`; the run-root `best_model.pth` is the multi-model
+bundle whose primary head is the selected-epoch representation with the highest
+validation balanced accuracy. Evaluation writes one directory per model
+under `evaluation_results/<output_type>/`, plus a combined manifest in
+`evaluation_results/`. Set `paths.run_dir` in the configuration to evaluate a
+specific run; null selects the newest completed run.
 
 The implementation follows Mahmood Lab's
 [PANTHER repository](https://github.com/mahmoodlab/PANTHER) and the CVPR 2024
