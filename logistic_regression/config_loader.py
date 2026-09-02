@@ -10,6 +10,11 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence
 
 import yaml
 
+try:
+    from .model import normalize_pooling_statistics
+except ImportError:
+    from model import normalize_pooling_statistics
+
 
 _OPTIONS: Dict[str, Sequence[Any]] = {
     "bag_level": ("tissue", "slide"),
@@ -264,11 +269,11 @@ def resolve_feature_file_suffix(config: Mapping[str, Any]) -> str:
     return suffix
 
 
-def _validate_config(config: Mapping[str, Any]) -> None:
+def _validate_config(config: MutableMapping[str, Any]) -> None:
     """Validate dataset, evaluation, and logistic-regression settings.
 
     Args:
-        config (Mapping[str, Any]): Parsed configuration mapping.
+        config (MutableMapping[str, Any]): Parsed configuration mapping.
 
     Returns:
         None: Validation succeeds by returning normally.
@@ -283,6 +288,14 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     pooling_epsilon = _require_number(config, "pooling_population_std_epsilon")
     if pooling_epsilon < 0.0:
         raise ValueError("pooling_population_std_epsilon must be nonnegative.")
+    if "pooling_statistics" not in config or config.get("pooling_statistics") is None:
+        raise ValueError("pooling_statistics must be a nonempty list.")
+    try:
+        config["pooling_statistics"] = list(
+            normalize_pooling_statistics(config.get("pooling_statistics"))
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid pooling_statistics: {error}") from error
     if config.get("use_standard_scaler") is not True:
         raise ValueError("use_standard_scaler must be true for this baseline.")
     workers = config.get("num_workers")

@@ -19,7 +19,8 @@ feature_model_input_dims:  # Feature extractor names mapped to raw tile feature 
 bag_level: "tissue"  # Bag granularity; options: tissue, slide
 feature_normalization: "none"  # Per-tile normalization; options: none, l2, layer_norm
 num_classes: 5  # Number of fixed target classes expected in the discovered class ordering
-pooling_population_std_epsilon: 0.0  # Nonnegative variance floor before population-standard-deviation square root
+pooling_statistics: ["mean", "standard_deviation"]  # Ordered bag-vector blocks concatenated after mask-aware pooling; nonempty unique list; options: mean, standard_deviation
+pooling_population_std_epsilon: 0.0  # Nonnegative variance floor before population-standard-deviation square root; used only when standard_deviation is selected
 use_standard_scaler: true  # Fit StandardScaler on training bag vectors before logistic regression
 max_tiles_per_bag:  # Deterministic tile caps applied after complete bag construction
   train: 2048  # Positive cap or null; random sampling varies deterministically by epoch

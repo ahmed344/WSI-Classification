@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Union
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 import joblib
 import numpy as np
@@ -12,23 +12,141 @@ import torch.nn.functional as F
 
 
 ArrayLike = Union[np.ndarray, torch.Tensor]
+DEFAULT_POOLING_STATISTICS: Tuple[str, ...] = ("mean", "standard_deviation")
+_POOLING_CONTRACT_BLOCKS: Dict[str, str] = {
+    "mean": "population_mean",
+    "standard_deviation": "population_std",
+}
+
+
+def _population_mean_block(context: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """Return or compute the mask-aware population mean.
+
+    Args:
+        context (Dict[str, torch.Tensor]): Shared pooling tensors. May be
+            updated in place with a cached ``mean`` block.
+
+    Returns:
+        torch.Tensor: Mean block shaped ``[B, D]``.
+    """
+    cached = context.get("mean")
+    if cached is not None:
+        return cached
+    mean = (context["features"] * context["weights"]).sum(dim=1) / context[
+        "denominator"
+    ]
+    context["mean"] = mean
+    return mean
+
+
+def _population_std_block(context: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """Return the mask-aware population standard deviation.
+
+    Args:
+        context (Dict[str, torch.Tensor]): Shared pooling tensors including
+            features, weights, denominator, and epsilon.
+
+    Returns:
+        torch.Tensor: Standard-deviation block shaped ``[B, D]``.
+    """
+    mean = _population_mean_block(context)
+    variance = (
+        (context["features"] - mean.unsqueeze(1)).square() * context["weights"]
+    ).sum(dim=1) / context["denominator"]
+    return torch.sqrt(variance.clamp_min(0.0) + context["epsilon"])
+
+
+_POOLING_STATISTIC_BLOCKS: Dict[
+    str, Callable[[Dict[str, torch.Tensor]], torch.Tensor]
+] = {
+    "mean": _population_mean_block,
+    "standard_deviation": _population_std_block,
+}
+
+
+def normalize_pooling_statistics(statistics: Optional[Sequence[str]]) -> Tuple[str, ...]:
+    """Validate and freeze an ordered pooling-statistic list.
+
+    Args:
+        statistics (Optional[Sequence[str]]): Requested statistic names, or
+            ``None`` for the default mean-then-standard-deviation contract.
+
+    Returns:
+        Tuple[str, ...]: Nonempty unique statistic names in concatenation order.
+    """
+    if statistics is None:
+        return DEFAULT_POOLING_STATISTICS
+    if isinstance(statistics, (str, bytes)) or not isinstance(statistics, Sequence):
+        raise ValueError(
+            "pooling_statistics must be a nonempty list of statistic names."
+        )
+    names = list(statistics)
+    if not names:
+        raise ValueError("pooling_statistics must be a nonempty list.")
+    if any(not isinstance(name, str) or not name for name in names):
+        raise ValueError("Every pooling_statistics entry must be a nonempty string.")
+    unknown = [name for name in names if name not in _POOLING_STATISTIC_BLOCKS]
+    if unknown:
+        available = ", ".join(sorted(_POOLING_STATISTIC_BLOCKS))
+        raise ValueError(
+            f"Unknown pooling_statistics {unknown}. Available: {available}."
+        )
+    if len(set(names)) != len(names):
+        raise ValueError("pooling_statistics must not contain duplicate names.")
+    return tuple(names)
+
+
+def pooling_output_dim(input_dim: int, statistics: Sequence[str]) -> int:
+    """Return the concatenated bag-vector width for one tile feature width.
+
+    Args:
+        input_dim (int): Positive raw tile feature dimension.
+        statistics (Sequence[str]): Ordered pooling statistic names.
+
+    Returns:
+        int: ``len(statistics) * input_dim``.
+    """
+    if input_dim <= 0:
+        raise ValueError("input_dim must be positive.")
+    names = normalize_pooling_statistics(statistics)
+    return len(names) * input_dim
+
+
+def pooling_contract(statistics: Sequence[str]) -> str:
+    """Build the checkpoint pooling-contract string for selected statistics.
+
+    Args:
+        statistics (Sequence[str]): Ordered pooling statistic names.
+
+    Returns:
+        str: Concatenation contract including the padding-mask rule.
+    """
+    names = normalize_pooling_statistics(statistics)
+    blocks = ", ".join(_POOLING_CONTRACT_BLOCKS[name] for name in names)
+    return f"concat({blocks}); mask excludes padding"
 
 
 class RawFeatureStatisticsPooler:
-    """Pool tiles into mask-aware population mean and standard deviation.
+    """Pool tiles into selected mask-aware population statistics.
 
     Args:
         epsilon (float): Nonnegative variance floor applied before square root.
+        statistics (Sequence[str]): Ordered statistic names to concatenate.
 
     Returns:
         RawFeatureStatisticsPooler: Callable stateless pooling object.
     """
 
-    def __init__(self, epsilon: float = 0.0) -> None:
+    def __init__(
+        self,
+        epsilon: float = 0.0,
+        statistics: Sequence[str] = DEFAULT_POOLING_STATISTICS,
+    ) -> None:
         """Initialize the raw-feature pooler.
 
         Args:
             epsilon (float): Nonnegative variance floor before square root.
+            statistics (Sequence[str]): Ordered statistic names to concatenate.
 
         Returns:
             None: Pooling configuration is stored in place.
@@ -36,11 +154,12 @@ class RawFeatureStatisticsPooler:
         if epsilon < 0.0:
             raise ValueError("epsilon must be nonnegative.")
         self.epsilon = float(epsilon)
+        self.statistics = normalize_pooling_statistics(statistics)
 
     def __call__(
         self, features: torch.Tensor, masks: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Pool padded or unpadded bags into ``[mean || population_std]``.
+        """Pool padded or unpadded bags into the configured statistic vector.
 
         Args:
             features (torch.Tensor): Features shaped ``[B, T, D]`` or ``[T, D]``.
@@ -48,28 +167,36 @@ class RawFeatureStatisticsPooler:
                 ``[T]``; ``None`` marks every tile valid.
 
         Returns:
-            torch.Tensor: Bag representations shaped ``[B, 2D]``.
+            torch.Tensor: Bag representations shaped ``[B, kD]``.
         """
-        return pool_raw_features(features, masks=masks, epsilon=self.epsilon)
+        return pool_raw_features(
+            features,
+            masks=masks,
+            epsilon=self.epsilon,
+            statistics=self.statistics,
+        )
 
 
 def pool_raw_features(
     features: torch.Tensor,
     masks: Optional[torch.Tensor] = None,
     epsilon: float = 0.0,
+    statistics: Sequence[str] = DEFAULT_POOLING_STATISTICS,
 ) -> torch.Tensor:
-    """Compute mask-aware raw-feature population moments.
+    """Compute selected mask-aware raw-feature population moments.
 
     Args:
         features (torch.Tensor): Features shaped ``[B, T, D]`` or ``[T, D]``.
         masks (Optional[torch.Tensor]): Valid rows shaped ``[B, T]`` or ``[T]``.
         epsilon (float): Nonnegative value added to population variance.
+        statistics (Sequence[str]): Ordered statistic names to concatenate.
 
     Returns:
-        torch.Tensor: Concatenated mean and standard deviation shaped ``[B, 2D]``.
+        torch.Tensor: Concatenated statistic blocks shaped ``[B, kD]``.
     """
     if epsilon < 0.0:
         raise ValueError("epsilon must be nonnegative.")
+    names = normalize_pooling_statistics(statistics)
     if features.ndim == 2:
         features = features.unsqueeze(0)
         if masks is not None and masks.ndim == 1:
@@ -92,13 +219,16 @@ def pool_raw_features(
     if torch.any(counts == 0):
         raise ValueError("Every bag must contain at least one valid tile.")
     weights = valid.unsqueeze(-1).to(dtype=features.dtype)
-    denominator = counts.to(dtype=features.dtype)
-    mean = (features * weights).sum(dim=1) / denominator
-    variance = (
-        (features - mean.unsqueeze(1)).square() * weights
-    ).sum(dim=1) / denominator
-    standard_deviation = torch.sqrt(variance.clamp_min(0.0) + epsilon)
-    return torch.cat((mean, standard_deviation), dim=1)
+    context: Dict[str, torch.Tensor] = {
+        "features": features,
+        "weights": weights,
+        "denominator": counts.to(dtype=features.dtype),
+        "epsilon": torch.as_tensor(
+            epsilon, dtype=features.dtype, device=features.device
+        ),
+    }
+    blocks = [_POOLING_STATISTIC_BLOCKS[name](context) for name in names]
+    return torch.cat(blocks, dim=1)
 
 
 class TorchLogisticRegression:

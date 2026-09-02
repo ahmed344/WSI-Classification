@@ -240,9 +240,11 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# Claude
+# Agents
+AGENTS.md
 CLAUDE.md
 .claude
+.codex
 
 # Marimo
 marimo/_static/

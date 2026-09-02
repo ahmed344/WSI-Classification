@@ -24,15 +24,25 @@ from torch.utils.data import DataLoader
 try:
     from .config_loader import allocate_training_run, load_config
     from .dataset import WSIBagDataset, collate_fn, create_bag_dataset
-    from .model import RawFeatureStatisticsPooler, TorchLogisticRegression
+    from .model import (
+        RawFeatureStatisticsPooler,
+        TorchLogisticRegression,
+        pooling_contract,
+        pooling_output_dim,
+    )
 except ImportError:
     from config_loader import allocate_training_run, load_config
     from dataset import WSIBagDataset, collate_fn, create_bag_dataset
-    from model import RawFeatureStatisticsPooler, TorchLogisticRegression
+    from model import (
+        RawFeatureStatisticsPooler,
+        TorchLogisticRegression,
+        pooling_contract,
+        pooling_output_dim,
+    )
 
 
-MODEL_SCHEMA = "raw_feature_statistics_cuda_logistic_regression_v2"
-POOLING_CONTRACT = "concat(population_mean, population_std); mask excludes padding"
+MODEL_SCHEMA = "raw_feature_statistics_cuda_logistic_regression_v3"
+LEGACY_MODEL_SCHEMA = "raw_feature_statistics_cuda_logistic_regression_v2"
 
 
 def seed_everything(seed: int) -> None:
@@ -422,8 +432,10 @@ def train_logistic_regression(config_path: Optional[str] = None) -> Dict[str, st
     )
     train_dataset.set_epoch(0)
     val_dataset.set_epoch(0)
+    pooling_statistics = list(config["pooling_statistics"])
     pooler = RawFeatureStatisticsPooler(
-        epsilon=float(config["pooling_population_std_epsilon"])
+        epsilon=float(config["pooling_population_std_epsilon"]),
+        statistics=pooling_statistics,
     )
     train_vectors, train_labels, _ = collect_pooled_vectors(
         create_dataloader(train_dataset, config), pooler
@@ -494,8 +506,11 @@ def train_logistic_regression(config_path: Optional[str] = None) -> Dict[str, st
         "class_folders": class_folders,
         "bag_level": str(config["bag_level"]),
         "input_dim": int(config["input_dim"]),
-        "pooling_dim": 2 * int(config["input_dim"]),
-        "pooling_contract": POOLING_CONTRACT,
+        "pooling_statistics": pooling_statistics,
+        "pooling_dim": pooling_output_dim(
+            int(config["input_dim"]), pooling_statistics
+        ),
+        "pooling_contract": pooling_contract(pooling_statistics),
         "pooling_population_std_epsilon": float(
             config["pooling_population_std_epsilon"]
         ),
@@ -534,8 +549,11 @@ def train_logistic_regression(config_path: Optional[str] = None) -> Dict[str, st
         "class_folders": class_folders,
         "bag_level": str(config["bag_level"]),
         "input_dim": int(config["input_dim"]),
-        "pooling_dim": 2 * int(config["input_dim"]),
-        "pooling_contract": POOLING_CONTRACT,
+        "pooling_statistics": pooling_statistics,
+        "pooling_dim": pooling_output_dim(
+            int(config["input_dim"]), pooling_statistics
+        ),
+        "pooling_contract": pooling_contract(pooling_statistics),
         "train_bags": len(train_dataset),
         "validation_bags": len(val_dataset),
         "test_evaluated": False,

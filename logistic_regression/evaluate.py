@@ -21,10 +21,17 @@ try:
         resolve_inference_run_paths,
     )
     from .dataset import WSIBagDataset, create_bag_dataset
-    from .model import RawFeatureStatisticsPooler, TorchLogisticRegression
+    from .model import (
+        DEFAULT_POOLING_STATISTICS,
+        RawFeatureStatisticsPooler,
+        TorchLogisticRegression,
+        normalize_pooling_statistics,
+        pooling_contract,
+        pooling_output_dim,
+    )
     from .train import (
+        LEGACY_MODEL_SCHEMA,
         MODEL_SCHEMA,
-        POOLING_CONTRACT,
         calculate_metrics,
         collect_pooled_vectors,
         create_dataloader,
@@ -36,16 +43,48 @@ except ImportError:
     import model as _model_module
     from config_loader import load_config, resolve_inference_run_paths
     from dataset import WSIBagDataset, create_bag_dataset
-    from model import RawFeatureStatisticsPooler, TorchLogisticRegression
+    from model import (
+        DEFAULT_POOLING_STATISTICS,
+        RawFeatureStatisticsPooler,
+        TorchLogisticRegression,
+        normalize_pooling_statistics,
+        pooling_contract,
+        pooling_output_dim,
+    )
     from train import (
+        LEGACY_MODEL_SCHEMA,
         MODEL_SCHEMA,
-        POOLING_CONTRACT,
         calculate_metrics,
         collect_pooled_vectors,
         create_dataloader,
         full_class_probabilities,
         json_safe,
         seed_everything,
+    )
+
+
+def resolve_checkpoint_pooling_statistics(loaded: Mapping[str, Any]) -> List[str]:
+    """Resolve pooling statistics from a v3 bundle or a v2 default.
+
+    Args:
+        loaded (Mapping[str, Any]): Checkpoint dictionary.
+
+    Returns:
+        List[str]: Ordered statistic names used to pool the checkpoint.
+    """
+    schema = loaded.get("model_schema")
+    raw = loaded.get("pooling_statistics")
+    if schema == MODEL_SCHEMA:
+        if raw is None:
+            raise ValueError("Checkpoint must contain pooling_statistics.")
+        return list(normalize_pooling_statistics(raw))
+    if schema == LEGACY_MODEL_SCHEMA:
+        if raw is None:
+            return list(DEFAULT_POOLING_STATISTICS)
+        return list(normalize_pooling_statistics(raw))
+    raise ValueError(
+        f"Checkpoint model_schema must be '{MODEL_SCHEMA}' or "
+        f"'{LEGACY_MODEL_SCHEMA}'; unsupported formats cannot be evaluated."
     )
 
 
@@ -65,10 +104,10 @@ def load_checkpoint_bundle(path: str | Path) -> Dict[str, Any]:
     loaded = joblib.load(source)
     if not isinstance(loaded, dict):
         raise ValueError("Checkpoint must contain a dictionary bundle.")
-    if loaded.get("model_schema") != MODEL_SCHEMA:
+    if loaded.get("model_schema") not in (MODEL_SCHEMA, LEGACY_MODEL_SCHEMA):
         raise ValueError(
-            f"Checkpoint model_schema must be '{MODEL_SCHEMA}'; "
-            "unsupported formats cannot be evaluated."
+            f"Checkpoint model_schema must be '{MODEL_SCHEMA}' or "
+            f"'{LEGACY_MODEL_SCHEMA}'; unsupported formats cannot be evaluated."
         )
     model = loaded.get("model")
     if not isinstance(model, TorchLogisticRegression):
@@ -94,10 +133,14 @@ def load_checkpoint_bundle(path: str | Path) -> Dict[str, Any]:
         raise ValueError("Checkpoint bag_level disagrees with embedded config.")
     input_dim = int(loaded.get("input_dim", -1))
     pooling_dim = int(loaded.get("pooling_dim", -1))
-    if input_dim <= 0 or pooling_dim != 2 * input_dim:
+    pooling_statistics = resolve_checkpoint_pooling_statistics(loaded)
+    if input_dim <= 0 or pooling_dim != pooling_output_dim(
+        input_dim, pooling_statistics
+    ):
         raise ValueError("Checkpoint input and pooling dimensions are inconsistent.")
-    if loaded.get("pooling_contract") != POOLING_CONTRACT:
+    if loaded.get("pooling_contract") != pooling_contract(pooling_statistics):
         raise ValueError("Checkpoint pooling contract is unsupported.")
+    loaded["pooling_statistics"] = pooling_statistics
     classifier_classes = np.asarray(model.classes_, dtype=np.int64)
     if (
         classifier_classes.ndim != 1
@@ -479,7 +522,8 @@ def evaluate_checkpoint(
     )
     splits = ["val", "test"] + (["train"] if train_diagnostic else [])
     pooler = RawFeatureStatisticsPooler(
-        epsilon=float(bundle["pooling_population_std_epsilon"])
+        epsilon=float(bundle["pooling_population_std_epsilon"]),
+        statistics=list(bundle["pooling_statistics"]),
     )
     results: Dict[str, Any] = {}
     for level in levels:
