@@ -8,6 +8,7 @@ from typing import Any, Dict, Mapping, MutableMapping, Optional, Sequence
 
 import yaml
 
+from .panther_dataset import BAG_LEVELS
 from .panther_model import OUTPUT_TYPES
 
 
@@ -27,6 +28,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         raise ValueError(f"Configuration '{path}' must contain a YAML mapping.")
 
     config: Dict[str, Any] = dict(loaded)
+    _apply_level_defaults(config)
     _validate(config)
     config["input_dim"] = _mapped_value(
         config, "feature_model_input_dims", int
@@ -41,6 +43,31 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     _resolve_paths(config, path.parent)
     config["config_path"] = str(path)
     return config
+
+
+def _apply_level_defaults(config: Dict[str, Any]) -> None:
+    """Fill missing level and post-training keys so older YAML files still load.
+
+    Args:
+        config (Dict[str, Any]): Loaded, still unresolved configuration mapping.
+
+    Returns:
+        None: Matching sections are updated in place.
+    """
+    prototype = config.get("prototype")
+    if isinstance(prototype, MutableMapping):
+        prototype.setdefault("bag_level", "slide")
+    training = config.get("training")
+    if isinstance(training, MutableMapping):
+        training.setdefault("bag_level", "slide")
+        training.setdefault("checkpoint_level", str(training["bag_level"]))
+    evaluation = config.get("evaluation")
+    if isinstance(evaluation, MutableMapping):
+        evaluation.setdefault("bag_levels", ["slide"])
+        evaluation.setdefault("run_after_training", False)
+    visualization = config.get("visualization")
+    if isinstance(visualization, MutableMapping):
+        visualization.setdefault("run_after_training", False)
 
 
 def allocate_training_run(config: Dict[str, Any]) -> Path:
@@ -136,6 +163,7 @@ def _validate(config: Mapping[str, Any]) -> None:
         raise ValueError("max_tiles_per_slide must be a positive integer or null.")
 
     prototype = _section(config, "prototype")
+    _choice(prototype, "bag_level", BAG_LEVELS)
     _choice(prototype, "method", ("kmeans",))
     for key in (
         "num_prototypes", "patches_per_prototype", "max_iterations",
@@ -169,6 +197,8 @@ def _validate(config: Mapping[str, Any]) -> None:
         raise ValueError("model.em_chunk_size must be a positive integer or null.")
 
     training = _section(config, "training")
+    _choice(training, "bag_level", BAG_LEVELS)
+    _choice(training, "checkpoint_level", BAG_LEVELS)
     for key in ("epochs", "batch_size", "gradient_accumulation_steps"):
         _positive_int(training, key)
     _nonnegative_int(training, "warmup_epochs")
@@ -180,17 +210,40 @@ def _validate(config: Mapping[str, Any]) -> None:
         raise ValueError("training.input_dropout must be in [0, 1).")
     _choice(training, "optimizer", ("adamw", "sgd"))
     _choice(training, "scheduler", ("cosine", "linear", "constant"))
-    _choice(training, "checkpoint_selection", ("last", "best_val_loss"))
+    _choice(
+        training,
+        "checkpoint_selection",
+        (
+            "last",
+            "best_val_loss",
+            "best_val_accuracy",
+            "best_val_balanced_accuracy",
+            "best_val_macro_f1",
+        ),
+    )
     for key in ("classifier_bias", "class_weighted_loss"):
         if not isinstance(training.get(key), bool):
             raise ValueError(f"training.{key} must be a boolean.")
 
     evaluation = _section(config, "evaluation")
+    bag_levels = evaluation.get("bag_levels")
+    if (
+        not isinstance(bag_levels, list)
+        or not bag_levels
+        or any(level not in BAG_LEVELS for level in bag_levels)
+        or len(set(bag_levels)) != len(bag_levels)
+    ):
+        raise ValueError(
+            "evaluation.bag_levels must be a nonempty unique list containing "
+            f"values from {BAG_LEVELS}."
+        )
     splits = evaluation.get("splits")
     if not isinstance(splits, list) or not splits or any(s not in SPLITS for s in splits):
         raise ValueError("evaluation.splits must be a nonempty split-name list.")
     if not isinstance(evaluation.get("include_train"), bool):
         raise ValueError("evaluation.include_train must be a boolean.")
+    if not isinstance(evaluation.get("run_after_training"), bool):
+        raise ValueError("evaluation.run_after_training must be a boolean.")
     _positive_int(evaluation, "confusion_matrix_dpi")
 
     visualization = _section(config, "visualization")
@@ -209,6 +262,8 @@ def _validate(config: Mapping[str, Any]) -> None:
         raise ValueError("visualization.save_mixture_proportions must be a boolean.")
     if not isinstance(visualization.get("save_individual_tissues"), bool):
         raise ValueError("visualization.save_individual_tissues must be a boolean.")
+    if not isinstance(visualization.get("run_after_training"), bool):
+        raise ValueError("visualization.run_after_training must be a boolean.")
 
     runtime = _section(config, "runtime")
     _choice(runtime, "device", ("auto", "cuda", "cpu"))

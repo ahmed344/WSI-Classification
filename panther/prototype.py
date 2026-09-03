@@ -12,15 +12,15 @@ import numpy as np
 import torch
 from sklearn.cluster import KMeans
 
-from .panther_dataset import PantherSlideDataset, stable_seed
+from .panther_dataset import PantherBagDataset, stable_seed
 
 
 def fit_prototypes(
-    dataset: PantherSlideDataset,
+    dataset: PantherBagDataset,
     config: Mapping[str, Any],
     destination: Path,
 ) -> tuple[torch.Tensor, Dict[str, Any]]:
-    """Sample slides evenly and fit the configured full sklearn K-means model."""
+    """Sample configured training bags evenly and fit the sklearn K-means model."""
     settings = config["prototype"]
     num_prototypes = int(settings["num_prototypes"])
     target = num_prototypes * int(settings["patches_per_prototype"])
@@ -34,7 +34,7 @@ def fit_prototypes(
         item = dataset[index]
         features = item["features"]
         generator = torch.Generator().manual_seed(
-            stable_seed(int(config["random_seed"]), item["slide_key"], "prototype")
+            stable_seed(int(config["random_seed"]), item["bag_key"], "prototype")
         )
         take = min(per_slide, int(features.shape[0]), target - offset)
         selected = torch.randperm(int(features.shape[0]), generator=generator)[:take]
@@ -42,7 +42,8 @@ def fit_prototypes(
         offset += take
         if (index + 1) % 25 == 0 or index + 1 == len(dataset):
             print(
-                f"Prototype sampling: {index + 1}/{len(dataset)} slides, "
+                f"Prototype sampling: {index + 1}/{len(dataset)} "
+                f"{dataset.bag_level} bags, "
                 f"{offset:,}/{target:,} patches"
             )
     if offset < num_prototypes:
@@ -76,6 +77,7 @@ def fit_prototypes(
         "iterations": int(kmeans.n_iter_),
         "elapsed_seconds": float(time.time() - started),
         "random_seed": int(config["random_seed"]),
+        "bag_level": dataset.bag_level,
         "feature_normalization": str(config["feature_normalization"]),
     }
     destination.parent.mkdir(parents=True, exist_ok=True)

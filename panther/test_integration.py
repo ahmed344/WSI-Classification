@@ -9,7 +9,6 @@ import torch
 import yaml
 from PIL import Image
 
-from panther.evaluate_panther import run_evaluation
 from panther.panther_dataset import build_datasets
 from panther.panther_model import LinearClassifier, PANTHER
 from panther.prototype import fit_prototypes
@@ -54,6 +53,7 @@ def _config(root: Path) -> dict:
         "max_tiles_per_slide": None,
         "tile_sampling": "random",
         "prototype": {
+            "bag_level": "slide",
             "method": "kmeans",
             "num_prototypes": 2,
             "patches_per_prototype": 8,
@@ -71,6 +71,8 @@ def _config(root: Path) -> dict:
             "em_chunk_size": 3,
         },
         "training": {
+            "bag_level": "slide",
+            "checkpoint_level": "slide",
             "epochs": 2,
             "batch_size": 4,
             "learning_rate": 1e-3,
@@ -101,11 +103,45 @@ def _write_data(root: Path) -> None:
         for slide_index in range(8):
             slide = root / class_name / f"slide_{slide_index:02d}"
             slide.mkdir(parents=True)
-            features = torch.randn(6, 4, generator=generator) + 4 * class_index
-            torch.save(features, slide / "tissue_features.pt")
-            pd.DataFrame({"x": range(6), "y": range(6)}).to_csv(
-                slide / "tissue_tiles.csv", index=False
-            )
+            for tissue_index in range(2):
+                features = (
+                    torch.randn(6, 4, generator=generator)
+                    + 4 * class_index
+                    + 0.1 * tissue_index
+                )
+                name = f"tissue_{tissue_index}"
+                torch.save(features, slide / f"{name}_features.pt")
+                pd.DataFrame({"x": range(6), "y": range(6)}).to_csv(
+                    slide / f"{name}_tiles.csv", index=False
+                )
+
+
+def test_tissue_and_slide_bag_views_share_slide_splits(tmp_path: Path) -> None:
+    """Verify bag levels change units without introducing split leakage."""
+    data_root = tmp_path / "data"
+    _write_data(data_root)
+    config = _config(data_root)
+    slide_datasets, classes, records = build_datasets(config, bag_level="slide")
+    assignments = {record["slide_key"]: record["split"] for record in records}
+    tissue_datasets, tissue_classes, _ = build_datasets(
+        config,
+        class_folders=classes,
+        split_assignments=assignments,
+        bag_level="tissue",
+    )
+
+    assert tissue_classes == classes
+    assert len(tissue_datasets["train"]) == 2 * len(slide_datasets["train"])
+    for split in ("train", "val", "test"):
+        assert {
+            record["slide_key"] for record in tissue_datasets[split].records
+        } == {
+            record["slide_key"] for record in slide_datasets[split].records
+        }
+        assert all(
+            len(record["tissues"]) == 1
+            for record in tissue_datasets[split].records
+        )
 
 
 def test_panther_map_em_shapes_probabilities_and_chunk_invariance() -> None:
@@ -274,7 +310,9 @@ def test_small_pipeline_is_independent_and_trainable(tmp_path: Path) -> None:
     assert (model_dir / "best_validation_model.pth").is_file()
 
 
-def test_training_and_evaluation_run_every_requested_output(tmp_path: Path) -> None:
+def test_training_and_evaluation_run_every_requested_output(
+    tmp_path: Path, capsys
+) -> None:
     """Verify one run trains every representation and copies the val-bacc winner.
 
     Args:
@@ -288,6 +326,14 @@ def test_training_and_evaluation_run_every_requested_output(tmp_path: Path) -> N
     _write_data(data_root)
     run_dir = tmp_path / "run"
     config = _config(data_root)
+    config["prototype"]["bag_level"] = "tissue"
+    config["training"].update(
+        {
+            "bag_level": "tissue",
+            "checkpoint_level": "slide",
+            "checkpoint_selection": "best_val_balanced_accuracy",
+        }
+    )
     config.update(
         {
             "output_dir": str(tmp_path / "results"),
@@ -295,11 +341,14 @@ def test_training_and_evaluation_run_every_requested_output(tmp_path: Path) -> N
             "feature_model_suffixes": {"default": "_features.pt"},
             "feature_model_input_dims": {"default": 4},
             "evaluation": {
+                "run_after_training": True,
+                "bag_levels": ["tissue", "slide"],
                 "splits": ["test"],
                 "include_train": False,
                 "confusion_matrix_dpi": 50,
             },
             "visualization": {
+                "run_after_training": False,
                 "split": "test",
                 "max_slides": 1,
                 "tile_size": 448,
@@ -327,21 +376,34 @@ def test_training_and_evaluation_run_every_requested_output(tmp_path: Path) -> N
         yaml.safe_dump(config, handle)
 
     assert run_training(str(config_path)) == run_dir.resolve()
+    output = capsys.readouterr().out
+    assert "Epoch metric order: train_tissue, val_tissue, val_slide" in output
+    assert "| loss=" in output
+    assert "| acc=" in output
+    assert "| bal_acc=" in output
     output_types = ("allcat", "pi", "mean", "variance")
     assert set(component_embedding_paths(run_dir)) == {"pi", "mean", "variance"}
+    assert all(
+        path.is_file()
+        for path in component_embedding_paths(run_dir, "tissue").values()
+    )
     for output_type in output_types:
         model_dir = run_dir / "models" / output_type
         assert (model_dir / "best_model.pth").is_file()
         assert (model_dir / "training_history.json").is_file()
         assert (model_dir / "training_history.png").is_file()
 
-    manifest = run_evaluation(str(config_path))
+    with (run_dir / "evaluation_results" / "evaluation_manifest.json").open(
+        encoding="utf-8"
+    ) as handle:
+        manifest = json.load(handle)
     assert manifest["output_types"] == list(output_types)
     assert set(manifest["results"]) == set(output_types)
     for output_type in output_types:
         evaluation_dir = run_dir / "evaluation_results" / output_type
         assert (evaluation_dir / "evaluation_manifest.json").is_file()
         assert (evaluation_dir / "slide_test_predictions.csv").is_file()
+        assert (evaluation_dir / "tissue_test_predictions.csv").is_file()
 
     histories = {}
     trained_models = {}
@@ -367,7 +429,14 @@ def test_training_and_evaluation_run_every_requested_output(tmp_path: Path) -> N
         checkpoint["training_details"]["input_dim"]
         == trained_models[winner]["training_details"]["input_dim"]
     )
-    assert selection["metric"] == "val_balanced_accuracy"
+    assert selection["metric"] == "val_slide_balanced_accuracy"
+    assert checkpoint["training_details"]["training_level"] == "tissue"
+    assert checkpoint["training_details"]["checkpoint_level"] == "slide"
+    assert checkpoint["prototype_metadata"]["bag_level"] == "tissue"
+    assert all(
+        {"train", "val_tissue", "val_slide"} <= set(entry)
+        for entry in histories[winner]
+    )
 
 
 def test_official_visualization_palette_and_center_coordinate_overlay() -> None:
@@ -539,4 +608,3 @@ def test_assignment_outputs_are_flat_under_split_and_mixture_is_optional(
     color_map = get_default_color_map(2)
     save_mixture_plot(np.asarray([0.7, 0.3]), color_map, mixture, dpi=50)
     assert mixture.is_file()
-

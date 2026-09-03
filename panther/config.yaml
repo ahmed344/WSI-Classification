@@ -6,6 +6,9 @@
 # model package is imported. Run from the repository root with:
 #   python -m panther.train_panther --config panther/config.yaml
 #   python -m panther.evaluate_panther --config panther/config.yaml
+#   python -m panther.visualize_assignments --config panther/config.yaml
+# Training also runs evaluation when evaluation.run_after_training is true, and
+# visualization when visualization.run_after_training is true.
 
 # Input data. The expected layout is data_root/class_name/slide_name/*.pt.
 data_root: "/workspaces/WSI-Classification/data/HE-MYO/Processed"
@@ -39,16 +42,19 @@ feature_normalization: "none"  # Options: none, l2
 max_tiles_per_slide: null       # null uses all tiles; positive integer caps each slide
 tile_sampling: "random"        # Options when capped: random, uniform, first
 
-# Step 1: global morphological prototype construction on training slides only.
+# Step 1: global morphological prototype construction on training data only.
 prototype:
+  # Bag unit used to balance tile sampling before K-means. This is independent
+  # from classifier fitting and checkpoint selection.
+  bag_level: "slide"             # Options: tissue, slide
   method: "kmeans"              # Faithful CPU sklearn K-means implementation
   num_prototypes: 16            # C=16 is the paper's default supervised setting
-  patches_per_prototype: 10000  # At most 160,000 balanced training patches in total
+  patches_per_prototype: 10000  # At most num_prototypes * patches_per_prototype balanced training patches in total
   max_iterations: 50
   num_initializations: 5
   algorithm: "lloyd"            # sklearn options: lloyd, elkan
 
-# Step 2: per-slide diagonal Gaussian-mixture MAP-EM representation.
+# Step 2: per-bag diagonal Gaussian-mixture MAP-EM representation.
 model:
   em_iterations: 1              # Original downstream scripts use one EM update
   tau: 1.0                      # Strength of the prototype-centered conjugate prior
@@ -58,12 +64,17 @@ model:
   # flattened diagonal-variance block; "allcat" concatenates all three blocks.
   output_type: ["allcat", "pi", "mean", "variance"]
   fix_prototypes: true           # Preserve training-only K-means centroids
-  em_chunk_size: 65536           # Tile chunk size; null evaluates a slide in one block
+  em_chunk_size: 65536           # Tile chunk size; null evaluates a bag in one block
 
 # Step 3: original bias-free linear downstream classifier.
 training:
-  epochs: 200
-  batch_size: 256
+  # The linear head can be fit at either level, independently of K-means.
+  bag_level: "tissue"            # Options: tissue, slide
+  # Every epoch validates both levels; this chooses which validation stream
+  # controls the per-head checkpoint and run-root head selection.
+  checkpoint_level: "tissue"      # Options: tissue, slide
+  epochs: 500
+  batch_size: 512
   learning_rate: 0.0001
   weight_decay: 0.00001
   optimizer: "adamw"             # Options: adamw, sgd
@@ -74,14 +85,17 @@ training:
   classifier_bias: false
   class_weighted_loss: true
   # "last" matches the official no-early-stopping classification workflow.
-  # "best_val_loss" evaluates the lowest-validation-loss epoch instead.
+  # The best_val_* options select the best epoch using checkpoint_level.
+  # Supported metrics: loss, accuracy, balanced_accuracy, and macro_f1.
   # Each models/<output_type>/best_model.pth follows this rule. The run-root
   # best_model.pth then copies the selected-epoch head with the highest
   # validation balanced accuracy (ties: lower val loss, then config order).
-  checkpoint_selection: "last"
+  checkpoint_selection: "best_val_balanced_accuracy"
 
 # Evaluation outputs mirror CLAM: JSON report, CSV/JSON predictions, and matrix PNG.
 evaluation:
+  run_after_training: true      # When true, train_panther runs evaluation after saving the checkpoint
+  bag_levels: ["tissue", "slide"]
   splits: ["val", "test"]
   include_train: false
   confusion_matrix_dpi: 300
@@ -91,6 +105,7 @@ evaluation:
 # categorical palette. Here a slide-level GMM is rendered over every aligned
 # tissue image belonging to that slide.
 visualization:
+  run_after_training: false     # When true, train_panther runs visualization after training (and evaluation if both are enabled)
   split: "test"                 # Options: train, val, test
   max_slides: null              # null renders the complete selected split
   tile_size: 448                # Stored CSV coordinates are tile centers
@@ -113,4 +128,3 @@ paths:
   checkpoint: null
   evaluation_output: null
   visualization_output: null
-

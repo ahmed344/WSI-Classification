@@ -36,6 +36,7 @@ def evaluate_arrays(
     class_names: Sequence[str],
     device: torch.device,
     batch_size: int,
+    bag_level: str = "slide",
 ) -> tuple[Dict[str, Any], np.ndarray]:
     model.eval()
     loader = DataLoader(
@@ -54,11 +55,13 @@ def evaluate_arrays(
     probability_array = torch.cat(probabilities).numpy()
     metrics = classification_metrics(labels_all, probability_array, class_names)
     metrics["loss"] = loss_total / len(labels_all)
-    metrics["num_slides"] = len(labels_all)
+    metrics["num_bags"] = len(labels_all)
+    metrics[f"num_{bag_level}s"] = len(labels_all)
     return metrics, probability_array
 
 
 def save_split_results(
+    bag_level: str,
     split: str,
     metrics: Mapping[str, Any],
     probabilities: np.ndarray,
@@ -68,10 +71,10 @@ def save_split_results(
     dpi: int,
 ) -> Dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = output_dir / f"slide_{split}_evaluation.json"
-    predictions_csv = output_dir / f"slide_{split}_predictions.csv"
-    predictions_json = output_dir / f"slide_{split}_predictions.json"
-    matrix_path = output_dir / f"slide_{split}_confusion_matrix.png"
+    summary_path = output_dir / f"{bag_level}_{split}_evaluation.json"
+    predictions_csv = output_dir / f"{bag_level}_{split}_predictions.csv"
+    predictions_json = output_dir / f"{bag_level}_{split}_predictions.json"
+    matrix_path = output_dir / f"{bag_level}_{split}_confusion_matrix.png"
 
     summary = dict(metrics)
     predictions = list(summary.pop("predictions"))
@@ -83,8 +86,12 @@ def save_split_results(
     for index, label in enumerate(labels):
         prediction = int(predictions[index])
         row: Dict[str, Any] = {
+            "bag_level": bag_level,
+            "bag_name": cache["bag_names"][index],
+            "bag_key": cache["bag_keys"][index],
             "slide_name": cache["slide_names"][index],
             "slide_key": cache["slide_keys"][index],
+            "tissue_names": json.dumps(cache["tissue_names"][index]),
             "num_tiles": int(cache["tile_counts"][index]),
             "true_label": int(label),
             "predicted_label": prediction,
@@ -118,7 +125,7 @@ def save_split_results(
     )
     axis.set_xlabel("Predicted")
     axis.set_ylabel("Actual")
-    axis.set_title(f"PANTHER slide-level {split} confusion matrix")
+    axis.set_title(f"PANTHER {bag_level}-level {split} confusion matrix")
     figure.tight_layout()
     figure.savefig(matrix_path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
@@ -150,31 +157,64 @@ def run_evaluation(config_path: str | None = None) -> Dict[str, Any]:
     saved_classes, assignments = load_split_manifest(manifest_path)
     if saved_classes != class_names:
         raise ValueError("Checkpoint classes disagree with the split manifest.")
-    datasets, discovered_classes, _ = build_datasets(
+    slide_datasets, discovered_classes, _ = build_datasets(
         checkpoint_config,
         class_folders=class_names,
         split_assignments=assignments,
+        bag_level="slide",
     )
     if discovered_classes != class_names:
         raise ValueError("Current dataset class order disagrees with the checkpoint.")
 
-    cache_paths = component_embedding_paths(run_dir)
-    missing_caches = [path for path in cache_paths.values() if not path.is_file()]
+    requested_levels = list(runtime_config["evaluation"]["bag_levels"])
+    datasets_by_level = {"slide": slide_datasets}
+    if "tissue" in requested_levels:
+        tissue_datasets, tissue_classes, _ = build_datasets(
+            checkpoint_config,
+            class_folders=class_names,
+            split_assignments=assignments,
+            bag_level="tissue",
+        )
+        if tissue_classes != class_names:
+            raise ValueError("Tissue and slide datasets disagree on class order.")
+        datasets_by_level["tissue"] = tissue_datasets
+    cache_paths = {
+        level: component_embedding_paths(run_dir, level)
+        for level in requested_levels
+    }
+    missing_caches = [
+        path
+        for level_paths in cache_paths.values()
+        for path in level_paths.values()
+        if not path.is_file()
+    ]
     if missing_caches:
         raise FileNotFoundError(
-            f"Slide embedding caches are missing: {missing_caches}. Re-run training."
+            f"PANTHER embedding caches are missing: {missing_caches}. Re-run training."
         )
     component_embeddings = {
-        component: torch.load(path, map_location="cpu", weights_only=False)
-        for component, path in cache_paths.items()
+        level: {
+            component: torch.load(path, map_location="cpu", weights_only=False)
+            for component, path in level_paths.items()
+        }
+        for level, level_paths in cache_paths.items()
     }
-    for component, embeddings in component_embeddings.items():
-        for split, dataset in datasets.items():
-            expected_keys = [record["slide_key"] for record in dataset.records]
-            if embeddings[split]["slide_keys"] != expected_keys:
-                raise ValueError(
-                    f"{component} embedding cache does not match the {split} manifest."
-                )
+    for level, level_embeddings in component_embeddings.items():
+        for component, embeddings in level_embeddings.items():
+            for split, dataset in datasets_by_level[level].items():
+                expected_keys = [
+                    (
+                        f"{record['slide_key']}/{record['tissues'][0]['tissue_name']}"
+                        if level == "tissue"
+                        else record["slide_key"]
+                    )
+                    for record in dataset.records
+                ]
+                if embeddings[split]["bag_keys"] != expected_keys:
+                    raise ValueError(
+                        f"{component} {level} embedding cache does not match "
+                        f"the {split} manifest."
+                    )
 
     models = checkpoint.get("models")
     output_types = checkpoint.get("output_types")
@@ -200,7 +240,6 @@ def run_evaluation(config_path: str | None = None) -> Dict[str, Any]:
         model_payload = models[output_type]
         if not isinstance(model_payload, Mapping):
             raise ValueError(f"Invalid model payload for output_type={output_type}.")
-        embeddings = compose_slide_embeddings(component_embeddings, output_type)
         training_details = model_payload.get("training_details")
         if not isinstance(training_details, Mapping):
             raise ValueError(f"Missing training details for output_type={output_type}.")
@@ -212,42 +251,54 @@ def run_evaluation(config_path: str | None = None) -> Dict[str, Any]:
         model.load_state_dict(model_payload["model_state_dict"], strict=True)
         type_output_dir = output_dir / output_type
         type_results: Dict[str, Any] = {}
-        for split in requested_splits:
-            split_cache = embeddings[split]
-            metrics, probabilities = evaluate_arrays(
-                model,
-                split_cache["representations"],
-                split_cache["labels"],
-                class_names,
-                device,
-                int(checkpoint_config["training"]["batch_size"]),
+        for level in requested_levels:
+            embeddings = compose_slide_embeddings(
+                component_embeddings[level], output_type
             )
-            artifacts = save_split_results(
-                split,
-                metrics,
-                probabilities,
-                split_cache,
-                class_names,
-                type_output_dir,
-                int(runtime_config["evaluation"]["confusion_matrix_dpi"]),
-            )
-            printable_auc = metrics["multiclass_roc_auc"]
-            auc_text = "not valid" if printable_auc is None else f"{printable_auc:.4f}"
-            print(
-                f"{output_type}/slide/{split}: n={len(datasets[split])} "
-                f"{class_counts(datasets[split])} accuracy={metrics['accuracy']:.4f} "
-                f"balanced_accuracy={metrics['balanced_accuracy']:.4f} "
-                f"macro_f1={metrics['macro_f1']:.4f} auc={auc_text}"
-            )
-            compact = dict(metrics)
-            compact.pop("predictions")
-            type_results[f"slide/{split}"] = {**compact, "artifacts": artifacts}
+            for split in requested_splits:
+                split_cache = embeddings[split]
+                metrics, probabilities = evaluate_arrays(
+                    model,
+                    split_cache["representations"],
+                    split_cache["labels"],
+                    class_names,
+                    device,
+                    int(checkpoint_config["training"]["batch_size"]),
+                    bag_level=level,
+                )
+                artifacts = save_split_results(
+                    level,
+                    split,
+                    metrics,
+                    probabilities,
+                    split_cache,
+                    class_names,
+                    type_output_dir,
+                    int(runtime_config["evaluation"]["confusion_matrix_dpi"]),
+                )
+                printable_auc = metrics["multiclass_roc_auc"]
+                auc_text = (
+                    "not valid" if printable_auc is None else f"{printable_auc:.4f}"
+                )
+                dataset = datasets_by_level[level][split]
+                print(
+                    f"{output_type}/{level}/{split}: n={len(dataset)} "
+                    f"{class_counts(dataset)} accuracy={metrics['accuracy']:.4f} "
+                    f"balanced_accuracy={metrics['balanced_accuracy']:.4f} "
+                    f"macro_f1={metrics['macro_f1']:.4f} auc={auc_text}"
+                )
+                compact = dict(metrics)
+                compact.pop("predictions")
+                type_results[f"{level}/{split}"] = {
+                    **compact,
+                    "artifacts": artifacts,
+                }
 
         type_manifest = {
             "checkpoint": str(checkpoint_path),
             "model_schema": MODEL_SCHEMA,
             "class_folders": class_names,
-            "bag_level": "slide",
+            "bag_levels": requested_levels,
             "native_panther_representation": output_type,
             "results": type_results,
         }
@@ -263,7 +314,7 @@ def run_evaluation(config_path: str | None = None) -> Dict[str, Any]:
         "checkpoint": str(checkpoint_path),
         "model_schema": MODEL_SCHEMA,
         "class_folders": class_names,
-        "bag_level": "slide",
+        "bag_levels": requested_levels,
         "output_types": output_types,
         "evaluation_directories": evaluation_directories,
         "results": all_results,
@@ -283,4 +334,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

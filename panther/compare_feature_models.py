@@ -650,9 +650,6 @@ def run_feature_model_comparison(
                     prototype_count,
                     run_dir=matching,
                 )
-                if not has_complete_evaluation(matching, output_types):
-                    print(f"Evaluating reused run {matching.name}")
-                    run_evaluation(str(yaml_path))
                 run_dir = matching
                 reused = True
             else:
@@ -670,8 +667,10 @@ def run_feature_model_comparison(
                     prototype_count,
                     run_dir=run_dir,
                 )
-                run_evaluation(str(yaml_path))
                 reused = False
+            if not has_complete_evaluation(run_dir, output_types):
+                print(f"Evaluating run {run_dir.name}")
+                run_evaluation(str(yaml_path))
             if not has_complete_evaluation(run_dir, output_types):
                 raise FileNotFoundError(
                     f"Incomplete evaluation artifacts in {run_dir}."

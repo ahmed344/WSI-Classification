@@ -24,7 +24,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from .config_loader import allocate_training_run, load_config
 from .metrics import classification_metrics
 from .panther_dataset import (
-    PantherSlideDataset,
+    BAG_LEVELS,
+    PantherBagDataset,
     build_datasets,
     class_counts,
     save_split_manifest,
@@ -33,7 +34,7 @@ from .panther_model import LinearClassifier, PANTHER
 from .prototype import fit_prototypes
 
 
-MODEL_SCHEMA = "panther-original-v2"
+MODEL_SCHEMA = "panther-original-v3"
 EMBEDDING_COMPONENT_KEYS = {
     "pi": "mixture_weights",
     "mean": "means",
@@ -87,10 +88,14 @@ def create_panther(
     )
 
 
-def component_embedding_paths(directory: Path) -> Dict[str, Path]:
-    """Return the three persistent component-cache paths for one run."""
+def component_embedding_paths(
+    directory: Path, bag_level: str = "slide"
+) -> Dict[str, Path]:
+    """Return the three persistent component-cache paths for one bag level."""
+    if bag_level not in BAG_LEVELS:
+        raise ValueError(f"bag_level must be one of {BAG_LEVELS}, received {bag_level}.")
     return {
-        component: directory / f"slide_embeddings_{component}.pt"
+        component: directory / f"{bag_level}_embeddings_{component}.pt"
         for component in EMBEDDING_COMPONENT_KEYS
     }
 
@@ -134,12 +139,16 @@ def compose_slide_embeddings(
 
 @torch.no_grad()
 def aggregate_slide_embeddings(
-    datasets: Mapping[str, PantherSlideDataset],
+    datasets: Mapping[str, PantherBagDataset],
     panther: PANTHER,
     device: torch.device,
     destination: Path,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Encode each slide once and persist pi, mean, and variance separately."""
+    """Encode every bag at one level and persist its PANTHER components."""
+    levels = {dataset.bag_level for dataset in datasets.values()}
+    if len(levels) != 1:
+        raise ValueError(f"All datasets must use one bag level, received {levels}.")
+    bag_level = levels.pop()
     panther.eval().to(device)
     payloads: Dict[str, Dict[str, Dict[str, Any]]] = {
         component: {} for component in EMBEDDING_COMPONENT_KEYS
@@ -152,6 +161,9 @@ def aggregate_slide_embeddings(
         labels = []
         slide_names = []
         slide_keys = []
+        bag_names = []
+        bag_keys = []
+        tissue_names = []
         tile_counts = []
         for index in range(len(dataset)):
             item = dataset[index]
@@ -167,13 +179,23 @@ def aggregate_slide_embeddings(
             labels.append(int(item["label"]))
             slide_names.append(str(item["slide_name"]))
             slide_keys.append(str(item["slide_key"]))
+            bag_names.append(str(item["bag_name"]))
+            bag_keys.append(str(item["bag_key"]))
+            tissue_names.append(list(item["tissue_names"]))
             tile_counts.append(int(item["num_tiles"]))
             if (index + 1) % 25 == 0 or index + 1 == len(dataset):
-                print(f"PANTHER aggregation {split}: {index + 1}/{len(dataset)} slides")
+                print(
+                    f"PANTHER aggregation {bag_level}/{split}: "
+                    f"{index + 1}/{len(dataset)} bags"
+                )
         metadata = {
+            "bag_level": bag_level,
+            "bag_names": bag_names,
+            "bag_keys": bag_keys,
             "labels": torch.tensor(labels, dtype=torch.long),
             "slide_names": slide_names,
             "slide_keys": slide_keys,
+            "tissue_names": tissue_names,
             "tile_counts": tile_counts,
             "elapsed_seconds": float(time.time() - started),
         }
@@ -184,7 +206,7 @@ def aggregate_slide_embeddings(
             }
 
     destination.mkdir(parents=True, exist_ok=True)
-    for component, path in component_embedding_paths(destination).items():
+    for component, path in component_embedding_paths(destination, bag_level).items():
         torch.save(payloads[component], path)
     return payloads
 
@@ -291,8 +313,28 @@ def train_classifier(
     config: Mapping[str, Any],
     device: torch.device,
     model_dir: Path,
+    validation_embeddings: Mapping[
+        str, Mapping[str, Mapping[str, Any]]
+    ] | None = None,
 ) -> tuple[LinearClassifier, list[Dict[str, Any]], Dict[str, Any]]:
     settings = config["training"]
+    training_level = str(settings.get("bag_level", "slide"))
+    checkpoint_level = str(settings.get("checkpoint_level", training_level))
+    if training_level not in BAG_LEVELS or checkpoint_level not in BAG_LEVELS:
+        raise ValueError(
+            f"Training/checkpoint levels must be in {BAG_LEVELS}; received "
+            f"{training_level}/{checkpoint_level}."
+        )
+    validation_by_level = (
+        dict(validation_embeddings)
+        if validation_embeddings is not None
+        else {level: embeddings for level in BAG_LEVELS}
+    )
+    missing_levels = [
+        level for level in BAG_LEVELS if level not in validation_by_level
+    ]
+    if missing_levels:
+        raise ValueError(f"Missing validation embeddings for levels: {missing_levels}.")
     model_dir.mkdir(parents=True, exist_ok=True)
     train_data = embeddings["train"]
     input_dim = int(train_data["representations"].shape[1])
@@ -311,7 +353,11 @@ def train_classifier(
     loss_fn = nn.CrossEntropyLoss(weight=weights)
 
     history: list[Dict[str, Any]] = []
+    selection = str(settings["checkpoint_selection"])
+    metric_key, maximize = _checkpoint_metric(selection)
+    best_value = -float("inf") if maximize else float("inf")
     best_loss = float("inf")
+    best_loss_epoch = -1
     best_state: Dict[str, torch.Tensor] | None = None
     best_epoch = -1
     for epoch in range(int(settings["epochs"])):
@@ -328,33 +374,53 @@ def train_classifier(
             int(settings["gradient_accumulation_steps"]),
             float(settings["input_dropout"]),
         )
-        val_data = embeddings["val"]
-        val_metrics = _classifier_pass(
-            model,
-            val_data["representations"],
-            val_data["labels"],
-            class_names,
-            device,
-            int(settings["batch_size"]),
-            loss_fn,
-        )
+        validation_metrics: Dict[str, Dict[str, Any]] = {}
+        for level in BAG_LEVELS:
+            val_data = validation_by_level[level]["val"]
+            validation_metrics[level] = _classifier_pass(
+                model,
+                val_data["representations"],
+                val_data["labels"],
+                class_names,
+                device,
+                int(settings["batch_size"]),
+                loss_fn,
+            )
+        selected_validation = validation_metrics[checkpoint_level]
         entry = {
             "epoch": epoch + 1,
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "train": train_metrics,
-            "val": val_metrics,
+            "val_tissue": validation_metrics["tissue"],
+            "val_slide": validation_metrics["slide"],
+            # Compatibility alias: validation at the configured checkpoint level.
+            "val": selected_validation,
         }
         history.append(entry)
-        if float(val_metrics["loss"]) < best_loss:
-            best_loss = float(val_metrics["loss"])
+        current = float(selected_validation[metric_key])
+        current_loss = float(selected_validation["loss"])
+        if current_loss < best_loss:
+            best_loss = current_loss
+            best_loss_epoch = epoch + 1
+        improved = current > best_value if maximize else current < best_value
+        if improved:
+            best_value = current
             best_epoch = epoch + 1
             best_state = copy.deepcopy(model.state_dict())
         print(
-            f"Epoch {epoch + 1:03d}/{settings['epochs']} "
-            f"train_loss={train_metrics['loss']:.5f} "
-            f"train_bacc={train_metrics['balanced_accuracy']:.4f} "
-            f"val_loss={val_metrics['loss']:.5f} "
-            f"val_bacc={val_metrics['balanced_accuracy']:.4f}"
+            f"epoch={epoch + 1} | "
+            f"loss={train_metrics['loss']:.5f}, "
+            f"{validation_metrics['tissue']['loss']:.5f}, "
+            f"{validation_metrics['slide']['loss']:.5f} | "
+            f"acc={train_metrics['accuracy']:.4f}, "
+            f"{validation_metrics['tissue']['accuracy']:.4f}, "
+            f"{validation_metrics['slide']['accuracy']:.4f} | "
+            f"bal_acc={train_metrics['balanced_accuracy']:.4f}, "
+            f"{validation_metrics['tissue']['balanced_accuracy']:.4f}, "
+            f"{validation_metrics['slide']['balanced_accuracy']:.4f} | "
+            f"f1={train_metrics['macro_f1']:.4f}, "
+            f"{validation_metrics['tissue']['macro_f1']:.4f}, "
+            f"{validation_metrics['slide']['macro_f1']:.4f}"
         )
 
     final_state = copy.deepcopy(model.state_dict())
@@ -367,7 +433,6 @@ def train_classifier(
         {"model_state_dict": best_state, "epoch": best_epoch},
         model_dir / "best_validation_model.pth",
     )
-    selection = str(settings["checkpoint_selection"])
     selected_state = final_state if selection == "last" else best_state
     selected_epoch = int(settings["epochs"]) if selection == "last" else best_epoch
     model.load_state_dict(selected_state)
@@ -375,10 +440,25 @@ def train_classifier(
         "input_dim": input_dim,
         "best_validation_epoch": best_epoch,
         "best_validation_loss": best_loss,
+        "best_validation_loss_epoch": best_loss_epoch,
+        "best_checkpoint_value": best_value,
+        "best_checkpoint_metric": metric_key,
+        "training_level": training_level,
+        "checkpoint_level": checkpoint_level,
         "selected_epoch": selected_epoch,
         "checkpoint_selection": selection,
     }
     return model, history, details
+
+
+def _checkpoint_metric(selection: str) -> tuple[str, bool]:
+    """Resolve a checkpoint-selection mode to its metric key and direction."""
+    if selection in ("last", "best_val_loss"):
+        return "loss", False
+    prefix = "best_val_"
+    if selection.startswith(prefix):
+        return selection[len(prefix):], True
+    raise ValueError(f"Unsupported checkpoint selection: {selection}.")
 
 
 def select_primary_output_type(
@@ -421,13 +501,22 @@ def select_primary_output_type(
                 f"selected_epoch {selected_epoch} is out of range for "
                 f"output_type={output_type} with {len(history)} epochs."
             )
-        val_metrics = history[selected_epoch - 1].get("val")
+        checkpoint_level = details.get("checkpoint_level")
+        history_key = (
+            f"val_{checkpoint_level}"
+            if checkpoint_level in BAG_LEVELS
+            else "val"
+        )
+        val_metrics = history[selected_epoch - 1].get(history_key)
         if not isinstance(val_metrics, Mapping):
-            raise ValueError(f"Validation metrics missing for output_type={output_type}.")
+            raise ValueError(
+                f"{history_key} metrics missing for output_type={output_type}."
+            )
         candidates.append(
             {
                 "output_type": output_type,
                 "selected_epoch": selected_epoch,
+                "checkpoint_level": checkpoint_level,
                 "val_balanced_accuracy": float(val_metrics["balanced_accuracy"]),
                 "val_loss": float(val_metrics["loss"]),
             }
@@ -440,8 +529,15 @@ def select_primary_output_type(
             item[0],
         ),
     )[1]
+    levels = {candidate["checkpoint_level"] for candidate in candidates}
+    configured_level = levels.pop() if len(levels) == 1 else None
     return winner["output_type"], {
-        "metric": ROOT_SELECTION_METRIC,
+        "metric": (
+            f"val_{configured_level}_balanced_accuracy"
+            if configured_level in BAG_LEVELS
+            else ROOT_SELECTION_METRIC
+        ),
+        "checkpoint_level": configured_level,
         "winner": winner["output_type"],
         "candidates": candidates,
     }
@@ -487,13 +583,21 @@ def plot_training_history(
     """
     if not history:
         raise ValueError("Cannot plot an empty training history.")
+    plotted_splits = (
+        ("train", "val_tissue", "val_slide")
+        if all(
+            "val_tissue" in entry and "val_slide" in entry
+            for entry in history
+        )
+        else ("train", "val")
+    )
     metric_keys = [
         key
         for key in HISTORY_METRIC_KEYS
         if all(
             entry.get(split, {}).get(key) is not None
             for entry in history
-            for split in ("train", "val")
+            for split in plotted_splits
         )
     ]
     if not metric_keys:
@@ -503,8 +607,8 @@ def plot_training_history(
         len(metric_keys), 1, figsize=(10, 4 * len(metric_keys)), squeeze=False
     )
     for axis, key in zip(axes.ravel(), metric_keys):
-        axis.plot([entry["train"][key] for entry in history], label="train")
-        axis.plot([entry["val"][key] for entry in history], label="val")
+        for split in plotted_splits:
+            axis.plot([entry[split][key] for entry in history], label=split)
         if best_epoch > 0:
             axis.axvline(best_epoch - 1, color="red", linestyle="--", label="best")
         axis.set_ylabel(key)
@@ -518,8 +622,37 @@ def plot_training_history(
     plt.close(figure)
 
 
+def _run_configured_post_training_stages(
+    config: Mapping[str, Any], config_path: str | None
+) -> None:
+    """Run evaluation and visualization after training when those flags are set.
+
+    Imports are deferred so ``evaluate_panther`` and ``visualize_assignments``
+    can keep importing this module without a circular load.
+
+    Args:
+        config (Mapping[str, Any]): Resolved training configuration.
+        config_path (str | None): YAML path passed to the standalone stages,
+            or ``None`` for the package default.
+
+    Returns:
+        None: Requested stages write their artifacts under the current run.
+    """
+    if bool(config["evaluation"]["run_after_training"]):
+        from .evaluate_panther import run_evaluation
+
+        run_evaluation(config_path)
+    if bool(config["visualization"]["run_after_training"]):
+        from .visualize_assignments import run_visualization
+
+        run_visualization(config_path)
+
+
 def run_training(config_path: str | None = None) -> Path:
     """Fit prototypes, encode slides, train the linear head, and save a run.
+
+    When ``evaluation.run_after_training`` or ``visualization.run_after_training``
+    is true, the matching standalone stage runs after the checkpoint is saved.
 
     Args:
         config_path (str | None): YAML path, or ``None`` for the module default.
@@ -534,35 +667,75 @@ def run_training(config_path: str | None = None) -> Path:
     print(f"Run directory: {run_dir}")
     print(f"Device: {device}")
 
-    datasets, class_names, records = build_datasets(config)
+    slide_datasets, class_names, records = build_datasets(config, bag_level="slide")
+    assignments = {record["slide_key"]: record["split"] for record in records}
+    tissue_datasets, tissue_classes, _ = build_datasets(
+        config,
+        class_folders=class_names,
+        split_assignments=assignments,
+        bag_level="tissue",
+    )
+    if tissue_classes != class_names:
+        raise ValueError("Tissue and slide datasets disagree on class order.")
+    datasets_by_level = {
+        "tissue": tissue_datasets,
+        "slide": slide_datasets,
+    }
     if len(class_names) < 2:
         raise ValueError("PANTHER classification requires at least two classes.")
     print(f"Classes: {class_names}")
-    for split, dataset in datasets.items():
-        print(f"{split}: {len(dataset)} slides {class_counts(dataset)}")
+    for level in BAG_LEVELS:
+        for split, dataset in datasets_by_level[level].items():
+            print(
+                f"{level}/{split}: {len(dataset)} bags {class_counts(dataset)}"
+            )
+    prototype_level = str(config["prototype"]["bag_level"])
+    training_level = str(config["training"]["bag_level"])
+    checkpoint_level = str(config["training"]["checkpoint_level"])
+    print(
+        f"Levels: prototype={prototype_level} | training={training_level} | "
+        f"checkpoint={checkpoint_level}"
+    )
+    print(
+        f"Epoch metric order: train_{training_level}, val_tissue, val_slide"
+    )
     save_split_manifest(records, class_names, run_dir)
 
     prototype_path = run_dir / "prototypes.pkl"
     prototypes, prototype_metadata = fit_prototypes(
-        datasets["train"], config, prototype_path
+        datasets_by_level[prototype_level]["train"], config, prototype_path
     )
     panther = create_panther(prototypes, config)
-    component_embeddings = aggregate_slide_embeddings(
-        datasets, panther, device, run_dir
-    )
+    component_embeddings = {
+        level: aggregate_slide_embeddings(
+            datasets_by_level[level], panther, device, run_dir
+        )
+        for level in BAG_LEVELS
+    }
     output_types = list(config["model"]["output_type"])
     trained_models: Dict[str, Dict[str, Any]] = {}
     training_histories: Dict[str, list[Dict[str, Any]]] = {}
     for output_type in output_types:
         seed_everything(int(config["random_seed"]))
-        embeddings = compose_slide_embeddings(component_embeddings, output_type)
+        embeddings_by_level = {
+            level: compose_slide_embeddings(
+                component_embeddings[level], output_type
+            )
+            for level in BAG_LEVELS
+        }
+        embeddings = embeddings_by_level[training_level]
         model_dir = run_dir / "models" / output_type
         print(
             f"Training output_type={output_type} with "
             f"{embeddings['train']['representations'].shape[1]} features"
         )
         classifier, history, training_details = train_classifier(
-            embeddings, class_names, config, device, model_dir
+            embeddings,
+            class_names,
+            config,
+            device,
+            model_dir,
+            validation_embeddings=embeddings_by_level,
         )
         training_details["output_type"] = output_type
         history_path = model_dir / "training_history.json"
@@ -621,8 +794,13 @@ def run_training(config_path: str | None = None) -> Path:
         "prototype_metadata": prototype_metadata,
         "split_manifest": str(run_dir / "split_manifest.json"),
         "embedding_caches": {
-            component: str(path)
-            for component, path in component_embedding_paths(run_dir).items()
+            level: {
+                component: str(path)
+                for component, path in component_embedding_paths(
+                    run_dir, level
+                ).items()
+            }
+            for level in BAG_LEVELS
         },
         "default_output_type": primary_output_type,
         "model_state_dict": primary_model["model_state_dict"],
@@ -633,6 +811,7 @@ def run_training(config_path: str | None = None) -> Path:
     with (run_dir / "resolved_config.json").open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
     print(f"Saved selected checkpoint: {config['paths']['checkpoint']}")
+    _run_configured_post_training_stages(config, config_path)
     return run_dir
 
 

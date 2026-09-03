@@ -1,4 +1,4 @@
-"""Independent slide-bag discovery, splitting, and feature loading for PANTHER."""
+"""Independent tissue/slide bag discovery, splitting, and loading for PANTHER."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from torch.utils.data import Dataset
 
 
 SPLITS = ("train", "val", "test")
+BAG_LEVELS = ("tissue", "slide")
 
 
 class TissueRecord(TypedDict):
@@ -34,8 +35,8 @@ class SlideRecord(TypedDict):
     tissues: List[TissueRecord]
 
 
-class PantherSlideDataset(Dataset):
-    """Load one concatenated, variable-length slide feature bag at a time."""
+class PantherBagDataset(Dataset):
+    """Load one variable-length tissue or concatenated-slide feature bag."""
 
     def __init__(
         self,
@@ -45,13 +46,19 @@ class PantherSlideDataset(Dataset):
         max_tiles_per_slide: Optional[int] = None,
         tile_sampling: str = "random",
         random_seed: int = 42,
+        bag_level: str = "slide",
     ) -> None:
+        if bag_level not in BAG_LEVELS:
+            raise ValueError(
+                f"bag_level must be one of {BAG_LEVELS}, received {bag_level}."
+            )
         self.records = list(records)
         self.input_dim = int(input_dim)
         self.feature_normalization = feature_normalization
         self.max_tiles_per_slide = max_tiles_per_slide
         self.tile_sampling = tile_sampling
         self.random_seed = int(random_seed)
+        self.bag_level = bag_level
 
     def __len__(self) -> int:
         return len(self.records)
@@ -67,7 +74,7 @@ class PantherSlideDataset(Dataset):
             int(features.shape[0]),
             self.max_tiles_per_slide,
             self.tile_sampling,
-            stable_seed(self.random_seed, record["slide_key"]),
+            stable_seed(self.random_seed, _bag_key(record, self.bag_level)),
         )
         features = features[selected]
         if self.feature_normalization == "l2":
@@ -83,18 +90,33 @@ class PantherSlideDataset(Dataset):
             "label": int(record["label"]),
             "slide_name": record["slide_name"],
             "slide_key": record["slide_key"],
+            "bag_name": _bag_name(record, self.bag_level),
+            "bag_key": _bag_key(record, self.bag_level),
+            "bag_level": self.bag_level,
+            "tissue_names": [
+                tissue["tissue_name"] for tissue in record["tissues"]
+            ],
             "class_name": record["class_name"],
             "num_tissues": len(record["tissues"]),
             "num_tiles": int(features.shape[0]),
         }
 
 
+# Backward-compatible public name used by visualization and downstream callers.
+PantherSlideDataset = PantherBagDataset
+
+
 def build_datasets(
     config: Mapping[str, Any],
     class_folders: Optional[Sequence[str]] = None,
     split_assignments: Optional[Mapping[str, str]] = None,
-) -> tuple[Dict[str, PantherSlideDataset], List[str], List[SlideRecord]]:
-    """Discover slides and construct the three deterministic split datasets."""
+    bag_level: str = "slide",
+) -> tuple[Dict[str, PantherBagDataset], List[str], List[SlideRecord]]:
+    """Discover slides and construct deterministic tissue- or slide-bag datasets."""
+    if bag_level not in BAG_LEVELS:
+        raise ValueError(
+            f"bag_level must be one of {BAG_LEVELS}, received {bag_level}."
+        )
     classes, discovered = discover_slide_records(
         Path(str(config["data_root"])),
         str(config["feature_file_suffix"]),
@@ -142,8 +164,13 @@ def build_datasets(
         "random_seed": int(config["random_seed"]),
     }
     datasets = {
-        split: PantherSlideDataset(
-            [record for record in records if record["split"] == split], **common
+        split: PantherBagDataset(
+            _records_at_level(
+                [record for record in records if record["split"] == split],
+                bag_level,
+            ),
+            bag_level=bag_level,
+            **common,
         )
         for split in SPLITS
     }
@@ -346,8 +373,33 @@ def load_split_manifest(path: Path) -> tuple[List[str], Dict[str, str]]:
     }
 
 
-def class_counts(dataset: PantherSlideDataset) -> Dict[str, int]:
+def class_counts(dataset: PantherBagDataset) -> Dict[str, int]:
     return dict(Counter(record["class_name"] for record in dataset.records))
+
+
+def _records_at_level(
+    records: Sequence[SlideRecord], bag_level: str
+) -> List[SlideRecord]:
+    """Expand slide records into one-record-per-tissue bags when requested."""
+    if bag_level == "slide":
+        return list(records)
+    return [
+        {**record, "tissues": [tissue]}
+        for record in records
+        for tissue in record["tissues"]
+    ]
+
+
+def _bag_name(record: SlideRecord, bag_level: str) -> str:
+    if bag_level == "tissue":
+        return str(record["tissues"][0]["tissue_name"])
+    return str(record["slide_name"])
+
+
+def _bag_key(record: SlideRecord, bag_level: str) -> str:
+    if bag_level == "tissue":
+        return f"{record['slide_key']}/{record['tissues'][0]['tissue_name']}"
+    return str(record["slide_key"])
 
 
 def select_tile_indices(
