@@ -32,8 +32,10 @@ from logistic_regression.model import (
     RawFeatureStatisticsPooler,
     TorchLogisticRegression,
     pool_raw_features,
+    pooling_contract,
 )
 from logistic_regression.train import (
+    LEGACY_MODEL_SCHEMA,
     MODEL_SCHEMA,
     create_dataloader,
     train_logistic_regression,
@@ -191,6 +193,7 @@ def test_default_config_resolution_and_validation_errors(
     assert Path(default["data_root"]).is_absolute()
     assert default["input_dim"] == 1536
     assert default["feature_file_suffix"] == "_features_uni2h.pt"
+    assert default["pooling_statistics"] == ["mean", "standard_deviation"]
     assert Path(default["paths"]["checkpoint"]).is_absolute()
 
     invalid_cases = (
@@ -203,6 +206,10 @@ def test_default_config_resolution_and_validation_errors(
             "sum to one",
         ),
         ({"feature_model": "missing"}, "Unknown feature_model"),
+        ({"pooling_statistics": []}, "Invalid pooling_statistics"),
+        ({"pooling_statistics": "mean"}, "Invalid pooling_statistics"),
+        ({"pooling_statistics": ["median"]}, "Invalid pooling_statistics"),
+        ({"pooling_statistics": ["mean", "mean"]}, "Invalid pooling_statistics"),
     )
     for case_index, (overrides, message) in enumerate(invalid_cases):
         case_directory = tmp_path / f"invalid_{case_index}"
@@ -340,6 +347,50 @@ def test_pooling_is_deterministic_mask_aware_population_statistics() -> None:
     assert torch.equal(pooled, RawFeatureStatisticsPooler()(features, masks))
 
 
+def test_pooling_statistics_select_and_order_blocks() -> None:
+    """Verify mean-only, std-only, and reversed concatenation widths.
+
+    Args:
+        None: Tensor fixtures are constructed internally.
+
+    Returns:
+        None: Assertions verify selected blocks and padding independence.
+    """
+    features = torch.tensor(
+        [
+            [[1.0, 2.0], [3.0, 6.0], [1000.0, -1000.0]],
+            [[2.0, 4.0], [2.0, 8.0], [2.0, 12.0]],
+        ]
+    )
+    masks = torch.tensor([[True, True, False], [True, True, True]])
+    expected_mean = torch.tensor([[2.0, 4.0], [2.0, 8.0]])
+    expected_std = torch.tensor([[1.0, 2.0], [0.0, 3.2659864]])
+    mean_only = pool_raw_features(features, masks, statistics=["mean"])
+    std_only = pool_raw_features(
+        features, masks, statistics=["standard_deviation"]
+    )
+    reversed_blocks = pool_raw_features(
+        features, masks, statistics=["standard_deviation", "mean"]
+    )
+    assert torch.allclose(mean_only, expected_mean, atol=1e-6)
+    assert torch.allclose(std_only, expected_std, atol=1e-6)
+    assert torch.allclose(
+        reversed_blocks, torch.cat((expected_std, expected_mean), dim=1), atol=1e-6
+    )
+    changed = features.clone()
+    changed[~masks] = torch.tensor([[-77_777.0, 88_888.0]])
+    assert torch.equal(
+        mean_only, pool_raw_features(changed, masks, statistics=["mean"])
+    )
+    assert torch.equal(
+        std_only,
+        pool_raw_features(changed, masks, statistics=["standard_deviation"]),
+    )
+    assert pooling_contract(["mean"]) == (
+        "concat(population_mean); mask excludes padding"
+    )
+
+
 def test_tissue_and_slide_bags(
     synthetic_data_root: Path,
 ) -> None:
@@ -473,6 +524,7 @@ def test_joblib_schema_roundtrip_and_evaluation_artifacts(
     artifacts = train_logistic_regression(str(config_path))
     bundle = load_checkpoint_bundle(artifacts["checkpoint"])
     assert bundle["model_schema"] == MODEL_SCHEMA
+    assert bundle["pooling_statistics"] == ["mean", "standard_deviation"]
     assert bundle["pooling_dim"] == 2 * FEATURE_DIM
     assert np.array_equal(
         bundle["model"].predict(np.eye(2 * FEATURE_DIM)),
@@ -503,6 +555,82 @@ def test_joblib_schema_roundtrip_and_evaluation_artifacts(
             "confusion_matrix",
         }
         assert all(Path(path).is_file() for path in result["artifacts"].values())
+
+
+def test_mean_only_checkpoint_pooler_ignores_runtime_yaml(
+    tmp_path: Path,
+    synthetic_data_root: Path,
+) -> None:
+    """Train on mean-only vectors and evaluate with a mean-plus-std runtime YAML.
+
+    Args:
+        tmp_path (Path): Pytest-managed temporary directory.
+        synthetic_data_root (Path): Synthetic dataset root.
+
+    Returns:
+        None: Assertions verify checkpoint pooling width and successful evaluation.
+    """
+    train_directory = tmp_path / "train"
+    train_directory.mkdir()
+    train_config = write_config(
+        train_directory,
+        synthetic_data_root,
+        {"pooling_statistics": ["mean"]},
+    )
+    artifacts = train_logistic_regression(str(train_config))
+    bundle = load_checkpoint_bundle(artifacts["checkpoint"])
+    assert bundle["pooling_statistics"] == ["mean"]
+    assert bundle["pooling_dim"] == FEATURE_DIM
+    assert bundle["pooling_contract"] == pooling_contract(["mean"])
+    assert bundle["model"].coef_.shape[1] == FEATURE_DIM
+
+    eval_directory = tmp_path / "eval"
+    eval_directory.mkdir()
+    eval_config = write_config(eval_directory, synthetic_data_root)
+    manifest = evaluate_checkpoint(
+        config_path=str(eval_config),
+        checkpoint=artifacts["checkpoint"],
+        supplementary_bag_level="slide",
+    )
+    assert set(manifest["results"]) == {
+        "tissue/val",
+        "tissue/test",
+        "slide/val",
+        "slide/test",
+    }
+    for result in manifest["results"].values():
+        assert not result.get("skipped", False)
+
+
+def test_legacy_v2_checkpoint_defaults_to_mean_and_std(
+    tmp_path: Path,
+    synthetic_data_root: Path,
+) -> None:
+    """Load a v2 bundle that omits pooling_statistics as mean-plus-std.
+
+    Args:
+        tmp_path (Path): Pytest-managed temporary directory.
+        synthetic_data_root (Path): Synthetic dataset root.
+
+    Returns:
+        None: Assertions verify implied statistics and successful evaluation.
+    """
+    config_path = write_config(tmp_path, synthetic_data_root)
+    artifacts = train_logistic_regression(str(config_path))
+    bundle = joblib.load(artifacts["checkpoint"])
+    bundle["model_schema"] = LEGACY_MODEL_SCHEMA
+    del bundle["pooling_statistics"]
+    legacy_path = tmp_path / "legacy_v2.joblib"
+    joblib.dump(bundle, legacy_path)
+    loaded = load_checkpoint_bundle(legacy_path)
+    assert loaded["pooling_statistics"] == ["mean", "standard_deviation"]
+    assert loaded["pooling_dim"] == 2 * FEATURE_DIM
+    manifest = evaluate_checkpoint(
+        config_path=str(config_path),
+        checkpoint=str(legacy_path),
+        supplementary_bag_level="slide",
+    )
+    assert not manifest["results"]["tissue/val"].get("skipped", False)
 
 
 class SyntheticEvaluationDataset(Dataset):

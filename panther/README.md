@@ -23,8 +23,16 @@ From the repository root:
 python -m panther.train_panther --config panther/config.yaml
 python -m panther.evaluate_panther --config panther/config.yaml
 python -m panther.visualize_assignments --config panther/config.yaml
+python -m panther.compare_feature_models --config panther/config.yaml
 pytest panther/test_integration.py -q
 ```
+
+`compare_feature_models` trains the current configuration across every
+feature extractor (`hoptimus`, `uni2h`, `genbio`) and prototype count
+(`8`, `16`, `32`). Each of those nine runs fits the four configured heads
+(`allcat`, `pi`, `mean`, `variance`) and writes
+`feature_model_comparison.csv` plus `feature_model_comparison.md` under
+`output_dir/panther/`. Matching completed runs are reused by default.
 
 Each training run receives a dated directory under
 `output_dir/panther/`. The directory contains the exact split manifest,
