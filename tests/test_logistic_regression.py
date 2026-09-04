@@ -8,10 +8,12 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 import joblib
+import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 import torch
 import yaml
+from matplotlib.figure import Figure
 from torch.utils.data import Dataset
 
 from clam.clam_dataset import WSIBagDataset as ClamBagDataset
@@ -39,6 +41,13 @@ from logistic_regression.train import (
     MODEL_SCHEMA,
     create_dataloader,
     train_logistic_regression,
+)
+from logistic_regression.visualize_attribution import (
+    attribution_grid_maps,
+    compute_tile_attribution,
+    require_mean_std_pooling,
+    save_attribution_figure,
+    visualize_attribution,
 )
 
 
@@ -147,7 +156,7 @@ def write_config(
             "max_iter": 300,
             "class_weight": None,
             "max_tiles_per_bag": {"train": None, "val": None, "test": None},
-            "paths": {"checkpoint": None, "evaluation_output": None},
+            "paths": {"checkpoint": None, "evaluation_output": None, "attribution_output": None},
             "evaluation": {
                 "supplementary_bag_level": "slide",
                 "include_train": False,
@@ -194,7 +203,9 @@ def test_default_config_resolution_and_validation_errors(
     assert default["input_dim"] == 1536
     assert default["feature_file_suffix"] == "_features_uni2h.pt"
     assert default["pooling_statistics"] == ["mean", "standard_deviation"]
+    assert default["visualization"]["samples"] == ["test"]
     assert Path(default["paths"]["checkpoint"]).is_absolute()
+    assert Path(default["paths"]["attribution_output"]).is_absolute()
 
     invalid_cases = (
         ({"bag_level": "patient"}, "Invalid bag_level"),
@@ -210,6 +221,31 @@ def test_default_config_resolution_and_validation_errors(
         ({"pooling_statistics": "mean"}, "Invalid pooling_statistics"),
         ({"pooling_statistics": ["median"]}, "Invalid pooling_statistics"),
         ({"pooling_statistics": ["mean", "mean"]}, "Invalid pooling_statistics"),
+        ({"visualization": {"samples": []}}, "visualization.samples"),
+        (
+            {
+                "visualization": {
+                    "samples": ["holdout"],
+                    "tile_size": 448,
+                    "dpi": 150,
+                    "render_workers": 1,
+                    "thumbnail_size": 64,
+                }
+            },
+            "visualization.samples",
+        ),
+        (
+            {
+                "visualization": {
+                    "samples": ["test", "test"],
+                    "tile_size": 448,
+                    "dpi": 150,
+                    "render_workers": 1,
+                    "thumbnail_size": 64,
+                }
+            },
+            "visualization.samples",
+        ),
     )
     for case_index, (overrides, message) in enumerate(invalid_cases):
         case_directory = tmp_path / f"invalid_{case_index}"
@@ -236,6 +272,7 @@ def test_dated_run_colocates_training_artifacts(
     assert run_directory.parent == Path(config["output_dir"]) / "logistic_regression"
     assert Path(config["paths"]["checkpoint"]).parent == run_directory
     assert Path(config["paths"]["evaluation_output"]).parent == run_directory
+    assert Path(config["paths"]["attribution_output"]).parent == run_directory
 
 
 def test_split_parity_with_clam_and_slide_disjointness(
@@ -757,3 +794,334 @@ def test_absent_class_keeps_fixed_confusion_and_report_metrics() -> None:
     assert metrics["classification_report"]["macro avg"]["recall"] == pytest.approx(
         2.0 / 3.0
     )
+
+
+def make_fitted_attribution_model(
+    input_dim: int = 2,
+    num_classes: int = 2,
+) -> TorchLogisticRegression:
+    """Build a CPU estimator with known linear parameters for attribution tests.
+
+    Args:
+        input_dim (int): Raw tile feature width.
+        num_classes (int): Number of represented classes.
+
+    Returns:
+        TorchLogisticRegression: Fitted-looking estimator on CPU.
+    """
+    pooled_dim = 2 * input_dim
+    model = TorchLogisticRegression(device="cpu", class_weight=None, max_iter=1)
+    model.classes_ = np.arange(num_classes, dtype=np.int64)
+    model.mean_ = np.zeros(pooled_dim, dtype=np.float32)
+    model.scale_ = np.ones(pooled_dim, dtype=np.float32)
+    coef = np.zeros((num_classes, pooled_dim), dtype=np.float32)
+    for class_index in range(num_classes):
+        coef[class_index, class_index % input_dim] = 1.0
+        coef[class_index, input_dim + (class_index % input_dim)] = 0.5 - 0.25 * class_index
+    model.coef_ = coef
+    model.intercept_ = 0.1 * np.arange(num_classes, dtype=np.float32)
+    model.fit_device_ = "cpu"
+    return model
+
+
+def test_require_mean_std_pooling_rejects_other_contracts() -> None:
+    """Reject attribution pooling contracts that are not mean then std.
+
+    Args:
+        None: This test uses in-memory statistic names.
+
+    Returns:
+        None: Assertions verify acceptance of the required contract only.
+    """
+    assert require_mean_std_pooling(["mean", "standard_deviation"]) == (
+        "mean",
+        "standard_deviation",
+    )
+    with pytest.raises(ValueError, match="Attribution heatmaps require"):
+        require_mean_std_pooling(["mean"])
+    with pytest.raises(ValueError, match="Attribution heatmaps require"):
+        require_mean_std_pooling(["standard_deviation", "mean"])
+
+
+def test_tile_attribution_reconstructs_logits_and_ignores_padding() -> None:
+    """Verify exact logit reconstruction and padding independence.
+
+    Args:
+        None: Synthetic bags are constructed internally.
+
+    Returns:
+        None: Assertions verify reconstruction error and masked padding.
+    """
+    features = torch.tensor(
+        [
+            [[1.0, 2.0], [3.0, 6.0], [5.0, 2.0], [99.0, -99.0]],
+            [[2.0, 4.0], [2.0, 8.0], [2.0, 12.0], [0.0, 0.0]],
+        ]
+    )
+    masks = torch.tensor(
+        [[True, True, True, False], [True, True, True, False]]
+    )
+    model = make_fitted_attribution_model(input_dim=2, num_classes=2)
+    mean_evidence, std_evidence, errors, baselines, logits = compute_tile_attribution(
+        features,
+        masks,
+        model,
+        ["mean", "standard_deviation"],
+        epsilon=0.0,
+        num_classes=2,
+    )
+    reconstructed = mean_evidence.sum(dim=-1) + std_evidence.sum(dim=-1) + baselines
+    assert torch.allclose(reconstructed, logits, atol=1e-5)
+    assert float(errors.max().item()) <= 1e-4
+    assert torch.equal(mean_evidence[..., 3], torch.zeros_like(mean_evidence[..., 3]))
+    assert torch.equal(std_evidence[..., 3], torch.zeros_like(std_evidence[..., 3]))
+    changed = features.clone()
+    changed[~masks] = torch.tensor([[-77_777.0, 88_888.0]])
+    mean_changed, std_changed, _, _, logits_changed = compute_tile_attribution(
+        changed,
+        masks,
+        model,
+        ["mean", "standard_deviation"],
+        epsilon=0.0,
+        num_classes=2,
+    )
+    assert torch.allclose(mean_evidence, mean_changed, atol=1e-6)
+    assert torch.allclose(std_evidence, std_changed, atol=1e-6)
+    assert torch.allclose(logits, logits_changed, atol=1e-6)
+    mean_eps, std_eps, errors_eps, baselines_eps, logits_eps = compute_tile_attribution(
+        features,
+        masks,
+        model,
+        ["mean", "standard_deviation"],
+        epsilon=1e-4,
+        num_classes=2,
+    )
+    reconstructed_eps = mean_eps.sum(dim=-1) + std_eps.sum(dim=-1) + baselines_eps
+    assert torch.allclose(reconstructed_eps, logits_eps, atol=1e-5)
+    assert float(errors_eps.max().item()) <= 1e-4
+
+
+def test_attribution_grid_l1_identities() -> None:
+    """Verify all-class L1 panels are the class-wise absolute sums.
+
+    Args:
+        None: Signed evidence arrays are constructed internally.
+
+    Returns:
+        None: Assertions verify L1 identities used by the figure grid.
+    """
+    mean_evidence = np.array(
+        [[1.0, -0.5, 0.25], [0.0, 0.5, -1.0], [-0.25, 0.0, 0.75]],
+        dtype=np.float64,
+    )
+    std_evidence = np.array(
+        [[0.2, 0.1, 0.0], [-0.1, 0.0, 0.3], [0.05, -0.2, 0.1]],
+        dtype=np.float64,
+    )
+    maps = attribution_grid_maps(mean_evidence, std_evidence)
+    expected_class_l1 = np.abs(mean_evidence) + np.abs(std_evidence)
+    assert np.allclose(maps["class_l1"], expected_class_l1)
+    assert np.allclose(maps["all_l1"], expected_class_l1.sum(axis=0))
+    assert np.allclose(maps["all_mean_abs"], np.abs(mean_evidence).sum(axis=0))
+    assert np.allclose(maps["all_std_abs"], np.abs(std_evidence).sum(axis=0))
+
+
+def _axis_by_title(figure: Figure, title: str) -> plt.Axes:
+    """Return the unique figure axis whose title matches ``title``.
+
+    Args:
+        figure (Figure): Attribution figure whose axes are searched.
+        title (str): Exact axis title to locate.
+
+    Returns:
+        plt.Axes: The matching axis.
+    """
+    matches = [axis for axis in figure.axes if axis.get_title() == title]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"Expected one axis titled {title!r}, found {len(matches)}."
+        )
+    return matches[0]
+
+
+def _axis_by_ylabel(figure: Figure, label: str) -> plt.Axes:
+    """Return the unique figure axis whose y-axis label matches ``label``.
+
+    Args:
+        figure (Figure): Attribution figure whose axes are searched.
+        label (str): Exact colorbar or axis ylabel to locate.
+
+    Returns:
+        plt.Axes: The matching axis.
+    """
+    matches = [axis for axis in figure.axes if axis.get_ylabel() == label]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"Expected one axis labeled {label!r}, found {len(matches)}."
+        )
+    return matches[0]
+
+
+def test_save_attribution_figure_writes_png(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Write one 3-by-(1+C) attribution figure without a source thumbnail.
+
+    Args:
+        tmp_path (Path): Pytest-managed temporary directory.
+        monkeypatch (pytest.MonkeyPatch): Fixture used to inspect the figure.
+
+    Returns:
+        None: Assertions verify PNG output, left thumbnail, first-row titles,
+            equal heatmap sizes, labeled shared colorbars, and an all-classes
+            colorbar closer to its heatmap than to the first class map.
+    """
+    mean_evidence = np.array(
+        [[1.0, -0.5, 0.25], [0.0, 0.5, -1.0]],
+        dtype=np.float64,
+    )
+    std_evidence = np.array(
+        [[0.2, 0.1, 0.0], [-0.1, 0.0, 0.3]],
+        dtype=np.float64,
+    )
+    coordinates = np.array(
+        [[0.0, 0.0], [448.0, 0.0], [0.0, 448.0]],
+        dtype=np.float64,
+    )
+    captured_figure: Dict[str, Figure] = {}
+    original_savefig = Figure.savefig
+
+    def _capture_figure(
+        figure: Figure,
+        output_path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Record the figure being saved, then write it.
+
+        Args:
+            figure (Figure): Figure being saved.
+            output_path (Path): Destination image path.
+            *args (Any): Additional positional save arguments.
+            **kwargs (Any): Additional keyword save arguments.
+
+        Returns:
+            None: The original save operation is completed.
+        """
+        captured_figure["figure"] = figure
+        original_savefig(figure, output_path, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", _capture_figure)
+    output_path = tmp_path / "attribution.png"
+    save_attribution_figure(
+        mean_evidence=mean_evidence,
+        std_evidence=std_evidence,
+        coordinates=coordinates,
+        class_names=("Alpha", "Beta"),
+        predicted_index=1,
+        slide_name="slide",
+        tissue_name="tissue_0",
+        true_class="Alpha",
+        predicted_class="Beta",
+        predicted_probability=0.8,
+        class_probabilities=(0.2, 0.8),
+        image_path=None,
+        output_path=output_path,
+        tile_size=448,
+        thumbnail_size=64,
+        render_dpi=50,
+    )
+    assert output_path.is_file()
+    assert output_path.stat().st_size > 0
+    figure = captured_figure["figure"]
+    original_axis = _axis_by_title(figure, "Original")
+    all_classes_axis = _axis_by_title(figure, "All classes")
+    alpha_axis = _axis_by_title(figure, "Alpha (0.200)")
+    beta_axis = _axis_by_title(figure, "★ Beta (0.800)")
+    grid = original_axis.get_gridspec()
+    assert grid is not None
+    assert grid.nrows == 3
+    assert grid.ncols == 6
+    assert original_axis.get_position().x0 < all_classes_axis.get_position().x0
+    assert {axis.get_title() for axis in figure.axes if axis.get_title()} == {
+        "Original",
+        "All classes",
+        "Alpha (0.200)",
+        "★ Beta (0.800)",
+    }
+    assert {axis.get_ylabel() for axis in figure.axes if axis.get_ylabel()} == {
+        "L1 magnitude",
+        "Mean evidence",
+        "Std evidence",
+        "L1 attribution magnitude",
+        "Signed mean logit evidence",
+        "Signed std logit evidence",
+    }
+    heatmap_widths = [
+        all_classes_axis.get_position().width,
+        alpha_axis.get_position().width,
+        beta_axis.get_position().width,
+    ]
+    assert heatmap_widths[0] == pytest.approx(heatmap_widths[1], rel=0.02)
+    assert heatmap_widths[1] == pytest.approx(heatmap_widths[2], rel=0.02)
+    class_colorbar = _axis_by_ylabel(figure, "L1 attribution magnitude")
+    assert alpha_axis.get_position().x1 < class_colorbar.get_position().x0
+    assert beta_axis.get_position().x1 < class_colorbar.get_position().x0
+    all_colorbar = _axis_by_ylabel(figure, "L1 magnitude")
+    assert all_classes_axis.get_position().x1 < all_colorbar.get_position().x0
+    assert all_colorbar.get_position().x1 < alpha_axis.get_position().x0
+    left_gap = all_colorbar.get_position().x0 - all_classes_axis.get_position().x1
+    right_gap = alpha_axis.get_position().x0 - all_colorbar.get_position().x1
+    assert left_gap < right_gap
+
+
+def test_visualize_attribution_renders_only_requested_splits(
+    tmp_path: Path,
+    synthetic_data_root: Path,
+) -> None:
+    """Train a checkpoint and render only the configured test split.
+
+    Args:
+        tmp_path (Path): Pytest-managed temporary directory.
+        synthetic_data_root (Path): Synthetic dataset root.
+
+    Returns:
+        None: Assertions verify test-only outputs and PNG summaries.
+    """
+    config_path = write_config(
+        tmp_path,
+        synthetic_data_root,
+        {
+            "visualization": {
+                "samples": ["test"],
+                "tile_size": 448,
+                "dpi": 50,
+                "render_workers": 1,
+                "thumbnail_size": 64,
+            }
+        },
+    )
+    artifacts = train_logistic_regression(str(config_path))
+    heatmap_dir = tmp_path / "attribution"
+    manifest = visualize_attribution(
+        config_path=str(config_path),
+        checkpoint=artifacts["checkpoint"],
+        output_dir=str(heatmap_dir),
+        samples=["test"],
+        dpi=50,
+        render_workers=1,
+    )
+    assert manifest["samples"] == ["test"]
+    assert set(manifest["results"]) == {"test"}
+    assert manifest["results"]["test"]["skipped"] is False
+    summary_path = Path(manifest["results"]["test"]["summary"])
+    assert summary_path.is_file()
+    assert not (heatmap_dir / "attribution_summary_train.json").exists()
+    assert not (heatmap_dir / "attribution_summary_val.json").exists()
+    tissues = manifest["results"]["test"]["tissues"]
+    assert tissues
+    for tissue in tissues:
+        assert Path(tissue["heatmap_path"]).is_file()
+        assert tissue["split"] == "test"
+

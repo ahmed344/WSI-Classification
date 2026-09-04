@@ -226,6 +226,7 @@ def test_write_experiment_config_forces_slide_bags(tmp_path: Path) -> None:
     assert payload["evaluation"]["include_train"] is False
     assert payload["paths"]["checkpoint"].endswith("best_model.joblib")
     assert payload["paths"]["evaluation_output"].endswith("evaluation_results")
+    assert payload["paths"]["attribution_output"].endswith("attribution_heatmaps")
 
 
 def test_reuse_signature_ignores_extractor_pooling_and_bag_level() -> None:

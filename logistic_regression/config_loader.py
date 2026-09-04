@@ -27,7 +27,14 @@ _OPTIONS: Dict[str, Sequence[Any]] = {
 }
 _SPLITS = ("train", "val", "test")
 _RUN_ID_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}(?:_\d{2})?$")
-_EXPLICIT_PATH_KEYS = ("checkpoint", "evaluation_output")
+_EXPLICIT_PATH_KEYS = ("checkpoint", "evaluation_output", "attribution_output")
+_VISUALIZATION_KEYS = (
+    "samples",
+    "tile_size",
+    "dpi",
+    "render_workers",
+    "thumbnail_size",
+)
 
 
 def logistic_regression_results_root(output_dir: str | Path) -> Path:
@@ -70,6 +77,7 @@ def apply_run_artifact_paths(config: Dict[str, Any], run_dir: str | Path) -> Non
     paths = dict(config.get("paths", {}) or {})
     paths["checkpoint"] = str(destination / "best_model.joblib")
     paths["evaluation_output"] = str(destination / "evaluation_results")
+    paths["attribution_output"] = str(destination / "attribution_heatmaps")
     config["paths"] = paths
 
 
@@ -343,8 +351,73 @@ def _validate_config(config: MutableMapping[str, Any]) -> None:
         raise ValueError("evaluation.supplementary_bag_level is invalid.")
     if not isinstance(evaluation.get("include_train"), bool):
         raise ValueError("evaluation.include_train must be a boolean.")
+    _validate_visualization(config.get("visualization"))
     if not isinstance(config.get("paths"), Mapping):
         raise ValueError("paths must be a mapping.")
+
+
+def _validate_visualization(visualization: Any) -> None:
+    """Validate attribution-heatmap visualization settings.
+
+    Args:
+        visualization (Any): Parsed ``visualization`` mapping.
+
+    Returns:
+        None: Validation succeeds by returning normally.
+    """
+    if not isinstance(visualization, Mapping):
+        raise ValueError("visualization must be a mapping.")
+    unknown = set(visualization) - set(_VISUALIZATION_KEYS)
+    if unknown:
+        raise ValueError(
+            "visualization contains unknown keys: " + ", ".join(sorted(unknown))
+        )
+    samples = visualization.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("visualization.samples must be a nonempty list.")
+    if any(not isinstance(sample, str) or not sample for sample in samples):
+        raise ValueError("Every visualization.samples entry must be a nonempty string.")
+    unknown_splits = [sample for sample in samples if sample not in _SPLITS]
+    if unknown_splits:
+        raise ValueError(
+            "visualization.samples entries must be train, val, or test; "
+            f"unknown: {unknown_splits}."
+        )
+    if len(set(samples)) != len(samples):
+        raise ValueError("visualization.samples must not contain duplicate names.")
+    for key in ("tile_size", "dpi", "render_workers", "thumbnail_size"):
+        value = visualization.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"visualization.{key} must be a positive integer.")
+
+
+def normalize_visualization_samples(samples: Optional[Sequence[str]]) -> List[str]:
+    """Validate and freeze an ordered visualization split list.
+
+    Args:
+        samples (Optional[Sequence[str]]): Split names, or ``None`` for test only.
+
+    Returns:
+        List[str]: Unique split names in the requested order.
+    """
+    if samples is None:
+        return ["test"]
+    if isinstance(samples, (str, bytes)) or not isinstance(samples, Sequence):
+        raise ValueError("visualization.samples must be a nonempty list of split names.")
+    names = list(samples)
+    if not names:
+        raise ValueError("visualization.samples must be a nonempty list.")
+    if any(not isinstance(name, str) or not name for name in names):
+        raise ValueError("Every visualization.samples entry must be a nonempty string.")
+    unknown = [name for name in names if name not in _SPLITS]
+    if unknown:
+        raise ValueError(
+            "visualization.samples entries must be train, val, or test; "
+            f"unknown: {unknown}."
+        )
+    if len(set(names)) != len(names):
+        raise ValueError("visualization.samples must not contain duplicate names.")
+    return names
 
 
 def _require_number(config: Mapping[str, Any], key: str) -> float:
@@ -408,14 +481,18 @@ def _resolve_paths(config: Dict[str, Any], config_dir: Path) -> None:
     paths = dict(raw_paths)
     explicit_checkpoint = _optional_path(paths.get("checkpoint"), config_dir)
     explicit_evaluation = _optional_path(paths.get("evaluation_output"), config_dir)
+    explicit_attribution = _optional_path(paths.get("attribution_output"), config_dir)
     config["_explicit_paths"] = {
         "checkpoint": explicit_checkpoint is not None,
         "evaluation_output": explicit_evaluation is not None,
+        "attribution_output": explicit_attribution is not None,
     }
     if explicit_checkpoint is not None:
         paths["checkpoint"] = str(explicit_checkpoint)
     if explicit_evaluation is not None:
         paths["evaluation_output"] = str(explicit_evaluation)
+    if explicit_attribution is not None:
+        paths["attribution_output"] = str(explicit_attribution)
     config["paths"] = paths
     latest = resolve_latest_training_run(root)
     if latest is not None:
@@ -424,6 +501,10 @@ def _resolve_paths(config: Dict[str, Any], config_dir: Path) -> None:
             config["checkpoint_dir"] = str(latest)
         if explicit_evaluation is None:
             config["paths"]["evaluation_output"] = str(latest / "evaluation_results")
+        if explicit_attribution is None:
+            config["paths"]["attribution_output"] = str(
+                latest / "attribution_heatmaps"
+            )
         return
     if explicit_checkpoint is None:
         config["paths"]["checkpoint"] = str(checkpoint_dir / "best_model.joblib")
@@ -431,6 +512,8 @@ def _resolve_paths(config: Dict[str, Any], config_dir: Path) -> None:
         config["paths"]["evaluation_output"] = str(
             root / "evaluation_results"
         )
+    if explicit_attribution is None:
+        config["paths"]["attribution_output"] = str(root / "attribution_heatmaps")
 
 
 def _absolute_path(value: Any, base_dir: Path, key: str) -> Path:

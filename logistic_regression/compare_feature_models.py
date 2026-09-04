@@ -170,10 +170,12 @@ def write_experiment_config(
     if run_dir is None:
         paths["checkpoint"] = None
         paths["evaluation_output"] = None
+        paths["attribution_output"] = None
     else:
         resolved_run = Path(run_dir).expanduser().resolve()
         paths["checkpoint"] = str(resolved_run / "best_model.joblib")
         paths["evaluation_output"] = str(resolved_run / "evaluation_results")
+        paths["attribution_output"] = str(resolved_run / "attribution_heatmaps")
     payload["paths"] = paths
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
