@@ -98,10 +98,10 @@ python segmentation/crop_tissues_multislides.py
 python feature_extraction/inference.py
 
 # (C) Train CLAM-MB classifier
-python clam/train_clam.py
+python clam/train.py
 
 # (D) Evaluate trained model
-python clam/evaluate_clam.py
+python clam/evaluate.py
 
 # (E) Generate attention heatmaps
 python clam/visualize_attention.py

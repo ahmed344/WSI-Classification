@@ -9,9 +9,9 @@ import torch
 from torch import nn
 
 try:
-    from .clam_model import CLAM_MB, CLAM_SB
+    from .model import CLAM_MB, CLAM_SB
 except ImportError:
-    from clam_model import CLAM_MB, CLAM_SB
+    from model import CLAM_MB, CLAM_SB
 
 
 def _run_model_smoke(model_class: Type[nn.Module], bag_level: str) -> None:

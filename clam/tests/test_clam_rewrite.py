@@ -8,8 +8,8 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from clam.clam_dataset import collate_fn, create_bag_dataset
-from clam.clam_model import CLAM_MB, CLAM_SB
+from clam.dataset import collate_fn, create_bag_dataset
+from clam.model import CLAM_MB, CLAM_SB
 
 
 def _write_fixture_dataset(root: Path) -> None:

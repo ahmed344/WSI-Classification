@@ -21,11 +21,11 @@ CLAM_DIRECTORY = Path(__file__).resolve().parents[1]
 if str(CLAM_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(CLAM_DIRECTORY))
 
-import evaluate_clam
-import train_clam
+import evaluate
+import train
 import visualize_attention
-from clam_dataset import collate_fn, create_bag_dataset
-from clam_model import CLAM_MB, CLAM_SB
+from dataset import collate_fn, create_bag_dataset
+from model import CLAM_MB, CLAM_SB
 from config_loader import (
     allocate_training_run,
     apply_run_artifact_paths,
@@ -297,7 +297,7 @@ def test_training_config_rejects_invalid_loader_values(
     config = _pipeline_config(tmp_path, "tissue")
     config[key] = value
     with pytest.raises(ValueError, match=message):
-        train_clam._validate_training_config(config)
+        train._validate_training_config(config)
 
 
 def test_make_loader_uses_workers_and_prefetch_factor(tmp_path: Path) -> None:
@@ -314,7 +314,7 @@ def test_make_loader_uses_workers_and_prefetch_factor(tmp_path: Path) -> None:
     config.update({"batch_size": 2, "num_workers": 2, "prefetch_factor": 3})
     dataset = create_bag_dataset(config, "train")
 
-    loader = train_clam._make_loader(dataset, config, training=False)
+    loader = train._make_loader(dataset, config, training=False)
     batch = next(iter(loader))
 
     assert loader.num_workers == 2
@@ -362,7 +362,7 @@ def test_generalized_cross_entropy_supports_label_smoothing_and_weights() -> Non
         "use_class_weighted_loss": True,
     }
     class_weights = torch.tensor([1.0, 2.0, 3.0])
-    criterion = train_clam.create_classification_criterion(config, class_weights)
+    criterion = train.create_classification_criterion(config, class_weights)
     logits = torch.randn(4, 3, requires_grad=True)
     targets = torch.tensor([0, 1, 2, 1])
     loss = criterion(logits, targets)
@@ -403,9 +403,9 @@ def test_training_rejects_configured_class_mismatch(
         del config_path
         return config
 
-    monkeypatch.setattr(train_clam, "load_config", _load_test_config)
+    monkeypatch.setattr(train, "load_config", _load_test_config)
     with pytest.raises(ValueError, match="Configured num_classes=3"):
-        train_clam.train("synthetic.yml")
+        train.train("synthetic.yml")
 
 
 @pytest.mark.parametrize("model_type", ["clam_sb", "clam_mb"])
@@ -434,12 +434,12 @@ def test_one_batch_train_validate_and_evaluate(
         shuffle=False,
         collate_fn=collate_fn,
     )
-    model = train_clam.create_model(config)
+    model = train.create_model(config)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     device = torch.device("cpu")
 
-    training = train_clam.train_epoch(
+    training = train.train_epoch(
         model,
         loader,
         criterion,
@@ -447,14 +447,14 @@ def test_one_batch_train_validate_and_evaluate(
         device,
         bag_weight=0.7,
     )
-    validation = train_clam.validate(
+    validation = train.validate(
         model,
         loader,
         criterion,
         device,
         bag_weight=0.7,
     )
-    evaluation = evaluate_clam.evaluate(
+    evaluation = evaluate.evaluate(
         model,
         loader,
         device,
@@ -497,7 +497,7 @@ def test_validate_defers_metric_reduction_without_changing_values(
         shuffle=False,
         collate_fn=collate_fn,
     )
-    model = train_clam.create_model(config)
+    model = train.create_model(config)
     criterion = nn.CrossEntropyLoss()
     bag_weight = 0.7
     expected_totals = {
@@ -530,7 +530,7 @@ def test_validate_defers_metric_reduction_without_changing_values(
                 float(instance_loss.item()) * batch_size
             )
 
-    metrics = train_clam.validate(
+    metrics = train.validate(
         model,
         loader,
         criterion,
@@ -551,14 +551,14 @@ def test_fixed_metrics_retain_absent_classes() -> None:
     Returns:
         None: Assertions verify three-class matrix and macro averaging behavior.
     """
-    metrics = train_clam._classification_metrics(
+    metrics = train._classification_metrics(
         labels=[0, 0, 1],
         predictions=[0, 1, 1],
         num_classes=3,
     )
     assert metrics["confusion_matrix"] == [[1, 1, 0], [0, 1, 0], [0, 0, 0]]
     assert metrics["macro_f1"] == pytest.approx((2 / 3 + 2 / 3 + 0) / 3)
-    assert evaluate_clam._multiclass_auc(
+    assert evaluate._multiclass_auc(
         labels=[0, 0, 1],
         probabilities=[[0.8, 0.1, 0.1], [0.4, 0.5, 0.1], [0.1, 0.8, 0.1]],
         num_classes=3,
@@ -575,7 +575,7 @@ def test_slide_checkpoint_metric_and_patience_warmup() -> None:
         None: Assertions verify metric routing and early-stopping semantics.
     """
     metric_key, maximize, metric_name = (
-        train_clam.resolve_best_checkpoint_metric("slide_balanced_accuracy")
+        train.resolve_best_checkpoint_metric("slide_balanced_accuracy")
     )
     assert metric_key == "balanced_accuracy"
     assert maximize is True
@@ -583,21 +583,21 @@ def test_slide_checkpoint_metric_and_patience_warmup() -> None:
 
     counter = 0
     for epoch in range(1, 11):
-        counter = train_clam.update_patience_counter(
+        counter = train.update_patience_counter(
             counter,
             improved=False,
             epoch=epoch,
             minimum_epochs=10,
         )
     assert counter == 0
-    counter = train_clam.update_patience_counter(
+    counter = train.update_patience_counter(
         counter,
         improved=False,
         epoch=11,
         minimum_epochs=10,
     )
     assert counter == 1
-    assert train_clam.update_patience_counter(
+    assert train.update_patience_counter(
         counter,
         improved=True,
         epoch=12,
@@ -614,7 +614,7 @@ def test_default_evaluation_controls_include_tissue_and_slide() -> None:
     Returns:
         None: Assertions verify ordered levels and the train-split switch.
     """
-    levels, include_train = evaluate_clam._evaluation_controls(
+    levels, include_train = evaluate._evaluation_controls(
         {
             "evaluation": {
                 "supplementary_bag_level": "slide",
@@ -642,10 +642,10 @@ def test_slide_level_evaluation_writes_all_artifacts(tmp_path: Path) -> None:
     _write_fixture_dataset(data_root)
     config = _pipeline_config(data_root, "tissue")
     config["slide_evaluation_batch_size"] = 1
-    model = train_clam.create_model(config)
+    model = train.create_model(config)
     output_dir = tmp_path / "evaluation"
 
-    result = evaluate_clam.run_level_split_evaluation(
+    result = evaluate.run_level_split_evaluation(
         model=model,
         config=config,
         class_folders=["Class0", "Class1"],
@@ -716,8 +716,8 @@ def test_training_records_slide_history_and_checkpoint_metric(
         del config_path
         return config
 
-    monkeypatch.setattr(train_clam, "load_config", _load_test_config)
-    artifacts = train_clam.train("synthetic.yml")
+    monkeypatch.setattr(train, "load_config", _load_test_config)
+    artifacts = train.train("synthetic.yml")
 
     with Path(artifacts["history"]).open("r", encoding="utf-8") as history_file:
         history = json.load(history_file)
@@ -829,10 +829,10 @@ def test_checkpoint_payload_load_round_trip(
         None: Assertions verify schema metadata, state, and identical logits.
     """
     config = _pipeline_config(tmp_path, "slide", model_type)
-    model = train_clam.create_model(config)
+    model = train.create_model(config)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
-    payload = train_clam._checkpoint_payload(
+    payload = train._checkpoint_payload(
         checkpoint_type="best",
         epoch=1,
         model=model,
@@ -846,7 +846,7 @@ def test_checkpoint_payload_load_round_trip(
     checkpoint_path = tmp_path / f"{model_type}.pth"
     torch.save(payload, checkpoint_path)
     loaded = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    restored = train_clam.create_model(loaded["config"])
+    restored = train.create_model(loaded["config"])
     restored.load_state_dict(loaded["model_state_dict"], strict=True)
     model.eval()
     restored.eval()
@@ -856,7 +856,7 @@ def test_checkpoint_payload_load_round_trip(
     with torch.no_grad():
         expected = model(features, mask=masks, instance_eval=False)["logits"]
         actual = restored(features, mask=masks, instance_eval=False)["logits"]
-    assert loaded["model_schema"] == train_clam.MODEL_SCHEMA
+    assert loaded["model_schema"] == train.MODEL_SCHEMA
     assert loaded["bag_level"] == "slide"
     assert loaded["class_folders"] == ["Class0", "Class1"]
     assert torch.equal(actual, expected)

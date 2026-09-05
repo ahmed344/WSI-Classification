@@ -23,13 +23,13 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 try:
-    from .clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
+    from .dataset import WSIBagDataset, collate_fn, create_bag_dataset
     from .config_loader import load_config
-    from .train_clam import MODEL_SCHEMA, create_model, seed_everything, seed_worker
+    from .train import MODEL_SCHEMA, create_model, seed_everything, seed_worker
 except ImportError:
-    from clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
+    from dataset import WSIBagDataset, collate_fn, create_bag_dataset
     from config_loader import load_config
-    from train_clam import MODEL_SCHEMA, create_model, seed_everything, seed_worker
+    from train import MODEL_SCHEMA, create_model, seed_everything, seed_worker
 
 
 def get_class_sample_counts(dataset: WSIBagDataset) -> Dict[str, int]:

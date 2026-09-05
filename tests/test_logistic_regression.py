@@ -16,7 +16,7 @@ import yaml
 from matplotlib.figure import Figure
 from torch.utils.data import Dataset
 
-from clam.clam_dataset import WSIBagDataset as ClamBagDataset
+from clam.dataset import WSIBagDataset as ClamBagDataset
 from logistic_regression.config_loader import (
     allocate_training_run,
     load_config,

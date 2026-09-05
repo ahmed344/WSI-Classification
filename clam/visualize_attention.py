@@ -28,12 +28,12 @@ except ImportError:  # pragma: no cover - optional thumbnail fallback.
     Image = None
 
 try:
-    from .clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
-    from .clam_model import CLAM_MB, CLAM_SB
+    from .dataset import WSIBagDataset, collate_fn, create_bag_dataset
+    from .model import CLAM_MB, CLAM_SB
     from .config_loader import load_config
 except ImportError:
-    from clam_dataset import WSIBagDataset, collate_fn, create_bag_dataset
-    from clam_model import CLAM_MB, CLAM_SB
+    from dataset import WSIBagDataset, collate_fn, create_bag_dataset
+    from model import CLAM_MB, CLAM_SB
     from config_loader import load_config
 
 
