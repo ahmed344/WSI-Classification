@@ -38,7 +38,7 @@ except ImportError:
 
 
 CLAMModel = Union[CLAM_SB, CLAM_MB]
-CHECKPOINT_SCHEMA = "canonical_clam_v2_sigmoid_attn"
+CHECKPOINT_SCHEMA = "canonical_clam_v1"
 EVIDENCE_RECONSTRUCTION_TOLERANCE = 1e-4
 EVIDENCE_QUANTILE = 0.99
 TOP_EVIDENCE_TILE_COUNT = 25
@@ -89,8 +89,6 @@ def create_model(config: Mapping[str, Any]) -> CLAMModel:
         dropout=float(config["dropout"]),
         k_sample=int(config["k_sample"]),
         subtyping=bool(config["subtyping"]),
-        attention_normalization=str(config["attention_normalization"]),
-        pooling_layernorm=bool(config["pooling_layernorm"]),
     )
 
 
@@ -271,7 +269,7 @@ def compute_tile_evidence(
     attention_weights: torch.Tensor,
     logits: torch.Tensor,
     tolerance: float = EVIDENCE_RECONSTRUCTION_TOLERANCE,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute each tile's exact signed contribution to every class logit.
 
     Args:
@@ -283,9 +281,8 @@ def compute_tile_evidence(
         tolerance (float): Maximum absolute logit reconstruction error.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Signed evidence shaped
-            ``[B, C, N]``, absolute reconstruction errors shaped ``[B, C]``,
-            and class baselines shaped ``[C]``.
+        Tuple[torch.Tensor, torch.Tensor]: Signed evidence shaped ``[B, C, N]``
+            and absolute reconstruction errors shaped ``[B, C]``.
     """
     if model.training:
         raise ValueError("Tile evidence must be computed with the model in eval mode.")
@@ -314,36 +311,17 @@ def compute_tile_evidence(
     classifier_biases = torch.stack(
         [classifier.bias.squeeze(0) for classifier in model.classifiers]
     )
+    tile_class_scores = torch.einsum(
+        "bnh,ch->bcn", embedded, classifier_weights
+    )
     class_attention = (
         attention_weights.expand(-1, class_count, -1)
         if attention_weights.shape[1] == 1
         else attention_weights
     )
-    raw_pooled_features = torch.bmm(class_attention, embedded)
-    layernorm = model.pooling_layernorm
-    if layernorm.weight is None or layernorm.bias is None:
-        raise ValueError("Pooling LayerNorm must use learnable affine parameters.")
-    scaled_classifier_weights = classifier_weights * layernorm.weight.unsqueeze(0)
-    centered_classifier_weights = (
-        scaled_classifier_weights
-        - scaled_classifier_weights.mean(dim=-1, keepdim=True)
-    )
-    pooled_scale = torch.sqrt(
-        raw_pooled_features.var(dim=-1, unbiased=False, keepdim=True)
-        + layernorm.eps
-    )
-    effective_classifier_weights = (
-        centered_classifier_weights.unsqueeze(0) / pooled_scale
-    )
-    tile_class_scores = torch.einsum(
-        "bnh,bch->bcn", embedded, effective_classifier_weights
-    )
-    class_baselines = classifier_biases + torch.einsum(
-        "ch,h->c", classifier_weights, layernorm.bias
-    )
     evidence = class_attention * tile_class_scores
     evidence = evidence.masked_fill(~masks.unsqueeze(1), 0.0)
-    reconstructed_logits = evidence.sum(dim=-1) + class_baselines.unsqueeze(0)
+    reconstructed_logits = evidence.sum(dim=-1) + classifier_biases.unsqueeze(0)
     numerical_residual = logits - reconstructed_logits
     if not torch.isfinite(evidence).all() or not torch.isfinite(
         numerical_residual
@@ -364,7 +342,7 @@ def compute_tile_evidence(
             / attention_mass
         )
         reconstructed_logits = (
-            evidence.sum(dim=-1) + class_baselines.unsqueeze(0)
+            evidence.sum(dim=-1) + classifier_biases.unsqueeze(0)
         )
         remaining_residual = logits - reconstructed_logits
         strongest_indices = class_attention.argmax(dim=-1, keepdim=True)
@@ -374,7 +352,7 @@ def compute_tile_evidence(
             src=remaining_residual.unsqueeze(-1),
         )
 
-    reconstructed_logits = evidence.sum(dim=-1) + class_baselines.unsqueeze(0)
+    reconstructed_logits = evidence.sum(dim=-1) + classifier_biases.unsqueeze(0)
     reconstruction_errors = (reconstructed_logits - logits).abs()
     maximum_error = float(reconstruction_errors.max().item())
     if maximum_error > tolerance:
@@ -382,7 +360,7 @@ def compute_tile_evidence(
             "Tile evidence failed to reconstruct the bag logits: "
             f"maximum absolute error {maximum_error:.6g} exceeds {tolerance:.6g}."
         )
-    return evidence, reconstruction_errors, class_baselines
+    return evidence, reconstruction_errors
 
 
 def evidence_color_limit(
@@ -615,6 +593,7 @@ def save_attention_figure(
     figure.tight_layout()
     figure.savefig(output_path, dpi=render_dpi, bbox_inches="tight")
     plt.close(figure)
+    tqdm.write(f"Saved attention heatmap to {output_path}")
 
 
 def draw_evidence(
@@ -780,40 +759,7 @@ def save_evidence_figure(
     figure.tight_layout()
     figure.savefig(output_path, dpi=render_dpi, bbox_inches="tight")
     plt.close(figure)
-
-
-def add_attention_colorbar(
-    figure: plt.Figure,
-    axis: Axes,
-    attention: np.ndarray,
-    label: Optional[str] = None,
-) -> None:
-    """Attach a jet colorbar matching one attention panel's value range.
-
-    Args:
-        figure (plt.Figure): Figure that owns the colorbar.
-        axis (Axes): Axis whose value range the colorbar describes.
-        attention (np.ndarray): One-dimensional attention weights.
-        label (Optional[str]): Optional colorbar label.
-
-    Returns:
-        None: The colorbar is added to ``figure``.
-    """
-    minimum = float(attention.min())
-    maximum = float(attention.max())
-    scalar_mappable = plt.cm.ScalarMappable(
-        cmap=plt.cm.jet,
-        norm=plt.Normalize(
-            vmin=minimum,
-            vmax=maximum if maximum > minimum else minimum + 1e-12,
-        ),
-    )
-    scalar_mappable.set_array([])
-    colorbar = figure.colorbar(
-        scalar_mappable, ax=axis, orientation="vertical", pad=0.04
-    )
-    if label is not None:
-        colorbar.set_label(label)
+    tqdm.write(f"Saved evidence heatmap to {output_path}")
 
 
 def save_attention_evidence_figure(
@@ -835,11 +781,7 @@ def save_attention_evidence_figure(
     thumbnail_size: int,
     render_dpi: int = 150,
 ) -> None:
-    """Save a 2-by-(C+1) figure with mean attention above the original tissue.
-
-    The first column stacks the unweighted mean attention heatmap over the
-    source thumbnail. Remaining columns keep per-class attention over signed
-    evidence. A single shared attention branch still spans those class columns.
+    """Save one figure with aligned attention above class evidence.
 
     Args:
         branch_attention (np.ndarray): Attention shaped ``[K, N]``.
@@ -880,14 +822,14 @@ def save_attention_evidence_figure(
         raise ValueError("render_dpi must be positive.")
 
     figure = plt.figure(figsize=(5 * (class_count + 1), 9))
-    grid = figure.add_gridspec(2, class_count + 1, hspace=0.32, wspace=0.28)
-    mean_attention = branch_attention.mean(axis=0)
-    mean_axis = figure.add_subplot(grid[0, 0])
-    draw_attention(mean_axis, coordinates, mean_attention, tile_size)
-    mean_axis.set_title("Attention — Mean")
-    add_attention_colorbar(figure, mean_axis, mean_attention)
-
-    original_axis = figure.add_subplot(grid[1, 0])
+    grid = figure.add_gridspec(
+        2,
+        class_count + 1,
+        width_ratios=[1.2] + [1.0] * class_count,
+        hspace=0.32,
+        wspace=0.28,
+    )
+    original_axis = figure.add_subplot(grid[:, 0])
     thumbnail = load_tissue_thumbnail(image_path, thumbnail_size)
     if thumbnail is None:
         original_axis.text(
@@ -915,14 +857,21 @@ def save_attention_evidence_figure(
             if branch_attention.shape[0] == 1
             else f"Attention — {branch_name}"
         )
-        add_attention_colorbar(
-            figure,
-            axis,
-            attention,
-            label="Attention weight"
-            if branch_index == len(attention_axes) - 1
-            else None,
+        minimum = float(attention.min())
+        maximum = float(attention.max())
+        scalar_mappable = plt.cm.ScalarMappable(
+            cmap=plt.cm.jet,
+            norm=plt.Normalize(
+                vmin=minimum,
+                vmax=maximum if maximum > minimum else minimum + 1e-12,
+            ),
         )
+        scalar_mappable.set_array([])
+        colorbar = figure.colorbar(
+            scalar_mappable, ax=axis, orientation="vertical", pad=0.04
+        )
+        if branch_index == len(attention_axes) - 1:
+            colorbar.set_label("Attention weight")
 
     for class_index, class_name in enumerate(class_names):
         axis = figure.add_subplot(grid[1, class_index + 1])
@@ -979,6 +928,7 @@ def save_attention_evidence_figure(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=render_dpi, bbox_inches="tight")
     plt.close(figure)
+    tqdm.write(f"Saved combined attention/evidence heatmap to {output_path}")
 
 
 def safe_filename(value: str) -> str:
@@ -1092,11 +1042,7 @@ def evaluate_with_attention(
                 logits = outputs["logits"]
                 if not isinstance(logits, torch.Tensor):
                     raise TypeError("Canonical model logits must be a tensor.")
-                (
-                    evidence_weights,
-                    reconstruction_errors,
-                    class_baselines,
-                ) = compute_tile_evidence(
+                evidence_weights, reconstruction_errors = compute_tile_evidence(
                     model=model,
                     features=features,
                     masks=masks,
@@ -1106,11 +1052,15 @@ def evaluate_with_attention(
                 probabilities = outputs["probabilities"].detach().cpu()
                 predictions = outputs["predictions"].detach().cpu()
                 labels = batch["labels"].detach().cpu()
-                class_baselines = class_baselines.detach().cpu()
+                classifier_biases = torch.stack(
+                    [
+                        classifier.bias.detach().cpu().squeeze(0)
+                        for classifier in model.classifiers
+                    ]
+                )
 
                 for bag_index, slide_name in enumerate(batch["slide_names"]):
                     valid_mask = batch["masks"][bag_index]
-                    bag_tile_count = int(valid_mask.sum().item())
                     attention = attention_weights[
                         bag_index, :, valid_mask.to(device)
                     ].detach().cpu()
@@ -1236,7 +1186,7 @@ def evaluate_with_attention(
                                 "reconstructed_logit": (
                                     bag_sum
                                     + float(
-                                        class_baselines[class_index].item()
+                                        classifier_biases[class_index].item()
                                     )
                                 ),
                                 "logit_reconstruction_error": float(
@@ -1253,7 +1203,6 @@ def evaluate_with_attention(
                             else 0
                         )
                         primary_attention = tissue_attention[primary_index]
-                        primary_gates = primary_attention * bag_tile_count
                         results.append(
                             {
                                 "bag_level": bag_level,
@@ -1266,7 +1215,6 @@ def evaluate_with_attention(
                                     primary_index
                                 ],
                                 "num_tiles": int(primary_attention.size),
-                                "bag_num_tiles": bag_tile_count,
                                 "attention_mass": float(
                                     primary_attention.sum()
                                 ),
@@ -1276,8 +1224,6 @@ def evaluate_with_attention(
                                 "mean_attention": float(
                                     primary_attention.mean()
                                 ),
-                                "max_gate": float(primary_gates.max()),
-                                "mean_gate": float(primary_gates.mean()),
                                 "heatmap_path": str(output_path),
                                 "evidence_heatmap_path": str(output_path),
                                 "evidence_by_class": evidence_diagnostics,

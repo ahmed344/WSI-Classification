@@ -52,14 +52,6 @@ def _run_model_smoke(model_class: Type[nn.Module], bag_level: str) -> None:
     )
     padded = ~masks.unsqueeze(1).expand_as(outputs["attention_weights"])
     assert torch.all(outputs["attention_weights"].masked_select(padded) == 0)
-    valid_counts = masks.sum(dim=1, keepdim=True).unsqueeze(1)
-    expected_attention = torch.sigmoid(outputs["attention_scores"]) / valid_counts
-    expected_attention = expected_attention.masked_fill(~masks.unsqueeze(1), 0.0)
-    assert torch.allclose(outputs["attention_weights"], expected_attention)
-    assert torch.allclose(
-        outputs["pooled_features"],
-        model.pooling_layernorm(outputs["raw_pooled_features"]),
-    )
     assert torch.isfinite(outputs["instance_loss"])
     assert set(outputs["instance_targets"].tolist()).issubset({0, 1})
 

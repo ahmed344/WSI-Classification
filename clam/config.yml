@@ -22,8 +22,6 @@ feature_model_input_dims:  # Mapping from feature model names to input dimension
 # Model architecture
 model_type: "clam_mb"  # Options: clam_mb, clam_sb
 gated_attention: true  # Use the canonical gated attention network
-attention_normalization: "sigmoid_mean"  # Must be sigmoid_mean; applies independent sigmoid gates and divides their weighted sum by the valid tile count
-pooling_layernorm: true  # Must be true; normalize sigmoid-over-T pooled vectors before classification
 hidden_dim: 512  # Shared tile embedding dimension
 attention_dim: 256  # Hidden dimension of the gated attention network
 dropout: 0.5  # Dropout in the shared embedding and attention projections

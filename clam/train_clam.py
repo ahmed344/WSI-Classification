@@ -33,7 +33,7 @@ except ImportError:
     from losses import GeneralizedCrossEntropyLoss
 
 
-MODEL_SCHEMA = "canonical_clam_v2_sigmoid_attn"
+MODEL_SCHEMA = "canonical_clam_v1"
 METRIC_KEYS = (
     "loss",
     "classification_loss",
@@ -67,8 +67,6 @@ def create_model(config: Mapping[str, Any]) -> nn.Module:
         dropout=float(config["dropout"]),
         k_sample=int(config["k_sample"]),
         subtyping=bool(config["subtyping"]),
-        attention_normalization=str(config["attention_normalization"]),
-        pooling_layernorm=bool(config["pooling_layernorm"]),
     )
 
 
