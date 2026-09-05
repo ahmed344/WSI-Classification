@@ -7,7 +7,7 @@ import json
 import multiprocessing as mp
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TypedDict, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -36,7 +36,6 @@ try:
     from .dataset import WSIBagDataset, create_bag_dataset
     from .evaluate import evaluation_data_config, load_checkpoint_bundle
     from .model import (
-        RawFeatureStatisticsPooler,
         TorchLogisticRegression,
         normalize_pooling_statistics,
         pool_raw_features,
@@ -56,7 +55,6 @@ except ImportError:
     from dataset import WSIBagDataset, create_bag_dataset
     from evaluate import evaluation_data_config, load_checkpoint_bundle
     from model import (
-        RawFeatureStatisticsPooler,
         TorchLogisticRegression,
         normalize_pooling_statistics,
         pool_raw_features,
@@ -71,11 +69,32 @@ except ImportError:
 
 REQUIRED_POOLING_STATISTICS: Tuple[str, ...] = ("mean", "standard_deviation")
 EVIDENCE_RECONSTRUCTION_TOLERANCE = 1e-4
-EVIDENCE_QUANTILE = 0.99
+CLASS_SUM_TOLERANCE = 1e-3
+EVIDENCE_QUANTILE = 0.98
 NEAR_ZERO_EVIDENCE = 1e-12
+ATTRIBUTION_DATALOADER_BATCH_SIZE = 1
 _MAGNITUDE_CMAP = plt.cm.magma
 _EVIDENCE_CMAP = plt.cm.RdBu_r
 ALL_CLASS_COLORBAR_GAP_FRACTION = 0.40
+_COLOR_LIMIT_KEYS: Tuple[str, ...] = (
+    "l1",
+    "all_l1",
+    "mean",
+    "std",
+    "all_mean",
+    "all_std",
+)
+
+
+class AttributionColorLimits(TypedDict):
+    """Shared colour-scale bounds for one split's 3-by-(1+C) figure."""
+
+    l1: float
+    all_l1: float
+    mean: float
+    std: float
+    all_mean: float
+    all_std: float
 
 
 def require_mean_std_pooling(statistics: Sequence[str]) -> Tuple[str, ...]:
@@ -119,6 +138,290 @@ def attribution_grid_maps(
         "all_l1": class_l1.sum(axis=0),
         "all_mean_abs": np.abs(mean_evidence).sum(axis=0),
         "all_std_abs": np.abs(std_evidence).sum(axis=0),
+    }
+
+
+def center_tile_evidence(evidence: np.ndarray) -> np.ndarray:
+    """Subtract the across-tile mean from each class row.
+
+    Args:
+        evidence (np.ndarray): Signed evidence shaped ``[C, N]``.
+
+    Returns:
+        np.ndarray: Zero-sum-per-class evidence shaped ``[C, N]``.
+    """
+    values = np.asarray(evidence, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] == 0:
+        raise ValueError("Evidence must have nonempty shape [C, N].")
+    if not np.isfinite(values).all():
+        raise ValueError("Evidence values must be finite.")
+    return values - values.mean(axis=1, keepdims=True)
+
+
+def evidence_contrast_ratio(evidence: np.ndarray) -> np.ndarray:
+    """Compute per-class spatial contrast relative to the DC offset.
+
+    The ratio is ``sd_i(e_ci) / |mean_i(e_ci)|`` on uncentred evidence. The
+    denominator is floored at ``NEAR_ZERO_EVIDENCE``.
+
+    Args:
+        evidence (np.ndarray): Uncentred signed evidence shaped ``[C, N]``.
+
+    Returns:
+        np.ndarray: Contrast ratios shaped ``[C]``.
+    """
+    values = np.asarray(evidence, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] == 0:
+        raise ValueError("Evidence must have nonempty shape [C, N].")
+    if not np.isfinite(values).all():
+        raise ValueError("Evidence values must be finite.")
+    means = values.mean(axis=1)
+    stds = values.std(axis=1, ddof=0)
+    denominators = np.maximum(np.abs(means), NEAR_ZERO_EVIDENCE)
+    return stds / denominators
+
+
+def within_tissue_effective_dimension(tile_features: np.ndarray) -> float:
+    """Participation ratio of within-tissue centred feature covariance.
+
+    ``D_eff = (sum_k lambda_k)^2 / sum_k lambda_k^2`` for the eigenvalues of
+    ``(1/N) sum_i u_i u_i^T``. Computed from the Gram matrix on the smaller of
+    ``N`` and ``D``.
+
+    Args:
+        tile_features (np.ndarray): Raw tile features shaped ``[N, D]``.
+
+    Returns:
+        float: Effective dimension, or ``0.0`` when variation is undefined.
+    """
+    features = np.asarray(tile_features, dtype=np.float64)
+    if features.ndim != 2 or features.shape[1] == 0:
+        raise ValueError("tile_features must have shape [N, D] with D > 0.")
+    if not np.isfinite(features).all():
+        raise ValueError("tile_features must be finite.")
+    tile_count = int(features.shape[0])
+    if tile_count < 2:
+        return 0.0
+    centered = features - features.mean(axis=0, keepdims=True)
+    tile_count_f = float(tile_count)
+    feature_dim = int(features.shape[1])
+    if tile_count <= feature_dim:
+        gram = (centered @ centered.T) / tile_count_f
+    else:
+        gram = (centered.T @ centered) / tile_count_f
+    trace = float(np.trace(gram))
+    frobenius_sq = float(np.sum(gram * gram))
+    if trace <= 0.0 or frobenius_sq <= 0.0:
+        return 0.0
+    return (trace * trace) / frobenius_sq
+
+
+def visualization_loader_config(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Copy an evaluation config and force one bag per attribution batch.
+
+    Args:
+        config (Mapping[str, Any]): Evaluation loading configuration.
+
+    Returns:
+        Dict[str, Any]: Config with ``batch_size`` set to 1.
+    """
+    payload = dict(config)
+    payload["batch_size"] = ATTRIBUTION_DATALOADER_BATCH_SIZE
+    return payload
+
+
+def represented_class_predictions(
+    logits: torch.Tensor,
+    model: TorchLogisticRegression,
+) -> np.ndarray:
+    """Argmax attribution logits over classes the estimator actually fitted.
+
+    Args:
+        logits (torch.Tensor): Full-space logits shaped ``[B, C]``.
+        model (TorchLogisticRegression): Fitted estimator.
+
+    Returns:
+        np.ndarray: Predicted labels in the frozen class space, shaped ``[B]``.
+    """
+    if logits.ndim != 2:
+        raise ValueError("logits must have shape [B, C].")
+    classes = np.asarray(model._require_fitted()["classes"], dtype=np.int64)
+    if classes.size == 0:
+        raise ValueError("Fitted classifier has no represented classes.")
+    if int(logits.shape[1]) <= int(classes.max()):
+        raise ValueError("logits width does not cover represented classes.")
+    represented = logits.detach().cpu().numpy()[:, classes]
+    return classes[np.argmax(represented, axis=1)]
+
+
+def magnitude_colorbar_label(name: str, limit: float) -> str:
+    """Build a sequential-colorbar label that states the plotted upper bound.
+
+    Args:
+        name (str): Row name without the numeric limit.
+        limit (float): Nonnegative colour-scale upper bound.
+
+    Returns:
+        str: Label including the ``0-limit`` range.
+    """
+    if not np.isfinite(limit) or limit <= 0.0:
+        raise ValueError("Colour limit must be a positive finite value.")
+    return f"{name} (0-{limit:.3g})"
+
+
+def signed_colorbar_label(name: str, limit: float) -> str:
+    """Build a diverging-colorbar label for centred signed evidence.
+
+    Args:
+        name (str): Evidence-block name without the numeric limit.
+        limit (float): Positive symmetric colour-scale bound.
+
+    Returns:
+        str: Colorbar label without a numeric range suffix.
+    """
+    if not np.isfinite(limit) or limit <= 0.0:
+        raise ValueError("Colour limit must be a positive finite value.")
+    return name
+
+
+def normalize_color_limits(limits: Mapping[str, float]) -> AttributionColorLimits:
+    """Validate and freeze shared colour limits for one figure or split.
+
+    Args:
+        limits (Mapping[str, float]): Mapping with the six required keys.
+
+    Returns:
+        AttributionColorLimits: Positive finite limits for every row scale.
+    """
+    missing = [key for key in _COLOR_LIMIT_KEYS if key not in limits]
+    if missing:
+        raise ValueError(
+            "color_limits is missing keys: " + ", ".join(missing) + "."
+        )
+    normalized: Dict[str, float] = {}
+    for key in _COLOR_LIMIT_KEYS:
+        value = float(limits[key])
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"color_limits[{key!r}] must be a positive finite value.")
+        normalized[key] = value
+    return AttributionColorLimits(
+        l1=normalized["l1"],
+        all_l1=normalized["all_l1"],
+        mean=normalized["mean"],
+        std=normalized["std"],
+        all_mean=normalized["all_mean"],
+        all_std=normalized["all_std"],
+    )
+
+
+def color_limits_from_maps(
+    centred_mean: np.ndarray,
+    centred_std: np.ndarray,
+) -> AttributionColorLimits:
+    """Compute per-tissue colour limits from centred mean and std evidence.
+
+    Args:
+        centred_mean (np.ndarray): Centred mean evidence shaped ``[C, N]``.
+        centred_std (np.ndarray): Centred std evidence shaped ``[C, N]``.
+
+    Returns:
+        AttributionColorLimits: Quantile limits for every row of the figure.
+    """
+    maps = attribution_grid_maps(centred_mean, centred_std)
+    return AttributionColorLimits(
+        l1=magnitude_color_limit(maps["class_l1"]),
+        all_l1=magnitude_color_limit(maps["all_l1"]),
+        mean=evidence_color_limit(centred_mean),
+        std=evidence_color_limit(centred_std),
+        all_mean=magnitude_color_limit(maps["all_mean_abs"]),
+        all_std=magnitude_color_limit(maps["all_std_abs"]),
+    )
+
+
+def compute_split_color_limits(
+    centred_mean_maps: Sequence[np.ndarray],
+    centred_std_maps: Sequence[np.ndarray],
+) -> AttributionColorLimits:
+    """Compute shared colour limits from every centred tissue map in a split.
+
+    Args:
+        centred_mean_maps (Sequence[np.ndarray]): Per-tissue centred mean maps.
+        centred_std_maps (Sequence[np.ndarray]): Per-tissue centred std maps.
+
+    Returns:
+        AttributionColorLimits: Split-wide quantile limits.
+    """
+    if len(centred_mean_maps) != len(centred_std_maps):
+        raise ValueError("Centred mean and std map lists must have equal length.")
+    if not centred_mean_maps:
+        raise ValueError("Cannot compute colour limits from an empty split.")
+    class_l1_parts: List[np.ndarray] = []
+    all_l1_parts: List[np.ndarray] = []
+    mean_parts: List[np.ndarray] = []
+    std_parts: List[np.ndarray] = []
+    all_mean_parts: List[np.ndarray] = []
+    all_std_parts: List[np.ndarray] = []
+    for centred_mean, centred_std in zip(centred_mean_maps, centred_std_maps):
+        maps = attribution_grid_maps(centred_mean, centred_std)
+        class_l1_parts.append(np.asarray(maps["class_l1"], dtype=np.float64).reshape(-1))
+        all_l1_parts.append(np.asarray(maps["all_l1"], dtype=np.float64).reshape(-1))
+        mean_parts.append(np.asarray(centred_mean, dtype=np.float64).reshape(-1))
+        std_parts.append(np.asarray(centred_std, dtype=np.float64).reshape(-1))
+        all_mean_parts.append(
+            np.asarray(maps["all_mean_abs"], dtype=np.float64).reshape(-1)
+        )
+        all_std_parts.append(
+            np.asarray(maps["all_std_abs"], dtype=np.float64).reshape(-1)
+        )
+    return AttributionColorLimits(
+        l1=magnitude_color_limit(np.concatenate(class_l1_parts)),
+        all_l1=magnitude_color_limit(np.concatenate(all_l1_parts)),
+        mean=evidence_color_limit(np.concatenate(mean_parts)),
+        std=evidence_color_limit(np.concatenate(std_parts)),
+        all_mean=magnitude_color_limit(np.concatenate(all_mean_parts)),
+        all_std=magnitude_color_limit(np.concatenate(all_std_parts)),
+    )
+
+
+def aggregate_split_diagnostics(
+    tissues: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize contrast ratios and effective dimension over a split.
+
+    Args:
+        tissues (Sequence[Mapping[str, Any]]): Per-tissue attribution records.
+
+    Returns:
+        Dict[str, Any]: Mean and median diagnostics across tissues and classes.
+    """
+    if not tissues:
+        raise ValueError("Cannot aggregate diagnostics from an empty tissue list.")
+    mean_rho = np.concatenate(
+        [
+            np.asarray(tissue["mean_contrast_ratio"], dtype=np.float64).reshape(-1)
+            for tissue in tissues
+        ]
+    )
+    std_rho = np.concatenate(
+        [
+            np.asarray(tissue["std_contrast_ratio"], dtype=np.float64).reshape(-1)
+            for tissue in tissues
+        ]
+    )
+    effective_dim = np.asarray(
+        [tissue["effective_dimension"] for tissue in tissues],
+        dtype=np.float64,
+    )
+    if mean_rho.size == 0 or std_rho.size == 0 or effective_dim.size == 0:
+        raise ValueError("Split diagnostics arrays must be nonempty.")
+    return {
+        "num_tissues": len(tissues),
+        "mean_contrast_ratio_mean": float(mean_rho.mean()),
+        "mean_contrast_ratio_median": float(np.median(mean_rho)),
+        "std_contrast_ratio_mean": float(std_rho.mean()),
+        "std_contrast_ratio_median": float(np.median(std_rho)),
+        "effective_dimension_mean": float(effective_dim.mean()),
+        "effective_dimension_median": float(np.median(effective_dim)),
     }
 
 
@@ -174,6 +477,36 @@ def expand_classifier_parameters(
     return weights, biases, mean_tensor, scale_tensor
 
 
+def center_multinomial_parameters(
+    weights: torch.Tensor,
+    intercept: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Project multinomial parameters onto the class-centred softmax gauge.
+
+    Softmax is invariant under adding the same vector to every class. The L2
+    penalty prefers ``1^T W = 0`` and ``1^T b = 0``, but L-BFGS leaves a small
+    residual that is amplified by the scaler and raw feature contraction.
+
+    Args:
+        weights (torch.Tensor): Class-by-feature coefficients shaped ``[C, F]``.
+        intercept (torch.Tensor): Class intercepts shaped ``[C]``.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Zero-class-mean weights and
+            intercepts.
+    """
+    if weights.ndim != 2 or intercept.shape != (weights.shape[0],):
+        raise ValueError("weights must have shape [C, F] and intercept [C].")
+    if weights.shape[0] < 2:
+        raise ValueError("Class-centring requires at least two classes.")
+    if not torch.isfinite(weights).all() or not torch.isfinite(intercept).all():
+        raise ValueError("Classifier parameters must be finite.")
+    return (
+        weights - weights.mean(dim=0, keepdim=True),
+        intercept - intercept.mean(),
+    )
+
+
 def compute_tile_attribution(
     features: torch.Tensor,
     masks: torch.Tensor,
@@ -182,7 +515,16 @@ def compute_tile_attribution(
     epsilon: float,
     num_classes: int,
     tolerance: float = EVIDENCE_RECONSTRUCTION_TOLERANCE,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    class_sum_tolerance: float = CLASS_SUM_TOLERANCE,
+    center_class_coefficients: bool = True,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """Decompose each class logit into mask-aware mean and std tile evidence.
 
     Args:
@@ -193,12 +535,17 @@ def compute_tile_attribution(
         epsilon (float): Nonnegative population-std variance floor.
         num_classes (int): Fixed checkpoint class count.
         tolerance (float): Maximum absolute logit reconstruction error.
+        class_sum_tolerance (float): Maximum absolute per-tile class-sum when
+            every class is represented.
+        center_class_coefficients (bool): If True, project represented-class
+            weights and intercepts onto the class-centred softmax gauge before
+            decomposing evidence.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             Mean evidence ``[B, C, T]``, std evidence ``[B, C, T]``, absolute
-            reconstruction errors ``[B, C]``, bag baselines ``[B, C]``, and
-            full-space logits ``[B, C]``.
+            reconstruction errors ``[B, C]``, bag baselines ``[B, C]``,
+            full-space logits ``[B, C]``, and pooled bag vectors ``[B, 2D]``.
     """
     require_mean_std_pooling(pooling_statistics)
     if features.ndim != 3 or masks.shape != features.shape[:2]:
@@ -211,10 +558,12 @@ def compute_tile_attribution(
         raise ValueError("epsilon must be nonnegative.")
     if tolerance < 0.0:
         raise ValueError("Evidence reconstruction tolerance must be nonnegative.")
+    if class_sum_tolerance < 0.0:
+        raise ValueError("Class-sum tolerance must be nonnegative.")
     if not torch.isfinite(features).all():
         raise ValueError("features contain non-finite values.")
     execution_device = torch.device(model.device)
-    feature_tensor = features.to(device=execution_device, dtype=torch.float32)
+    feature_tensor = features.to(device=execution_device, dtype=torch.float64)
     valid = masks.to(device=execution_device, dtype=torch.bool)
     if torch.any(valid.sum(dim=1) == 0):
         raise ValueError("Every bag must contain at least one valid tile.")
@@ -234,6 +583,9 @@ def compute_tile_attribution(
         device=execution_device,
         dtype=feature_tensor.dtype,
     )
+    fitted_classes = np.asarray(model._require_fitted()["classes"], dtype=np.int64)
+    if center_class_coefficients and fitted_classes.size == num_classes:
+        weights, intercept = center_multinomial_parameters(weights, intercept)
     standardized = (pooled - scaler_mean) / scaler_scale
     logits = F.linear(standardized, weights, intercept)
     alpha = weights / scaler_scale.unsqueeze(0)
@@ -241,22 +593,20 @@ def compute_tile_attribution(
     alpha_std = alpha[:, input_dim:]
     bag_mean = pooled[:, :input_dim]
     bag_std = pooled[:, input_dim:]
-    tile_weights = valid.unsqueeze(-1).to(dtype=feature_tensor.dtype)
     tile_counts = valid.sum(dim=1).to(dtype=feature_tensor.dtype)
+    weighted_features = feature_tensor.masked_fill(~valid.unsqueeze(-1), 0.0)
     mean_evidence = torch.einsum(
         "cd,btd->bct",
         alpha_mean,
-        feature_tensor * tile_weights,
+        weighted_features,
     ) / tile_counts.view(-1, 1, 1)
-    centered = (feature_tensor - bag_mean.unsqueeze(1)) * tile_weights
-    squared = centered.square()
-    variance_mass = squared.sum(dim=1)
+    share = feature_tensor - bag_mean.unsqueeze(1)
+    share.masked_fill_(~valid.unsqueeze(-1), 0.0)
+    share.square_()
+    variance_mass = share.sum(dim=1)
     positive_variance = variance_mass > 0.0
-    share = torch.where(
-        positive_variance.unsqueeze(1),
-        squared / variance_mass.unsqueeze(1).clamp_min(NEAR_ZERO_EVIDENCE),
-        torch.zeros_like(squared),
-    )
+    share.div_(variance_mass.unsqueeze(1).clamp_min(NEAR_ZERO_EVIDENCE))
+    share.masked_fill_(~positive_variance.unsqueeze(1), 0.0)
     std_evidence = torch.einsum("cd,bd,btd->bct", alpha_std, bag_std, share)
     mean_evidence = mean_evidence.masked_fill(~valid.unsqueeze(1), 0.0)
     std_evidence = std_evidence.masked_fill(~valid.unsqueeze(1), 0.0)
@@ -272,16 +622,6 @@ def compute_tile_attribution(
         / tile_counts.view(-1, 1, 1)
     )
     reconstructed = mean_evidence.sum(dim=-1) + std_evidence.sum(dim=-1) + bag_baselines
-    remaining = logits - reconstructed
-    if float(remaining.abs().max().item()) > tolerance:
-        first_valid = valid.to(dtype=torch.long).argmax(dim=1)
-        scatter_index = first_valid.view(-1, 1, 1).expand(-1, num_classes, 1)
-        mean_evidence = mean_evidence.scatter_add(
-            dim=-1,
-            index=scatter_index,
-            src=remaining.unsqueeze(-1),
-        )
-    reconstructed = mean_evidence.sum(dim=-1) + std_evidence.sum(dim=-1) + bag_baselines
     reconstruction_errors = (reconstructed - logits).abs()
     if not torch.isfinite(mean_evidence).all() or not torch.isfinite(std_evidence).all():
         raise ValueError("Tile evidence must be finite.")
@@ -291,7 +631,16 @@ def compute_tile_attribution(
             "Tile evidence failed to reconstruct the bag logits: "
             f"maximum absolute error {maximum_error:.6g} exceeds {tolerance:.6g}."
         )
-    return mean_evidence, std_evidence, reconstruction_errors, bag_baselines, logits
+    if fitted_classes.size == num_classes:
+        class_sum = (mean_evidence + std_evidence).sum(dim=1).masked_fill(~valid, 0.0)
+        maximum_class_sum = float(class_sum.abs().max().item())
+        if maximum_class_sum > class_sum_tolerance:
+            raise RuntimeError(
+                "Per-tile class-sum gauge failed: "
+                f"maximum absolute class sum {maximum_class_sum:.6g} exceeds "
+                f"{class_sum_tolerance:.6g}."
+            )
+    return mean_evidence, std_evidence, reconstruction_errors, bag_baselines, logits, pooled
 
 
 def evidence_color_limit(
@@ -606,8 +955,12 @@ def save_attribution_figure(
     tile_size: int,
     thumbnail_size: int,
     render_dpi: int = 150,
+    color_limits: Optional[Mapping[str, float]] = None,
 ) -> None:
     """Save a 3-by-(1+C) attribution grid with the original tissue on the left.
+
+    Mean, std, and L1 panels are plotted from tissue-centred evidence. Uncentred
+    arrays may be passed; the across-tile mean is removed before colouring.
 
     Args:
         mean_evidence (np.ndarray): Signed mean evidence shaped ``[C, N]``.
@@ -627,6 +980,9 @@ def save_attribution_figure(
         tile_size (int): Tile size in level-zero source-image pixels.
         thumbnail_size (int): Maximum original-tissue thumbnail size.
         render_dpi (int): Positive output resolution in dots per inch.
+        color_limits (Optional[Mapping[str, float]]): Optional shared split-wide
+            colour limits. When omitted, limits are the 0.98 quantile of this
+            tissue's centred maps.
 
     Returns:
         None: Combined attribution figure is written to ``output_path``.
@@ -649,13 +1005,20 @@ def save_attribution_figure(
         raise ValueError("class_probabilities must be nonnegative.")
     if abs(float(probability_values[predicted_index]) - float(predicted_probability)) > 1e-6:
         raise ValueError("predicted_probability does not match class_probabilities.")
-    maps = attribution_grid_maps(mean_evidence, std_evidence)
-    l1_limit = magnitude_color_limit(maps["class_l1"])
-    all_l1_limit = magnitude_color_limit(maps["all_l1"])
-    mean_limit = evidence_color_limit(mean_evidence)
-    std_limit = evidence_color_limit(std_evidence)
-    all_mean_limit = magnitude_color_limit(maps["all_mean_abs"])
-    all_std_limit = magnitude_color_limit(maps["all_std_abs"])
+    centred_mean = center_tile_evidence(mean_evidence)
+    centred_std = center_tile_evidence(std_evidence)
+    maps = attribution_grid_maps(centred_mean, centred_std)
+    limits = (
+        normalize_color_limits(color_limits)
+        if color_limits is not None
+        else color_limits_from_maps(centred_mean, centred_std)
+    )
+    l1_limit = limits["l1"]
+    all_l1_limit = limits["all_l1"]
+    mean_limit = limits["mean"]
+    std_limit = limits["std"]
+    all_mean_limit = limits["all_mean"]
+    all_std_limit = limits["all_std"]
 
     figure = plt.figure(figsize=(3.4 * (class_count + 1) + 8.0, 11.0))
     all_map_column = 1
@@ -678,30 +1041,30 @@ def save_attribution_figure(
             all_l1_limit,
             0.0,
             l1_limit,
-            "L1 magnitude",
-            "L1 attribution magnitude",
+            magnitude_colorbar_label("L1 magnitude", all_l1_limit),
+            magnitude_colorbar_label("L1 attribution magnitude", l1_limit),
         ),
         (
             maps["all_mean_abs"],
-            mean_evidence,
+            centred_mean,
             _MAGNITUDE_CMAP,
             0.0,
             all_mean_limit,
             -mean_limit,
             mean_limit,
-            "Mean evidence",
-            "Signed mean logit evidence",
+            magnitude_colorbar_label("Mean evidence", all_mean_limit),
+            signed_colorbar_label("Signed mean logit evidence", mean_limit),
         ),
         (
             maps["all_std_abs"],
-            std_evidence,
+            centred_std,
             _MAGNITUDE_CMAP,
             0.0,
             all_std_limit,
             -std_limit,
             std_limit,
-            "Std evidence",
-            "Signed std logit evidence",
+            magnitude_colorbar_label("Std evidence", all_std_limit),
+            signed_colorbar_label("Signed std logit evidence", std_limit),
         ),
     )
     for row_index, spec in enumerate(row_specs):
@@ -788,7 +1151,7 @@ def save_attribution_figure(
     figure.suptitle(
         f"Slide: {slide_name} | Tissue: {tissue_name}\n"
         f"True: {true_class} | Predicted: {predicted_class} "
-        f"({predicted_probability:.3f}) | Red supports, blue opposes",
+        f"({predicted_probability:.3f})",
         fontsize=12,
         fontweight="bold",
     )
@@ -810,6 +1173,22 @@ def safe_filename(value: str) -> str:
         character if character.isalnum() or character in "-_." else "_"
         for character in value
     )
+
+
+def split_attribution_output_dir(output_root: Path, split: str) -> Path:
+    """Build the directory that stores one visualization sample's artifacts.
+
+    Args:
+        output_root (Path): Attribution output root, typically
+            ``paths.attribution_output``.
+        split (str): Visualization sample name (``train``, ``val``, or ``test``).
+
+    Returns:
+        Path: ``{output_root}/{split}``.
+    """
+    if not split:
+        raise ValueError("split must be a nonempty string.")
+    return Path(output_root) / split
 
 
 def validate_aligned_bag(
@@ -902,7 +1281,6 @@ def render_split_attributions(
     dataset: WSIBagDataset,
     config: Mapping[str, Any],
     class_folders: Sequence[str],
-    pooler: RawFeatureStatisticsPooler,
     pooling_statistics: Sequence[str],
     epsilon: float,
     data_root: str,
@@ -913,7 +1291,7 @@ def render_split_attributions(
     thumbnail_size: int,
     render_dpi: int,
     render_workers: int,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], AttributionColorLimits]:
     """Render per-tissue attribution figures for one nonempty split.
 
     Args:
@@ -921,11 +1299,10 @@ def render_split_attributions(
         dataset (WSIBagDataset): Split dataset at the checkpoint bag level.
         config (Mapping[str, Any]): Evaluation loading configuration.
         class_folders (Sequence[str]): Frozen checkpoint class order.
-        pooler (RawFeatureStatisticsPooler): Checkpoint-compatible pooler.
         pooling_statistics (Sequence[str]): Checkpoint pooling-statistic names.
         epsilon (float): Population-std variance floor.
         data_root (str): Root containing class and slide directories.
-        output_dir (Path): Directory receiving figures and the split summary.
+        output_dir (Path): Per-sample directory receiving figures for ``split``.
         bag_level (str): Checkpoint bag level, tissue or slide.
         split (str): Rendered split name.
         tile_size (int): Tile size in source-image pixels.
@@ -934,15 +1311,16 @@ def render_split_attributions(
         render_workers (int): Number of independent figure-rendering processes.
 
     Returns:
-        List[Dict[str, Any]]: One attribution summary per rendered tissue.
+        Tuple[List[Dict[str, Any]], AttributionColorLimits]: Per-tissue
+            attribution summaries and the shared split colour limits.
     """
     if len(dataset) == 0:
         raise ValueError("Cannot visualize an empty dataset.")
     if render_workers <= 0:
         raise ValueError("render_workers must be positive.")
     dataset.set_epoch(0)
-    dataloader = create_dataloader(dataset, config)
-    results: List[Dict[str, Any]] = []
+    dataloader = create_dataloader(dataset, visualization_loader_config(config))
+    prepared: List[Dict[str, Any]] = []
     render_futures: List[Future[None]] = []
     output_dir.mkdir(parents=True, exist_ok=True)
     num_classes = len(class_folders)
@@ -965,6 +1343,7 @@ def render_split_attributions(
                     reconstruction_errors,
                     bag_baselines,
                     logits,
+                    pooled,
                 ) = compute_tile_attribution(
                     features=features,
                     masks=masks,
@@ -973,25 +1352,32 @@ def render_split_attributions(
                     epsilon=epsilon,
                     num_classes=num_classes,
                 )
-                pooled = pooler(features, masks)
+                pooled_numpy = pooled.detach().cpu().numpy()
                 probabilities = full_class_probabilities(
                     model,
-                    pooled.detach().cpu().numpy(),
+                    pooled_numpy,
                     num_classes,
                 )
-                predictions = np.asarray(model.predict(pooled), dtype=np.int64)
+                predictions = np.asarray(model.predict(pooled_numpy), dtype=np.int64)
+                attributed = represented_class_predictions(logits, model)
+                if not np.array_equal(predictions, attributed):
+                    raise RuntimeError(
+                        "Attribution logits and model.predict() disagree on this batch."
+                    )
                 labels = batch["labels"].detach().cpu().numpy()
                 mean_evidence = mean_evidence.detach().cpu()
                 std_evidence = std_evidence.detach().cpu()
                 reconstruction_errors = reconstruction_errors.detach().cpu()
                 bag_baselines = bag_baselines.detach().cpu()
                 logits = logits.detach().cpu()
-                del pooled
 
                 for bag_index, slide_name in enumerate(batch["slide_names"]):
                     valid_mask = batch["masks"][bag_index]
                     bag_mean = mean_evidence[bag_index, :, valid_mask]
                     bag_std = std_evidence[bag_index, :, valid_mask]
+                    bag_features = (
+                        batch["features"][bag_index, valid_mask].detach().cpu().numpy()
+                    )
                     coordinates = batch["coordinates"][bag_index, valid_mask].detach().cpu()
                     tissue_indices = batch["tissue_indices"][
                         bag_index, valid_mask
@@ -1016,9 +1402,14 @@ def render_split_attributions(
                         tissue_mask = tissue_indices == tissue_index
                         if not bool(tissue_mask.any()):
                             continue
+                        numpy_mask = tissue_mask.numpy()
                         tissue_mean = bag_mean[:, tissue_mask].numpy()
                         tissue_std = bag_std[:, tissue_mask].numpy()
                         tissue_coordinates = coordinates[tissue_mask].numpy()
+                        tissue_features = bag_features[numpy_mask]
+                        centred_mean = center_tile_evidence(tissue_mean)
+                        centred_std = center_tile_evidence(tissue_std)
+                        uncentred_maps = attribution_grid_maps(tissue_mean, tissue_std)
                         image_path = find_tissue_image(
                             data_root, true_class, str(slide_name), tissue_name
                         )
@@ -1026,66 +1417,98 @@ def render_split_attributions(
                             f"{safe_filename(str(slide_name))}_"
                             f"{safe_filename(tissue_name)}_attribution.png"
                         )
-                        render_arguments = {
-                            "mean_evidence": tissue_mean,
-                            "std_evidence": tissue_std,
-                            "coordinates": tissue_coordinates,
-                            "class_names": class_folders,
-                            "predicted_index": predicted_index,
-                            "slide_name": str(slide_name),
-                            "tissue_name": tissue_name,
-                            "true_class": true_class,
-                            "predicted_class": predicted_class,
-                            "predicted_probability": predicted_probability,
-                            "class_probabilities": class_probabilities,
-                            "image_path": image_path,
-                            "output_path": output_path,
-                            "tile_size": tile_size,
-                            "thumbnail_size": thumbnail_size,
-                            "render_dpi": render_dpi,
-                        }
-                        if render_executor is None:
-                            save_attribution_figure(**render_arguments)
-                        else:
-                            render_futures.append(
-                                render_executor.submit(
-                                    save_attribution_figure,
-                                    **render_arguments,
-                                )
-                            )
-                        maps = attribution_grid_maps(tissue_mean, tissue_std)
-                        results.append(
+                        prepared.append(
                             {
-                                "bag_level": bag_level,
-                                "split": split,
-                                "slide_name": str(slide_name),
-                                "tissue_name": tissue_name,
-                                "true_class": true_class,
-                                "predicted_class": predicted_class,
-                                "predicted_probability": predicted_probability,
-                                "num_tiles": int(tissue_mean.shape[1]),
-                                "bag_num_tiles": int(valid_mask.sum().item()),
-                                "heatmap_path": str(output_path),
-                                "logit_reconstruction_error": [
-                                    float(value)
-                                    for value in reconstruction_errors[bag_index].tolist()
-                                ],
-                                "bag_baselines": [
-                                    float(value)
-                                    for value in bag_baselines[bag_index].tolist()
-                                ],
-                                "bag_logits": [
-                                    float(value) for value in logits[bag_index].tolist()
-                                ],
-                                "bag_mean_evidence_sum": [
-                                    float(value) for value in bag_mean_sums.tolist()
-                                ],
-                                "bag_std_evidence_sum": [
-                                    float(value) for value in bag_std_sums.tolist()
-                                ],
-                                "tissue_l1_mass": float(maps["all_l1"].sum()),
+                                "centred_mean": centred_mean,
+                                "centred_std": centred_std,
+                                "render_arguments": {
+                                    "mean_evidence": tissue_mean,
+                                    "std_evidence": tissue_std,
+                                    "coordinates": tissue_coordinates,
+                                    "class_names": class_folders,
+                                    "predicted_index": predicted_index,
+                                    "slide_name": str(slide_name),
+                                    "tissue_name": tissue_name,
+                                    "true_class": true_class,
+                                    "predicted_class": predicted_class,
+                                    "predicted_probability": predicted_probability,
+                                    "class_probabilities": class_probabilities,
+                                    "image_path": image_path,
+                                    "output_path": output_path,
+                                    "tile_size": tile_size,
+                                    "thumbnail_size": thumbnail_size,
+                                    "render_dpi": render_dpi,
+                                },
+                                "summary": {
+                                    "bag_level": bag_level,
+                                    "split": split,
+                                    "slide_name": str(slide_name),
+                                    "tissue_name": tissue_name,
+                                    "true_class": true_class,
+                                    "predicted_class": predicted_class,
+                                    "predicted_probability": predicted_probability,
+                                    "num_tiles": int(tissue_mean.shape[1]),
+                                    "bag_num_tiles": int(valid_mask.sum().item()),
+                                    "heatmap_path": str(output_path),
+                                    "logit_reconstruction_error": [
+                                        float(value)
+                                        for value in reconstruction_errors[
+                                            bag_index
+                                        ].tolist()
+                                    ],
+                                    "bag_baselines": [
+                                        float(value)
+                                        for value in bag_baselines[bag_index].tolist()
+                                    ],
+                                    "bag_logits": [
+                                        float(value)
+                                        for value in logits[bag_index].tolist()
+                                    ],
+                                    "bag_mean_evidence_sum": [
+                                        float(value)
+                                        for value in bag_mean_sums.tolist()
+                                    ],
+                                    "bag_std_evidence_sum": [
+                                        float(value)
+                                        for value in bag_std_sums.tolist()
+                                    ],
+                                    "tissue_l1_mass": float(uncentred_maps["all_l1"].sum()),
+                                    "mean_contrast_ratio": [
+                                        float(value)
+                                        for value in evidence_contrast_ratio(
+                                            tissue_mean
+                                        ).tolist()
+                                    ],
+                                    "std_contrast_ratio": [
+                                        float(value)
+                                        for value in evidence_contrast_ratio(
+                                            tissue_std
+                                        ).tolist()
+                                    ],
+                                    "effective_dimension": within_tissue_effective_dimension(
+                                        tissue_features
+                                    ),
+                                },
                             }
                         )
+        if not prepared:
+            raise ValueError("No tissues were available to visualize.")
+        color_limits = compute_split_color_limits(
+            [item["centred_mean"] for item in prepared],
+            [item["centred_std"] for item in prepared],
+        )
+        for item in prepared:
+            render_arguments = dict(item["render_arguments"])
+            render_arguments["color_limits"] = color_limits
+            if render_executor is None:
+                save_attribution_figure(**render_arguments)
+            else:
+                render_futures.append(
+                    render_executor.submit(
+                        save_attribution_figure,
+                        **render_arguments,
+                    )
+                )
         for render_future in tqdm(
             as_completed(render_futures),
             total=len(render_futures),
@@ -1096,7 +1519,7 @@ def render_split_attributions(
     finally:
         if render_executor is not None:
             render_executor.shutdown(wait=True, cancel_futures=True)
-    return results
+    return [item["summary"] for item in prepared], color_limits
 
 
 def visualize_attribution(
@@ -1112,7 +1535,8 @@ def visualize_attribution(
     Args:
         config_path (Optional[str]): Runtime YAML path or package default.
         checkpoint (Optional[str]): Explicit checkpoint path override.
-        output_dir (Optional[str]): Explicit heatmap directory override.
+        output_dir (Optional[str]): Explicit heatmap root override. Each
+            visualization sample is written to ``{output_dir}/{split}/``.
         samples (Optional[Sequence[str]]): Optional split-name override.
         dpi (Optional[int]): Optional output DPI override.
         render_workers (Optional[int]): Optional figure-process override.
@@ -1145,10 +1569,6 @@ def visualize_attribution(
         render_workers,
     )
     seed_everything(int(data_config["random_seed"]))
-    pooler = RawFeatureStatisticsPooler(
-        epsilon=float(bundle["pooling_population_std_epsilon"]),
-        statistics=list(pooling_statistics),
-    )
     destination.mkdir(parents=True, exist_ok=True)
     results: Dict[str, Any] = {}
     for split in settings["samples"]:
@@ -1162,25 +1582,27 @@ def visualize_attribution(
             raise ValueError(
                 f"{split} dataset class order violates checkpoint contract."
             )
+        split_dir = split_attribution_output_dir(destination, split)
         if len(dataset) == 0:
             results[split] = {
                 "skipped": True,
                 "reason": "empty split",
+                "output_dir": str(split_dir.resolve()),
                 "tissues": [],
                 "summary": None,
+                "diagnostics": None,
             }
             print(f"{split} skipped: empty split")
             continue
-        tissues = render_split_attributions(
+        tissues, color_limits = render_split_attributions(
             model=bundle["model"],
             dataset=dataset,
             config=data_config,
             class_folders=class_folders,
-            pooler=pooler,
             pooling_statistics=pooling_statistics,
             epsilon=float(bundle["pooling_population_std_epsilon"]),
             data_root=str(data_config["data_root"]),
-            output_dir=destination,
+            output_dir=split_dir,
             bag_level=str(bundle["bag_level"]),
             split=split,
             tile_size=int(settings["tile_size"]),
@@ -1188,18 +1610,25 @@ def visualize_attribution(
             render_dpi=int(settings["dpi"]),
             render_workers=int(settings["render_workers"]),
         )
-        summary_path = destination / f"attribution_summary_{split}.json"
+        diagnostics = aggregate_split_diagnostics(tissues)
+        diagnostics["color_limits"] = dict(color_limits)
+        summary_path = split_dir / f"attribution_summary_{split}.json"
         with summary_path.open("w", encoding="utf-8") as summary_file:
             json.dump(json_safe(tissues), summary_file, indent=2)
         results[split] = {
             "skipped": False,
             "num_tissues": len(tissues),
             "num_bags": len(dataset),
+            "output_dir": str(split_dir.resolve()),
             "summary": str(summary_path.resolve()),
+            "diagnostics": diagnostics,
             "tissues": tissues,
         }
         print(
             f"{split} bags={len(dataset)} tissues={len(tissues)} "
+            f"D_eff_median={diagnostics['effective_dimension_median']:.3g} "
+            f"mean_rho_median={diagnostics['mean_contrast_ratio_median']:.3g} "
+            f"std_rho_median={diagnostics['std_contrast_ratio_median']:.3g} "
             f"summary={summary_path}"
         )
     manifest_path = destination / "attribution_manifest.json"
@@ -1235,7 +1664,10 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint", type=str, default=None, help="Checkpoint joblib override."
     )
     parser.add_argument(
-        "--output-dir", type=str, default=None, help="Heatmap output override."
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Heatmap output root; each sample is written to {output-dir}/{split}/.",
     )
     parser.add_argument(
         "--samples",

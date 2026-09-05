@@ -43,11 +43,20 @@ from logistic_regression.train import (
     train_logistic_regression,
 )
 from logistic_regression.visualize_attribution import (
+    aggregate_split_diagnostics,
     attribution_grid_maps,
+    center_multinomial_parameters,
+    center_tile_evidence,
+    compute_split_color_limits,
     compute_tile_attribution,
+    evidence_color_limit,
+    evidence_contrast_ratio,
     require_mean_std_pooling,
     save_attribution_figure,
+    split_attribution_output_dir,
+    visualization_loader_config,
     visualize_attribution,
+    within_tissue_effective_dimension,
 )
 
 
@@ -799,12 +808,15 @@ def test_absent_class_keeps_fixed_confusion_and_report_metrics() -> None:
 def make_fitted_attribution_model(
     input_dim: int = 2,
     num_classes: int = 2,
+    class_center: bool = True,
 ) -> TorchLogisticRegression:
     """Build a CPU estimator with known linear parameters for attribution tests.
 
     Args:
         input_dim (int): Raw tile feature width.
         num_classes (int): Number of represented classes.
+        class_center (bool): If True, subtract the across-class mean from
+            coefficients so the per-tile class-sum gauge holds.
 
     Returns:
         TorchLogisticRegression: Fitted-looking estimator on CPU.
@@ -817,7 +829,11 @@ def make_fitted_attribution_model(
     coef = np.zeros((num_classes, pooled_dim), dtype=np.float32)
     for class_index in range(num_classes):
         coef[class_index, class_index % input_dim] = 1.0
-        coef[class_index, input_dim + (class_index % input_dim)] = 0.5 - 0.25 * class_index
+        coef[class_index, input_dim + (class_index % input_dim)] = (
+            0.5 - 0.25 * class_index
+        )
+    if class_center:
+        coef = coef - coef.mean(axis=0, keepdims=True)
     model.coef_ = coef
     model.intercept_ = 0.1 * np.arange(num_classes, dtype=np.float32)
     model.fit_device_ = "cpu"
@@ -862,7 +878,7 @@ def test_tile_attribution_reconstructs_logits_and_ignores_padding() -> None:
         [[True, True, True, False], [True, True, True, False]]
     )
     model = make_fitted_attribution_model(input_dim=2, num_classes=2)
-    mean_evidence, std_evidence, errors, baselines, logits = compute_tile_attribution(
+    mean_evidence, std_evidence, errors, baselines, logits, pooled = compute_tile_attribution(
         features,
         masks,
         model,
@@ -871,13 +887,14 @@ def test_tile_attribution_reconstructs_logits_and_ignores_padding() -> None:
         num_classes=2,
     )
     reconstructed = mean_evidence.sum(dim=-1) + std_evidence.sum(dim=-1) + baselines
-    assert torch.allclose(reconstructed, logits, atol=1e-5)
-    assert float(errors.max().item()) <= 1e-4
+    assert torch.allclose(reconstructed, logits, atol=1e-8)
+    assert float(errors.max().item()) <= 1e-8
+    assert pooled.shape == (2, 4)
     assert torch.equal(mean_evidence[..., 3], torch.zeros_like(mean_evidence[..., 3]))
     assert torch.equal(std_evidence[..., 3], torch.zeros_like(std_evidence[..., 3]))
     changed = features.clone()
     changed[~masks] = torch.tensor([[-77_777.0, 88_888.0]])
-    mean_changed, std_changed, _, _, logits_changed = compute_tile_attribution(
+    mean_changed, std_changed, _, _, logits_changed, pooled_changed = compute_tile_attribution(
         changed,
         masks,
         model,
@@ -885,10 +902,11 @@ def test_tile_attribution_reconstructs_logits_and_ignores_padding() -> None:
         epsilon=0.0,
         num_classes=2,
     )
-    assert torch.allclose(mean_evidence, mean_changed, atol=1e-6)
-    assert torch.allclose(std_evidence, std_changed, atol=1e-6)
-    assert torch.allclose(logits, logits_changed, atol=1e-6)
-    mean_eps, std_eps, errors_eps, baselines_eps, logits_eps = compute_tile_attribution(
+    assert torch.allclose(mean_evidence, mean_changed, atol=1e-10)
+    assert torch.allclose(std_evidence, std_changed, atol=1e-10)
+    assert torch.allclose(logits, logits_changed, atol=1e-10)
+    assert torch.allclose(pooled, pooled_changed, atol=1e-10)
+    mean_eps, std_eps, errors_eps, baselines_eps, logits_eps, _ = compute_tile_attribution(
         features,
         masks,
         model,
@@ -897,8 +915,8 @@ def test_tile_attribution_reconstructs_logits_and_ignores_padding() -> None:
         num_classes=2,
     )
     reconstructed_eps = mean_eps.sum(dim=-1) + std_eps.sum(dim=-1) + baselines_eps
-    assert torch.allclose(reconstructed_eps, logits_eps, atol=1e-5)
-    assert float(errors_eps.max().item()) <= 1e-4
+    assert torch.allclose(reconstructed_eps, logits_eps, atol=1e-8)
+    assert float(errors_eps.max().item()) <= 1e-8
 
 
 def test_attribution_grid_l1_identities() -> None:
@@ -926,6 +944,216 @@ def test_attribution_grid_l1_identities() -> None:
     assert np.allclose(maps["all_std_abs"], np.abs(std_evidence).sum(axis=0))
 
 
+def test_center_tile_evidence_is_zero_sum() -> None:
+    """Centred evidence subtracts the across-tile mean per class.
+
+    Args:
+        None: Synthetic evidence is constructed internally.
+
+    Returns:
+        None: Assertions verify zero-sum rows and the explicit formula.
+    """
+    evidence = np.array(
+        [[1.0, -0.5, 0.25], [0.0, 0.5, -1.0]],
+        dtype=np.float64,
+    )
+    centred = center_tile_evidence(evidence)
+    assert centred.shape == evidence.shape
+    assert np.allclose(centred.mean(axis=1), 0.0)
+    expected = evidence - evidence.mean(axis=1, keepdims=True)
+    assert np.allclose(centred, expected)
+
+
+def test_evidence_contrast_ratio_constant_and_two_tile() -> None:
+    """Contrast ratio is zero for a constant map and matches a two-tile case.
+
+    Args:
+        None: Synthetic evidence is constructed internally.
+
+    Returns:
+        None: Assertions verify the ``sd / |mean|`` formula.
+    """
+    constant = np.array([[2.0, 2.0, 2.0], [-1.0, -1.0, -1.0]], dtype=np.float64)
+    assert np.allclose(evidence_contrast_ratio(constant), np.zeros(2))
+    two_tile = np.array([[0.0, 2.0]], dtype=np.float64)
+    ratio = evidence_contrast_ratio(two_tile)
+    assert ratio.shape == (1,)
+    assert ratio[0] == pytest.approx(1.0)
+
+
+def test_within_tissue_effective_dimension_rank_cases() -> None:
+    """Effective dimension is 0 for identical tiles and about 1 for rank-1 variation.
+
+    Args:
+        None: Synthetic tile matrices are constructed internally.
+
+    Returns:
+        None: Assertions verify the participation-ratio extremes.
+    """
+    identical = np.array([[1.0, 2.0], [1.0, 2.0], [1.0, 2.0]], dtype=np.float64)
+    assert within_tissue_effective_dimension(identical) == pytest.approx(0.0)
+    rank_one = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]], dtype=np.float64)
+    assert within_tissue_effective_dimension(rank_one) == pytest.approx(1.0, abs=1e-6)
+    single = np.array([[1.0, 2.0, 3.0]], dtype=np.float64)
+    assert within_tissue_effective_dimension(single) == pytest.approx(0.0)
+
+
+def test_center_multinomial_parameters_zero_class_mean() -> None:
+    """Class-centring subtracts the across-class mean from weights and intercepts.
+
+    Args:
+        None: Synthetic parameter tensors are constructed internally.
+
+    Returns:
+        None: Assertions verify zero class-means and softmax-gauge invariance.
+    """
+    weights = torch.tensor(
+        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+        dtype=torch.float64,
+    )
+    intercept = torch.tensor([0.5, -0.1], dtype=torch.float64)
+    centred_weights, centred_intercept = center_multinomial_parameters(
+        weights, intercept
+    )
+    assert torch.allclose(centred_weights.mean(dim=0), torch.zeros(3, dtype=torch.float64))
+    assert float(centred_intercept.sum().item()) == pytest.approx(0.0)
+    features = torch.tensor([[0.2, -0.3, 0.4]], dtype=torch.float64)
+    original = torch.nn.functional.linear(features, weights, intercept)
+    centred = torch.nn.functional.linear(features, centred_weights, centred_intercept)
+    assert torch.allclose(original - original.mean(dim=1, keepdim=True), centred)
+
+
+def test_class_sum_gauge_requires_centred_coefficients() -> None:
+    """The per-tile class-sum assertion fires unless coefficients are class-centred.
+
+    Args:
+        None: Synthetic bags and estimators are constructed internally.
+
+    Returns:
+        None: Assertions verify failure on an uncentred model, success after
+            class-centring (explicit or automatic), and a missing-class skip.
+    """
+    features = torch.tensor([[[1.0, 2.0], [3.0, 6.0], [5.0, 2.0]]])
+    masks = torch.tensor([[True, True, True]])
+    uncentred = make_fitted_attribution_model(
+        input_dim=2, num_classes=2, class_center=False
+    )
+    with pytest.raises(RuntimeError, match="class-sum gauge"):
+        compute_tile_attribution(
+            features,
+            masks,
+            uncentred,
+            ["mean", "standard_deviation"],
+            epsilon=0.0,
+            num_classes=2,
+            center_class_coefficients=False,
+        )
+    mean_auto, std_auto, _, _, _, _ = compute_tile_attribution(
+        features,
+        masks,
+        uncentred,
+        ["mean", "standard_deviation"],
+        epsilon=0.0,
+        num_classes=2,
+    )
+    auto_class_sum = (mean_auto + std_auto).sum(dim=1)
+    assert float(auto_class_sum.abs().max().item()) <= 1e-8
+    centred = make_fitted_attribution_model(
+        input_dim=2, num_classes=2, class_center=True
+    )
+    mean_evidence, std_evidence, _, _, _, _ = compute_tile_attribution(
+        features,
+        masks,
+        centred,
+        ["mean", "standard_deviation"],
+        epsilon=0.0,
+        num_classes=2,
+    )
+    class_sum = (mean_evidence + std_evidence).sum(dim=1)
+    assert float(class_sum.abs().max().item()) <= 1e-8
+    missing = make_fitted_attribution_model(
+        input_dim=2, num_classes=2, class_center=False
+    )
+    mean_missing, std_missing, _, _, _, _ = compute_tile_attribution(
+        features,
+        masks,
+        missing,
+        ["mean", "standard_deviation"],
+        epsilon=0.0,
+        num_classes=3,
+    )
+    assert mean_missing.shape[1] == 3
+    assert torch.equal(mean_missing[:, 2], torch.zeros_like(mean_missing[:, 2]))
+    assert torch.equal(std_missing[:, 2], torch.zeros_like(std_missing[:, 2]))
+
+
+def test_visualization_loader_config_forces_unit_batch() -> None:
+    """Attribution loading copies the eval config and sets ``batch_size`` to 1.
+
+    Args:
+        None: A small in-memory config mapping is used.
+
+    Returns:
+        None: Assertions verify the override and that the input is not mutated.
+    """
+    config = {"batch_size": 128, "num_workers": 8, "random_seed": 42}
+    payload = visualization_loader_config(config)
+    assert payload["batch_size"] == 1
+    assert payload["num_workers"] == 8
+    assert config["batch_size"] == 128
+
+
+def test_compute_split_color_limits_are_shared() -> None:
+    """Split-wide limits come from concatenated centred maps, not one tissue.
+
+    Args:
+        None: Two synthetic tissues are constructed internally.
+
+    Returns:
+        None: Assertions verify limits match the concatenated quantile.
+    """
+    mean_a = np.array([[0.0, 1.0], [-1.0, 0.0]], dtype=np.float64)
+    std_a = np.array([[0.0, 0.2], [0.1, -0.1]], dtype=np.float64)
+    mean_b = np.array([[0.0, 10.0], [-10.0, 0.0]], dtype=np.float64)
+    std_b = np.array([[0.0, 2.0], [1.0, -1.0]], dtype=np.float64)
+    centred_means = [center_tile_evidence(mean_a), center_tile_evidence(mean_b)]
+    centred_stds = [center_tile_evidence(std_a), center_tile_evidence(std_b)]
+    limits = compute_split_color_limits(centred_means, centred_stds)
+    combined_mean = np.concatenate(centred_means, axis=1)
+    assert limits["mean"] == pytest.approx(evidence_color_limit(combined_mean))
+    assert limits["mean"] > evidence_color_limit(centred_means[0])
+
+
+def test_aggregate_split_diagnostics_means_and_medians() -> None:
+    """Split diagnostics aggregate per-tissue contrast ratios and D_eff.
+
+    Args:
+        None: Two synthetic tissue records are constructed internally.
+
+    Returns:
+        None: Assertions verify mean and median summaries.
+    """
+    tissues = [
+        {
+            "mean_contrast_ratio": [0.0, 2.0],
+            "std_contrast_ratio": [1.0, 3.0],
+            "effective_dimension": 1.0,
+        },
+        {
+            "mean_contrast_ratio": [4.0, 6.0],
+            "std_contrast_ratio": [5.0, 7.0],
+            "effective_dimension": 3.0,
+        },
+    ]
+    diagnostics = aggregate_split_diagnostics(tissues)
+    assert diagnostics["num_tissues"] == 2
+    assert diagnostics["mean_contrast_ratio_mean"] == pytest.approx(3.0)
+    assert diagnostics["mean_contrast_ratio_median"] == pytest.approx(3.0)
+    assert diagnostics["std_contrast_ratio_mean"] == pytest.approx(4.0)
+    assert diagnostics["effective_dimension_mean"] == pytest.approx(2.0)
+    assert diagnostics["effective_dimension_median"] == pytest.approx(2.0)
+
+
 def _axis_by_title(figure: Figure, title: str) -> plt.Axes:
     """Return the unique figure axis whose title matches ``title``.
 
@@ -944,20 +1172,22 @@ def _axis_by_title(figure: Figure, title: str) -> plt.Axes:
     return matches[0]
 
 
-def _axis_by_ylabel(figure: Figure, label: str) -> plt.Axes:
-    """Return the unique figure axis whose y-axis label matches ``label``.
+def _axis_by_ylabel_prefix(figure: Figure, prefix: str) -> plt.Axes:
+    """Return the unique figure axis whose y-axis label starts with ``prefix``.
 
     Args:
         figure (Figure): Attribution figure whose axes are searched.
-        label (str): Exact colorbar or axis ylabel to locate.
+        prefix (str): Required ylabel prefix.
 
     Returns:
         plt.Axes: The matching axis.
     """
-    matches = [axis for axis in figure.axes if axis.get_ylabel() == label]
+    matches = [
+        axis for axis in figure.axes if str(axis.get_ylabel()).startswith(prefix)
+    ]
     if len(matches) != 1:
         raise AssertionError(
-            f"Expected one axis labeled {label!r}, found {len(matches)}."
+            f"Expected one axis labeled with prefix {prefix!r}, found {len(matches)}."
         )
     return matches[0]
 
@@ -1050,14 +1280,35 @@ def test_save_attribution_figure_writes_png(
         "Alpha (0.200)",
         "★ Beta (0.800)",
     }
-    assert {axis.get_ylabel() for axis in figure.axes if axis.get_ylabel()} == {
-        "L1 magnitude",
-        "Mean evidence",
-        "Std evidence",
-        "L1 attribution magnitude",
+    ylabel_prefixes = (
+        "L1 magnitude (",
+        "Mean evidence (",
+        "Std evidence (",
+        "L1 attribution magnitude (",
         "Signed mean logit evidence",
         "Signed std logit evidence",
-    }
+    )
+    for prefix in ylabel_prefixes:
+        _axis_by_ylabel_prefix(figure, prefix)
+    mean_label = _axis_by_ylabel_prefix(
+        figure, "Signed mean logit evidence"
+    ).get_ylabel()
+    std_label = _axis_by_ylabel_prefix(
+        figure, "Signed std logit evidence"
+    ).get_ylabel()
+    l1_label = _axis_by_ylabel_prefix(
+        figure, "L1 attribution magnitude ("
+    ).get_ylabel()
+    assert mean_label == "Signed mean logit evidence"
+    assert std_label == "Signed std logit evidence"
+    assert "red supports" not in mean_label.lower()
+    assert "blue opposes" not in mean_label.lower()
+    assert "red supports" not in std_label.lower()
+    assert "blue opposes" not in std_label.lower()
+    assert "red supports" not in l1_label.lower()
+    suptitle = figure._suptitle.get_text() if figure._suptitle is not None else ""
+    assert "Red supports" not in suptitle
+    assert "blue opposes" not in suptitle
     heatmap_widths = [
         all_classes_axis.get_position().width,
         alpha_axis.get_position().width,
@@ -1065,10 +1316,10 @@ def test_save_attribution_figure_writes_png(
     ]
     assert heatmap_widths[0] == pytest.approx(heatmap_widths[1], rel=0.02)
     assert heatmap_widths[1] == pytest.approx(heatmap_widths[2], rel=0.02)
-    class_colorbar = _axis_by_ylabel(figure, "L1 attribution magnitude")
+    class_colorbar = _axis_by_ylabel_prefix(figure, "L1 attribution magnitude (")
     assert alpha_axis.get_position().x1 < class_colorbar.get_position().x0
     assert beta_axis.get_position().x1 < class_colorbar.get_position().x0
-    all_colorbar = _axis_by_ylabel(figure, "L1 magnitude")
+    all_colorbar = _axis_by_ylabel_prefix(figure, "L1 magnitude (")
     assert all_classes_axis.get_position().x1 < all_colorbar.get_position().x0
     assert all_colorbar.get_position().x1 < alpha_axis.get_position().x0
     left_gap = all_colorbar.get_position().x0 - all_classes_axis.get_position().x1
@@ -1076,18 +1327,114 @@ def test_save_attribution_figure_writes_png(
     assert left_gap < right_gap
 
 
+def test_save_attribution_figure_uses_shared_color_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shared split colour limits appear in magnitude colorbar labels.
+
+    Args:
+        tmp_path (Path): Pytest-managed temporary directory.
+        monkeypatch (pytest.MonkeyPatch): Fixture used to inspect the figure.
+
+    Returns:
+        None: Assertions verify magnitude numeric limits and signed name-only
+            labels.
+    """
+    captured_figure: Dict[str, Figure] = {}
+    original_savefig = Figure.savefig
+
+    def _capture_figure(
+        figure: Figure,
+        output_path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Record the figure being saved, then write it.
+
+        Args:
+            figure (Figure): Figure being saved.
+            output_path (Path): Destination image path.
+            *args (Any): Additional positional save arguments.
+            **kwargs (Any): Additional keyword save arguments.
+
+        Returns:
+            None: The original save operation is completed.
+        """
+        captured_figure["figure"] = figure
+        original_savefig(figure, output_path, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", _capture_figure)
+    save_attribution_figure(
+        mean_evidence=np.array([[1.0, -0.5, 0.25], [0.0, 0.5, -1.0]], dtype=np.float64),
+        std_evidence=np.array([[0.2, 0.1, 0.0], [-0.1, 0.0, 0.3]], dtype=np.float64),
+        coordinates=np.array(
+            [[0.0, 0.0], [448.0, 0.0], [0.0, 448.0]], dtype=np.float64
+        ),
+        class_names=("Alpha", "Beta"),
+        predicted_index=1,
+        slide_name="slide",
+        tissue_name="tissue_0",
+        true_class="Alpha",
+        predicted_class="Beta",
+        predicted_probability=0.8,
+        class_probabilities=(0.2, 0.8),
+        image_path=None,
+        output_path=tmp_path / "shared.png",
+        tile_size=448,
+        thumbnail_size=64,
+        render_dpi=50,
+        color_limits={
+            "l1": 1.5,
+            "all_l1": 2.5,
+            "mean": 1.23,
+            "std": 0.77,
+            "all_mean": 3.1,
+            "all_std": 4.2,
+        },
+    )
+    figure = captured_figure["figure"]
+    ylabels = [str(axis.get_ylabel()) for axis in figure.axes if axis.get_ylabel()]
+    joined = "\n".join(ylabels)
+    assert "Signed mean logit evidence" in joined
+    assert "Signed std logit evidence" in joined
+    assert "centred" not in joined
+    assert "±" not in joined
+    assert "0-1.5" in joined
+    assert "0-2.5" in joined
+
+
+def test_split_attribution_output_dir_nests_each_sample(tmp_path: Path) -> None:
+    """Keep each visualization sample in its own subdirectory.
+
+    Args:
+        tmp_path (Path): Pytest-managed temporary directory.
+
+    Returns:
+        None: Assertions check per-split nesting under the output root.
+    """
+    assert split_attribution_output_dir(tmp_path, "train") == tmp_path / "train"
+    assert split_attribution_output_dir(tmp_path, "val") == tmp_path / "val"
+    assert split_attribution_output_dir(tmp_path, "test") == tmp_path / "test"
+    with pytest.raises(ValueError, match="nonempty"):
+        split_attribution_output_dir(tmp_path, "")
+
+
 def test_visualize_attribution_renders_only_requested_splits(
     tmp_path: Path,
     synthetic_data_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Train a checkpoint and render only the configured test split.
 
     Args:
         tmp_path (Path): Pytest-managed temporary directory.
         synthetic_data_root (Path): Synthetic dataset root.
+        monkeypatch (pytest.MonkeyPatch): Fixture used to capture loader config.
 
     Returns:
-        None: Assertions verify test-only outputs and PNG summaries.
+        None: Assertions verify test-only outputs under ``{output_dir}/test/``,
+            PNG summaries, diagnostics, and a unit-batch attribution DataLoader.
     """
     config_path = write_config(
         tmp_path,
@@ -1104,6 +1451,30 @@ def test_visualize_attribution_renders_only_requested_splits(
     )
     artifacts = train_logistic_regression(str(config_path))
     heatmap_dir = tmp_path / "attribution"
+    captured_batch_sizes: list[int] = []
+    import logistic_regression.visualize_attribution as visualization_module
+
+    original_create_dataloader = visualization_module.create_dataloader
+
+    def _capture_batch_size(
+        dataset: Dataset,
+        config: Mapping[str, Any],
+    ) -> Any:
+        """Record the attribution DataLoader batch size, then build the loader.
+
+        Args:
+            dataset (Dataset): Split dataset passed to the loader factory.
+            config (Mapping[str, Any]): Loading configuration.
+
+        Returns:
+            Any: The original DataLoader.
+        """
+        captured_batch_sizes.append(int(config["batch_size"]))
+        return original_create_dataloader(dataset, config)
+
+    monkeypatch.setattr(
+        visualization_module, "create_dataloader", _capture_batch_size
+    )
     manifest = visualize_attribution(
         config_path=str(config_path),
         checkpoint=artifacts["checkpoint"],
@@ -1112,16 +1483,39 @@ def test_visualize_attribution_renders_only_requested_splits(
         dpi=50,
         render_workers=1,
     )
+    assert captured_batch_sizes
+    assert captured_batch_sizes == [1] * len(captured_batch_sizes)
     assert manifest["samples"] == ["test"]
     assert set(manifest["results"]) == {"test"}
     assert manifest["results"]["test"]["skipped"] is False
+    split_dir = split_attribution_output_dir(heatmap_dir, "test")
     summary_path = Path(manifest["results"]["test"]["summary"])
     assert summary_path.is_file()
+    assert summary_path.parent == split_dir
+    assert Path(manifest["results"]["test"]["output_dir"]) == split_dir
+    assert (heatmap_dir / "attribution_manifest.json").is_file()
+    assert not (heatmap_dir / "train").exists()
+    assert not (heatmap_dir / "val").exists()
+    assert not (heatmap_dir / "attribution_summary_test.json").exists()
     assert not (heatmap_dir / "attribution_summary_train.json").exists()
     assert not (heatmap_dir / "attribution_summary_val.json").exists()
+    diagnostics = manifest["results"]["test"]["diagnostics"]
+    assert diagnostics is not None
+    assert diagnostics["num_tissues"] > 0
+    assert "effective_dimension_median" in diagnostics
+    assert "mean_contrast_ratio_median" in diagnostics
+    assert "std_contrast_ratio_median" in diagnostics
+    assert "color_limits" in diagnostics
+    assert diagnostics["color_limits"]["mean"] > 0.0
     tissues = manifest["results"]["test"]["tissues"]
     assert tissues
     for tissue in tissues:
         assert Path(tissue["heatmap_path"]).is_file()
+        assert Path(tissue["heatmap_path"]).parent == split_dir
         assert tissue["split"] == "test"
+        assert len(tissue["mean_contrast_ratio"]) == len(CLASS_NAMES)
+        assert len(tissue["std_contrast_ratio"]) == len(CLASS_NAMES)
+        assert tissue["effective_dimension"] >= 0.0
+        assert "bag_mean_evidence_sum" in tissue
+        assert "bag_std_evidence_sum" in tissue
 

@@ -59,4 +59,4 @@ visualization:  # Settings controlling L1 attribution heatmap generation
 paths:  # Optional artifact paths; null values attach to the newest dated run when available
   checkpoint: null  # Explicit joblib path or null for logistic_regression/<run>/best_model.joblib
   evaluation_output: null  # Explicit evaluation directory or null for logistic_regression/<run>/evaluation_results
-  attribution_output: null  # Explicit heatmap directory or null for logistic_regression/<run>/attribution_heatmaps
+  attribution_output: null  # Explicit heatmap root or null for logistic_regression/<run>/attribution_heatmaps; PNGs and summaries are written under {attribution_output}/{split}/
